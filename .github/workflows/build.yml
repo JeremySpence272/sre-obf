@@ -1,0 +1,375 @@
+name: Build (reusable)
+
+# Reusable build for ONE stock-LLVM version. Called by release.yml once per
+# supported LLVM major (22, 23). Produces, for that version:
+#   * toolchain  — stock LLVM + clang/opt with the obfuscator linked in
+#                  statically (LLVM_EXTERNAL_PROJECTS extension), Linux + Windows.
+#   * plugin       — loadable Obfuscator.so (-fpass-plugin), Linux.
+#   * plugin-macos — loadable Obfuscator.dylib (-fpass-plugin), macOS arm64.
+# Artifacts are suffixed with `llvm<major>` so both versions coexist in one run.
+on:
+  workflow_call:
+    inputs:
+      llvm_major:
+        description: 'Stock LLVM major version (e.g. 22)'
+        required: true
+        type: string
+      llvm_ref:
+        description: 'Stock LLVM branch or tag to build against (e.g. release/22.x)'
+        required: true
+        type: string
+
+jobs:
+  # ==========================================================================
+  # Full toolchain: stock LLVM + obfuscator as a static in-tree extension.
+  # ==========================================================================
+  toolchain:
+    name: toolchain / llvm${{ inputs.llvm_major }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows
+            runner: windows-2022
+          - os: linux
+            runner: ubuntu-24.04
+    env:
+      SCCACHE_IDLE_TIMEOUT: 0
+      # Local-disk sccache backend. We deliberately do NOT use SCCACHE_GHA_ENABLED:
+      # sccache 0.16's GHA backend still calls GitHub's retired v1 cache API
+      # (_apis/artifactcache) and, worse, a cache read failure is FATAL at server
+      # startup -> every cl.exe dies and the whole build fails on one API hiccup.
+      # Instead sccache writes to a local dir which actions/cache persists across
+      # runs. A cache-service outage then only degrades to a cold build, never
+      # breaks it.
+      SCCACHE_DIR: ${{ github.workspace }}/sccache
+      SCCACHE_CACHE_SIZE: 5G
+    steps:
+      - name: Checkout xollvm
+        uses: actions/checkout@v4
+        with:
+          path: xollvm
+          fetch-depth: 1
+
+      - name: Fetch stock LLVM (${{ inputs.llvm_ref }})
+        run: git clone --depth 1 --branch "${{ inputs.llvm_ref }}" https://github.com/llvm/llvm-project llvm-src
+        shell: bash
+
+      # ---------- Linux prep ----------
+      - name: Free disk space (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY"
+          sudo apt-get clean
+          df -h
+
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # `clang` here is the EXTERNAL clang used to compile the AES stub to
+          # bitcode -- the in-tree clang can't be used under LINK_INTO_TOOLS
+          # (it would form a dependency cycle).
+          sudo apt-get install -y ninja-build ccache python3 zstd clang
+
+      # ---------- Windows prep ----------
+      - name: Setup MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup sccache (Windows)
+        if: runner.os == 'Windows'
+        uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Install Ninja + external clang (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install ninja -y
+          choco install llvm -y   # external clang.exe for the AES stub
+        shell: pwsh
+
+      # ---------- Cache ----------
+      # Cache keys are namespaced per LLVM major so 22 and 23 builds never share
+      # (and thrash) each other's compiler cache.
+      - name: ccache (Linux)
+        if: runner.os == 'Linux'
+        uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: ${{ matrix.os }}-release-llvm${{ inputs.llvm_major }}
+          max-size: 2G
+          variant: ccache
+
+      # Restore the sccache dir from a previous run. Immutable per-sha key with a
+      # prefix restore-key: an exact miss still restores the most recent cache.
+      # A restore failure (cache-service outage) is non-fatal -> cold build.
+      - name: Restore sccache (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/sccache
+          key: sccache-windows-release-llvm${{ inputs.llvm_major }}-${{ github.sha }}
+          restore-keys: sccache-windows-release-llvm${{ inputs.llvm_major }}-
+
+      # ---------- Configure (Windows) ----------
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          mkdir build
+          cd build
+          cmake -G Ninja ^
+            -DCMAKE_BUILD_TYPE=Release ^
+            -DLLVM_ENABLE_PROJECTS="llvm;clang" ^
+            -DLLVM_ENABLE_RTTI=ON ^
+            -DLLVM_ENABLE_EH=ON ^
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;RISCV" ^
+            -DLLVM_INCLUDE_TESTS=OFF ^
+            -DLLVM_BUILD_TESTS=OFF ^
+            -DLLVM_INCLUDE_BENCHMARKS=OFF ^
+            -DLLVM_BUILD_BENCHMARKS=OFF ^
+            -DLLVM_INCLUDE_EXAMPLES=OFF ^
+            -DCLANG_INCLUDE_TESTS=OFF ^
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF ^
+            -DCLANG_ENABLE_ARCMT=OFF ^
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" ^
+            -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL ^
+            -DLLVM_ENABLE_ASSERTIONS=OFF ^
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
+            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DLLVM_PARALLEL_LINK_JOBS=1 ^
+            -DLLVM_EXTERNAL_PROJECTS=Obfuscator ^
+            -DLLVM_EXTERNAL_OBFUSCATOR_SOURCE_DIR=%GITHUB_WORKSPACE%\xollvm ^
+            -DLLVM_OBFUSCATOR_LINK_INTO_TOOLS=ON ^
+            -DCMAKE_INSTALL_PREFIX=%GITHUB_WORKSPACE%\install ^
+            ..\llvm-src\llvm
+
+      # ---------- Configure (Linux) ----------
+      - name: Configure (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir build && cd build
+          cmake -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="llvm;clang" \
+            -DLLVM_ENABLE_RTTI=ON \
+            -DLLVM_ENABLE_EH=ON \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64;ARM;RISCV" \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_BUILD_TESTS=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_BUILD_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+            -DCLANG_ENABLE_ARCMT=OFF \
+            -DLLVM_DISTRIBUTION_COMPONENTS="clang;clang-resource-headers;opt" \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DLLVM_EXTERNAL_PROJECTS=Obfuscator \
+            -DLLVM_EXTERNAL_OBFUSCATOR_SOURCE_DIR=$GITHUB_WORKSPACE/xollvm \
+            -DLLVM_OBFUSCATOR_LINK_INTO_TOOLS=ON \
+            -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/install \
+            ../llvm-src/llvm
+
+      # ---------- Build ----------
+      # install-distribution builds ONLY the shipped components (clang, opt +
+      # their libs), not the ~40 other standalone llvm-* tools. Big time cut and
+      # it means llvm-lto2 & friends are never built.
+      - name: Build
+        shell: bash
+        run: cmake --build build --parallel --target install-distribution
+
+      # Save even when the build failed (always()): a partial build still warmed
+      # the sccache dir, so the next run resumes warm instead of cold. Immutable
+      # per-sha key -> never clashes with the restored cache.
+      - name: Save sccache (Windows)
+        if: always() && runner.os == 'Windows'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/sccache
+          key: sccache-windows-release-llvm${{ inputs.llvm_major }}-${{ github.sha }}
+
+      - name: sccache stats (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: sccache --show-stats
+
+      # ---------- Smoke test: obfuscation runs from the built toolchain ----------
+      - name: Smoke test
+        shell: bash
+        run: |
+          BIN=install/bin
+          CLANG=$BIN/clang; [ -x "$BIN/clang.exe" ] && CLANG=$BIN/clang.exe
+          OPT=$BIN/opt; [ -x "$BIN/opt.exe" ] && OPT=$BIN/opt.exe
+          cat > ann.c <<'EOF'
+          #define OBF(spec) __attribute__((annotate("obf: " spec)))
+          OBF("mba, bcf, split")
+          int secret(int x){ int a=x*3+7; for(int i=0;i<x;i++) a+=(i^a); return a; }
+          EOF
+          "$CLANG" -O0 -emit-llvm -S ann.c -o ann.ll
+          "$OPT" -passes=obfuscation ann.ll -S -o ann_obf.ll
+          before=$(awk '/define .*@secret\(/,/^}/' ann.ll | wc -l)
+          after=$(awk '/define .*@secret\(/,/^}/' ann_obf.ll | wc -l)
+          echo "secret: $before -> $after"
+          [ "$after" -gt "$before" ] || { echo "obfuscation did not transform"; exit 1; }
+          "$OPT" -passes=verify ann_obf.ll -disable-output
+          # --- EP hook: obfuscation runs inside a normal clang compile ---
+          "$CLANG" -O2 -mllvm -enable-obfuscation -emit-llvm -S ann.c -o ann_ep.ll
+          ep=$(awk '/define .*@secret\(/,/^}/' ann_ep.ll | wc -l)
+          echo "secret (EP): $before -> $ep"
+          [ "$ep" -gt "$before" ] || { echo "EP hook did not obfuscate"; exit 1; }
+          "$OPT" -passes=verify ann_ep.ll -disable-output
+          # EP flag on un-annotated code must be a no-op (still valid IR)
+          cat > plain.c <<'EOF'
+          int plain(int x){ return x + 1; }
+          EOF
+          "$CLANG" -O2 -mllvm -enable-obfuscation -emit-llvm -S plain.c -o plain_ep.ll
+          "$OPT" -passes=verify plain_ep.ll -disable-output
+
+      # ---------- Package ----------
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cd install
+          tar --zstd -cf ../xollvm-linux-llvm${{ inputs.llvm_major }}-Release.tar.zst .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        # -mx=3 (fast) not -mx=7: the ~1GB+ install bundle at mx=7 lzma2 runs long
+        # enough to hit the job timeout. mx=3 keeps decent ratio at a fraction of
+        # the CPU cost.
+        run: 7z a -t7z -m0=lzma2 -mx=3 -mmt=on xollvm-windows-llvm${{ inputs.llvm_major }}-Release.7z .\install\*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xollvm-${{ matrix.os }}-llvm${{ inputs.llvm_major }}
+          path: |
+            xollvm-*.tar.zst
+            xollvm-*.7z
+          retention-days: 14
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Loadable plugin: Obfuscator.so (-fpass-plugin), Linux.
+  # ==========================================================================
+  plugin:
+    name: plugin / llvm${{ inputs.llvm_major }} / linux
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout xollvm
+        uses: actions/checkout@v4
+
+      - name: Install LLVM ${{ inputs.llvm_major }} dev + clang
+        run: |
+          # Ubuntu 24.04 (noble) does not ship recent llvm/clang in its default
+          # repos; add the official apt.llvm.org repo for the requested version.
+          wget -qO llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${{ inputs.llvm_major }}
+          sudo apt-get install -y ninja-build \
+            clang-${{ inputs.llvm_major }} \
+            llvm-${{ inputs.llvm_major }} \
+            llvm-${{ inputs.llvm_major }}-dev
+
+      - name: Build Obfuscator.so
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLVM_DIR=/usr/lib/llvm-${{ inputs.llvm_major }}/lib/cmake/llvm \
+            -DCMAKE_C_COMPILER=clang-${{ inputs.llvm_major }} \
+            -DCMAKE_CXX_COMPILER=clang++-${{ inputs.llvm_major }} \
+            -DCMAKE_BUILD_TYPE=Release
+          ninja -C build Obfuscator
+          cp build/Obfuscator.so Obfuscator-linux-x64-llvm${{ inputs.llvm_major }}.so
+
+      - name: Smoke test plugin
+        run: |
+          cat > ann.c <<'EOF'
+          #define OBF(spec) __attribute__((annotate("obf: " spec)))
+          OBF("mba, bcf, split")
+          int secret(int x){ int a=x*3+7; for(int i=0;i<x;i++) a+=(i^a); return a; }
+          EOF
+          clang-${{ inputs.llvm_major }} -O0 -emit-llvm -S ann.c -o ann.ll
+          opt-${{ inputs.llvm_major }} -load-pass-plugin=./Obfuscator-linux-x64-llvm${{ inputs.llvm_major }}.so -passes=obfuscation ann.ll -S -o ann_obf.ll
+          opt-${{ inputs.llvm_major }} -passes=verify ann_obf.ll -disable-output
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xollvm-plugin-linux-llvm${{ inputs.llvm_major }}
+          path: Obfuscator-linux-x64-llvm${{ inputs.llvm_major }}.so
+          retention-days: 14
+          if-no-files-found: error
+
+  # ==========================================================================
+  # Loadable plugin: Obfuscator.dylib (-fpass-plugin), macOS arm64.
+  # ==========================================================================
+  plugin-macos:
+    name: plugin / llvm${{ inputs.llvm_major }} / macos
+    runs-on: macos-14
+    steps:
+      - name: Checkout xollvm
+        uses: actions/checkout@v4
+
+      - name: Install LLVM ${{ inputs.llvm_major }} + ninja
+        run: |
+          # Homebrew keeps the NEWEST LLVM as the unversioned `llvm` formula and
+          # only cuts a versioned `llvm@N` once N+1 ships. So the formula name for
+          # a given major shifts over time (today: llvm@22 = 22.x, llvm = 23.x).
+          # Resolve it: prefer llvm@<major>, else fall back to the unversioned
+          # `llvm`, then assert the installed clang is actually that major.
+          MAJ='${{ inputs.llvm_major }}'
+          if brew info "llvm@${MAJ}" >/dev/null 2>&1; then
+            FORMULA="llvm@${MAJ}"
+          else
+            FORMULA="llvm"
+          fi
+          echo "Using brew formula: $FORMULA"
+          brew install "$FORMULA" ninja
+          PREFIX=$(brew --prefix "$FORMULA")
+          "$PREFIX/bin/clang" --version
+          "$PREFIX/bin/clang" --version | grep -q "clang version ${MAJ}\." || {
+            echo "ERROR: brew formula '$FORMULA' is not LLVM ${MAJ}"; exit 1; }
+          echo "LLVM_PREFIX=$PREFIX" >> "$GITHUB_ENV"
+
+      - name: Build Obfuscator plugin
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DLLVM_DIR="$LLVM_PREFIX/lib/cmake/llvm" \
+            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DCMAKE_BUILD_TYPE=Release
+          ninja -C build Obfuscator
+          # add_llvm_pass_plugin emits a MODULE lib; suffix is .so or .dylib
+          # depending on toolchain, so locate it instead of hardcoding.
+          PLUGIN=$(ls build/Obfuscator.dylib build/Obfuscator.so 2>/dev/null | head -n1)
+          cp "$PLUGIN" Obfuscator-macos-arm64-llvm${{ inputs.llvm_major }}.dylib
+
+      - name: Smoke test plugin
+        run: |
+          cat > ann.c <<'EOF'
+          #define OBF(spec) __attribute__((annotate("obf: " spec)))
+          OBF("mba, bcf, split")
+          int secret(int x){ int a=x*3+7; for(int i=0;i<x;i++) a+=(i^a); return a; }
+          EOF
+          "$LLVM_PREFIX/bin/clang" -O0 -emit-llvm -S ann.c -o ann.ll
+          "$LLVM_PREFIX/bin/opt" -load-pass-plugin=./Obfuscator-macos-arm64-llvm${{ inputs.llvm_major }}.dylib -passes=obfuscation ann.ll -S -o ann_obf.ll
+          "$LLVM_PREFIX/bin/opt" -passes=verify ann_obf.ll -disable-output
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xollvm-plugin-macos-llvm${{ inputs.llvm_major }}
+          path: Obfuscator-macos-arm64-llvm${{ inputs.llvm_major }}.dylib
+          retention-days: 14
+          if-no-files-found: error
