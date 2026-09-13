@@ -970,7 +970,7 @@ namespace {
 				continue;
 			}
 
-			if (!Disp->getTerminator()) {
+			if (!Disp->hasTerminator()) {
 				OS << "[flattening] Dispatcher has no terminator: " << Disp->getName()
 					<< "\n";
 				Broken = true;
