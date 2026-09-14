@@ -19,6 +19,45 @@
 
 namespace llvm::obf {
 
+	// ----------------------------------------------------------------------
+	// Obfuscator-generated function marker
+	//
+	// Functions the obfuscator synthesizes mid-pipeline (e.g. the VM's
+	// __vm_engine interpreter, handler thunks, anti-debug/crypto helpers)
+	// must never be re-driven by ObfuscationFunctionDriverPass: they carry
+	// no source annotation, and re-running analyses/passes on them is at
+	// best wasteful and at worst fatal (the 100k+ instruction VM engine).
+	//
+	// LLVM's function-pass adaptor iterates the module's function list, and
+	// on LLVM 23 it visits functions appended during that same iteration, so
+	// the driver would otherwise pick up these generated functions. We tag
+	// them at creation and early-return for them at the driver entry.
+	constexpr const char* GeneratedFnAttr = "obf-generated";
+
+	inline void markObfGenerated(llvm::Function& F) {
+		F.addFnAttr(GeneratedFnAttr);
+	}
+	inline bool isObfGenerated(const llvm::Function& F) {
+		return F.hasFnAttribute(GeneratedFnAttr);
+	}
+
+	// ----------------------------------------------------------------------
+	// Version-agnostic "is this block terminated?" check.
+	//
+	// LLVM 23 added BasicBlock::hasTerminator() and changed getTerminator()
+	// to require a well-formed block (llvm/llvm-project#189416): in a Release
+	// build its assert compiles out, so `!getTerminator()` no longer detects
+	// an unterminated block. hasTerminator() does NOT exist on LLVM 22, so we
+	// spell out its definition here — non-empty and last instruction is a
+	// terminator — which is stable across LLVM 22 and 23 and sidesteps the
+	// getTerminator() trap entirely. Use this instead of either API.
+	inline bool hasTerminatorCompat(const llvm::BasicBlock& BB) {
+		return !BB.empty() && BB.back().isTerminator();
+	}
+	inline bool hasTerminatorCompat(const llvm::BasicBlock* BB) {
+		return BB && hasTerminatorCompat(*BB);
+	}
+
 	std::vector<std::string> readAnnotations(llvm::Function* F);
 
 	llvm::Value* getObfEntropyI32(llvm::IRBuilder<>& B);

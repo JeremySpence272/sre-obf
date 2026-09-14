@@ -26,6 +26,7 @@
 #include "llvm/Transforms/Obfuscator/SeedManifest.h"
 #include "llvm/Transforms/Obfuscator/StringEncryption.h"
 #include "llvm/Transforms/Obfuscator/TargetCompat.h"
+#include "llvm/Transforms/Obfuscator/Utils.h"
 
 namespace llvm {
 
@@ -34,6 +35,13 @@ namespace llvm {
 	public:
 		PreservedAnalyses run(Function& F, FunctionAnalysisManager& FAM) {
 			if (F.isDeclaration())
+				return PreservedAnalyses::all();
+
+			// Never re-drive functions the obfuscator itself synthesized
+			// (VM engine/handlers, helpers). On LLVM 23 the function-pass
+			// adaptor visits functions appended mid-run, which would feed
+			// the 100k+ instruction __vm_engine back through here.
+			if (llvm::obf::isObfGenerated(F))
 				return PreservedAnalyses::all();
 
 			// Global cost/safety caps (deterministic skip).

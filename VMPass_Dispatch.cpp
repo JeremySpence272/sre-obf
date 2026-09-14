@@ -24,6 +24,7 @@
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 #include "llvm/Transforms/Obfuscator/VMPass_Emitter.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
+#include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 
 #include <functional>
@@ -158,7 +159,7 @@ void VMImpl::buildDispatch() {
 		// (nextInsn -> emitThreadedTail) could reference the full successor
 		// set as it was built. All that remains is wiring vm.entry to fetch
 		// the first instruction, same as any other handler's back-edge.
-		if (Entry && !Entry->getTerminator()) {
+		if (Entry && !llvm::obf::hasTerminatorCompat(Entry)) {
 			IRBuilder<> EB(Entry);
 			nextInsn(EB);
 		}
@@ -270,7 +271,7 @@ void VMImpl::buildDispatch() {
 	}
 
 	// Terminate vm.entry with branch to vm.dispatch
-	if (Entry && !Entry->getTerminator()) {
+	if (Entry && !llvm::obf::hasTerminatorCompat(Entry)) {
 		IRBuilder<> EB(Entry);
 		nextInsn(EB);
 	}
@@ -521,6 +522,7 @@ void VMImpl::populateVMEngine() {
 	EF->addFnAttr(Attribute::NoInline);
 	EF->addFnAttr(Attribute::OptimizeNone);
 	EF->setUnnamedAddr(GlobalValue::UnnamedAddr::None);
+	llvm::obf::markObfGenerated(*EF);
 	SS->EngineFn = EF;
 
 

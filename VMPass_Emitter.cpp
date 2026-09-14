@@ -16,11 +16,24 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "llvm/Config/llvm-config.h" // LLVM_VERSION_MAJOR
+
 #include "llvm/Transforms/Obfuscator/VMPass_ISA.h"
 
 using namespace llvm;
 
 #define DEBUG_TYPE "vm"
+
+// LLVM 23 split the unified `Br` opcode into `UncondBr`/`CondBr`
+// (llvm/llvm-project#184027). Match both spellings across supported LLVM
+// versions so the emitter builds against LLVM 22 and 23 alike.
+static inline bool isBranchOpcode(unsigned Op) {
+#if LLVM_VERSION_MAJOR >= 23
+	return Op == Instruction::UncondBr || Op == Instruction::CondBr;
+#else
+	return Op == Instruction::Br;
+#endif
+}
 
 STATISTIC(VMBytecodeBytes, "Total bytecode bytes emitted (v7)");
 STATISTIC(VMVirtRegs, "Virtual register slots allocated (v7)");
@@ -247,7 +260,7 @@ uint32_t BytecodeEmitter::isize(Instruction* I) {
 		if (Ty->isFloatTy() || Ty->isDoubleTy()) return 7 + NA;  // OP_CALL_F
 		markUnsupported(I); return 0;
 	}
-	if (Op == Instruction::Br)
+	if (isBranchOpcode(Op))
 		return cast<BranchInst>(I)->isUnconditional() ? 5 : 10;
 
 	if (Op == Instruction::Switch) {
@@ -974,7 +987,7 @@ void BytecodeEmitter::emit(Instruction* I) {
 	}
 
 
-	if (Op == Instruction::Br) {
+	if (isBranchOpcode(Op)) {
 		auto* BI = cast<BranchInst>(I);
 		if (BI->isUnconditional()) {
 			bop(OP_JMP); fixup_u32(BI->getSuccessor(0));
