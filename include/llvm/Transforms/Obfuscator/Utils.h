@@ -41,6 +41,23 @@ namespace llvm::obf {
 		return F.hasFnAttribute(GeneratedFnAttr);
 	}
 
+	// ----------------------------------------------------------------------
+	// Version-agnostic "is this block terminated?" check.
+	//
+	// LLVM 23 added BasicBlock::hasTerminator() and changed getTerminator()
+	// to require a well-formed block (llvm/llvm-project#189416): in a Release
+	// build its assert compiles out, so `!getTerminator()` no longer detects
+	// an unterminated block. hasTerminator() does NOT exist on LLVM 22, so we
+	// spell out its definition here — non-empty and last instruction is a
+	// terminator — which is stable across LLVM 22 and 23 and sidesteps the
+	// getTerminator() trap entirely. Use this instead of either API.
+	inline bool hasTerminatorCompat(const llvm::BasicBlock& BB) {
+		return !BB.empty() && BB.back().isTerminator();
+	}
+	inline bool hasTerminatorCompat(const llvm::BasicBlock* BB) {
+		return BB && hasTerminatorCompat(*BB);
+	}
+
 	std::vector<std::string> readAnnotations(llvm::Function* F);
 
 	llvm::Value* getObfEntropyI32(llvm::IRBuilder<>& B);

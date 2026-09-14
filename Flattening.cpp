@@ -970,7 +970,7 @@ namespace {
 				continue;
 			}
 
-			if (!Disp->hasTerminator()) {
+			if (!llvm::obf::hasTerminatorCompat(Disp)) {
 				OS << "[flattening] Dispatcher has no terminator: " << Disp->getName()
 					<< "\n";
 				Broken = true;

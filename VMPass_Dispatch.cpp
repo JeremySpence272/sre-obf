@@ -159,7 +159,7 @@ void VMImpl::buildDispatch() {
 		// (nextInsn -> emitThreadedTail) could reference the full successor
 		// set as it was built. All that remains is wiring vm.entry to fetch
 		// the first instruction, same as any other handler's back-edge.
-		if (Entry && !Entry->hasTerminator()) {
+		if (Entry && !llvm::obf::hasTerminatorCompat(Entry)) {
 			IRBuilder<> EB(Entry);
 			nextInsn(EB);
 		}
@@ -271,7 +271,7 @@ void VMImpl::buildDispatch() {
 	}
 
 	// Terminate vm.entry with branch to vm.dispatch
-	if (Entry && !Entry->hasTerminator()) {
+	if (Entry && !llvm::obf::hasTerminatorCompat(Entry)) {
 		IRBuilder<> EB(Entry);
 		nextInsn(EB);
 	}

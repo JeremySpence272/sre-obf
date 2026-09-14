@@ -297,7 +297,7 @@ namespace {
 		BasicBlock* bogusBB =
 			BasicBlock::Create(F.getContext(), "bcf.bogus", &F, realBB);
 		// Remove the unconditional branch auto-inserted by splitBasicBlock().
-		if (BB->hasTerminator())
+		if (llvm::obf::hasTerminatorCompat(BB))
 			BB->getTerminator()->eraseFromParent();
 
 
