@@ -14,6 +14,7 @@
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
@@ -446,6 +447,29 @@ Value* MbaUtils::applyMBARecursive(IRBuilder<>& B, BinaryOperator* BO,
 	unsigned depth, Rng& RecRng) {
 	if (depth == 0 || !BO)
 		return BO;
+
+	// Every MBA identity duplicates one or both operands. Raw `undef` may take
+	// a different bit pattern at each use, and poison propagates similarly, so
+	// an identity that is correct for a fixed bit-vector can be wrong after
+	// duplication. Stabilize each affected operand once, on the original BO,
+	// before the core rewrite or any advanced zero-builder (addSleZero /
+	// addInputDerivedZero, which read BO's operands after this returns) can
+	// duplicate them.
+	//
+	// Freeze ONLY operands that may actually be undef/poison. Freezing a
+	// provably-defined value (the overwhelmingly common case) is a semantic
+	// no-op but not a free one: the extra instruction displaces real binary
+	// operators from the fixed-size layered-window scans that run later,
+	// measurably reducing MBA coverage. Guarding on
+	// isGuaranteedNotToBeUndefOrPoison keeps the correctness fix while leaving
+	// defined-operand IR (and downstream MBA strength) unchanged.
+	for (unsigned I = 0; I < 2; ++I) {
+		Value* Operand = BO->getOperand(I);
+		if (isGuaranteedNotToBeUndefOrPoison(Operand))
+			continue;
+		Value* Stable = B.CreateFreeze(Operand, "mba.operand.freeze");
+		BO->setOperand(I, Stable);
+	}
 
 	bool useAlt = (RecRng.range(2) != 0);
 	Value* NewV = useAlt ? applyAlternate(B, BO) : applyPrimary(B, BO);
