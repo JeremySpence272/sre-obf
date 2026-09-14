@@ -1,0 +1,43 @@
+#include <stdint.h>
+#include <stdlib.h>
+
+// Oversized shift counts (>= bit width) are `poison` per LLVM's shl/lshr
+// semantics (LangRef "Poison Values"). This routes a poison-tainted i32
+// through several MBA-eligible add/sub/and/or/xor binops so
+// MbaUtils::applyMBARecursive (MBAUtils.cpp) has to rewrite operators whose
+// operand is not fully defined -- the situation the operand-freeze fix
+// targets (an MBA identity duplicates an operand; a duplicated undef/poison
+// operand that resolved differently per use would corrupt the rewrite).
+//
+// The poison-derived terms are deliberately never folded into the return
+// value: doing so would make the *expected* output itself unspecified,
+// which a correctness test cannot assert against. What this case verifies
+// is that MBA's rewrite of those poison-fed binops does not crash, does
+// not fail IR verification, and does not perturb the separately-computed,
+// fully-defined part of the function.
+__attribute__((noinline, annotate("{annotation}")))
+uint32_t obf_target(uint32_t a, uint32_t b) {{
+  volatile uint32_t sink;
+
+  uint32_t shiftAmt = 32u + (b & 1u);   // always 32 or 33: oversized
+  uint32_t poisonHi = a << shiftAmt;    // poison (shl count >= bitwidth)
+  uint32_t poisonLo = b >> shiftAmt;    // poison (lshr count >= bitwidth)
+
+  // MBA-eligible i32 binops fed by a poison operand -- routed to a
+  // volatile sink so nothing here can influence the returned value.
+  uint32_t t1 = poisonHi + a;
+  uint32_t t2 = poisonLo ^ b;
+  uint32_t t3 = t1 & t2;
+  uint32_t t4 = t3 | poisonHi;
+  sink = t4;
+  (void)sink;
+
+  // Fully-defined output: ordinary arithmetic on a, b only.
+  return (a + b) ^ (a - b) ^ (a & b) ^ (a | b);
+}}
+
+int main(int argc, char **argv) {{
+  uint32_t a = (argc > 1) ? (uint32_t)strtoul(argv[1], 0, 0) : 123u;
+  uint32_t b = (argc > 2) ? (uint32_t)strtoul(argv[2], 0, 0) : 456u;
+  return (int)(obf_target(a, b) & 0xFFu);
+}}
