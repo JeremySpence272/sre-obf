@@ -341,6 +341,10 @@ def render_complex_logic_program(annotation: str) -> str:
     return programs.render("base.complex_logic", annotation=annotation)
 
 
+def render_budget_recursive_flatten_program(annotation: str) -> str:
+    return programs.render("budget.recursive_flatten", annotation=annotation)
+
+
 def render_vm_v7_memory_program(annotation: str) -> str:
     return programs.render("vm.memory", annotation=annotation)
 

@@ -1,0 +1,44 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+// Bounded self-recursion (depth <= 3, decremented each call) plus a
+// switch-in-a-loop body: enough native control flow that flattening (which
+// does not read the IR budget) balloons the block/instruction count well
+// past a tight hard cap in a single pass invocation.
+__attribute__((noinline, annotate("{annotation}")))
+uint32_t obf_target(uint32_t x, uint32_t y) {{
+    uint32_t res = x ^ y;
+    uint32_t depth = x % 4u;
+    for (uint32_t i = 0; i < 6u; ++i) {{
+        switch ((res + i) % 5u) {{
+            case 0:
+                for (uint32_t j = 0; j < (y % 6u) + 1u; j++) res ^= (y + j);
+                break;
+            case 1:
+                if (res > y) res -= y; else res += x;
+                break;
+            case 2:
+                res = (res << 3) | (res >> 29);
+                break;
+            case 3:
+                res *= 31u;
+                break;
+            case 4:
+                if (depth > 0u)
+                    res ^= obf_target(depth - 1u, res) + i;
+                else
+                    res += y;
+                break;
+        }}
+        if (res & 0x80000000u) res >>= 1;
+    }}
+    return res;
+}}
+
+int main(int argc, char** argv) {{
+    uint32_t x = (argc > 1) ? (uint32_t)strtoul(argv[1], 0, 0) : 123u;
+    uint32_t y = (argc > 2) ? (uint32_t)strtoul(argv[2], 0, 0) : 456u;
+    printf("R=%u\n", obf_target(x, y));
+    return 0;
+}}

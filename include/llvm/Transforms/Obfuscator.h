@@ -27,8 +27,58 @@
 #include "llvm/Transforms/Obfuscator/StringEncryption.h"
 #include "llvm/Transforms/Obfuscator/TargetCompat.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 
 namespace llvm {
+
+	namespace {
+
+		// ================================================================
+		// Transactional budget enforcement: snapshot / restore helpers
+		// ================================================================
+		//
+		// Used by the per-pass driver loop below to give the absolute IR
+		// budget hard cap a real guarantee: if a single pass expands a
+		// function past the cap, the function is rolled back to its
+		// pre-pass state and the pass is recorded as skipped, rather than
+		// merely being caught (too late) by the *next* pass's pre-check.
+
+		/// Take a full, throwaway snapshot of \p F's current body. The
+		/// clone lives in F's module (self-recursive calls inside F keep
+		/// resolving to the original @F, which is what we want -- only the
+		/// snapshot's *body* is ever consulted, via restoreFunctionSnapshot).
+		/// Caller owns the returned Function and must eraseFromParent() it.
+		Function* snapshotFunction(Function& F) {
+			ValueToValueMapTy SnapVMap;
+			Function* Snap = CloneFunction(&F, SnapVMap);
+			Snap->setLinkage(GlobalValue::InternalLinkage);
+			return Snap;
+		}
+
+		/// Replace \p F's (bloated) body with a fresh clone of \p Snap's
+		/// pristine body, taken by snapshotFunction() before the offending
+		/// pass ran. Does not erase \p Snap -- the caller still owns it.
+		void restoreFunctionSnapshot(Function& F, Function* Snap) {
+			// Function::deleteBody() forces ExternalLinkage as a side
+			// effect (see FunctionMerging.cpp's buildThunk for the same
+			// gotcha) -- save/restore around it so an internal F stays
+			// internal.
+			AttributeList SavedAttrs = F.getAttributes();
+			GlobalValue::LinkageTypes SavedLinkage = F.getLinkage();
+			F.deleteBody();
+			F.setLinkage(SavedLinkage);
+
+			ValueToValueMapTy BackVMap;
+			for (unsigned i = 0, e = F.arg_size(); i != e; ++i)
+				BackVMap[Snap->getArg(i)] = F.getArg(i);
+
+			SmallVector<ReturnInst*, 8> Returns;
+			CloneFunctionInto(&F, Snap, BackVMap,
+				CloneFunctionChangeType::LocalChangesOnly, Returns);
+			F.setAttributes(SavedAttrs);
+		}
+
+	} // namespace
 
 	class ObfuscationFunctionDriverPass
 		: public PassInfoMixin<ObfuscationFunctionDriverPass> {
@@ -325,6 +375,17 @@ namespace llvm {
 				uint64_t PassSeed = llvm::obf::deriveSeed(FnSeed, Entry.Name);
 				Budget.recordPassStart(Entry.Name, CurrentInsts, PassSeed);
 
+				// --- Transactional snapshot ---
+				// Only taken when a hard cap is actually configured for this
+				// function (per-annotation `budgetMax=`/`budgetMultiplier=`
+				// override -> Cfg.budgetHardCap > 0). With no hard cap, Snap
+				// stays null and nothing below this point changes behavior:
+				// byte-identical output for every default (no-budget-knobs)
+				// run is preserved.
+				Function* Snap = nullptr;
+				if (Budget.isEnabled() && Cfg.budgetHardCap > 0)
+					Snap = snapshotFunction(F);
+
 				// --- Run the pass ---
 				PreservedAnalyses PA = Entry.Run(F, FAM);
 				bool Changed = !PA.areAllPreserved();
@@ -332,6 +393,36 @@ namespace llvm {
 				if (Changed) {
 					AnyChanged = true;
 					FAM.invalidate(F, PA);
+				}
+
+				// --- Transactional rollback: pass blew past the hard cap ---
+				if (Snap) {
+					unsigned PostRunInsts = llvm::obf::countInstructions(F);
+					if (PostRunInsts > Cfg.budgetHardCap) {
+						restoreFunctionSnapshot(F, Snap);
+						Snap->eraseFromParent();
+						Snap = nullptr;
+
+						FAM.invalidate(F, PreservedAnalyses::none());
+						Budget.markLastRecordSkipped("budget_rollback");
+
+						if (ObfVerbose)
+							errs() << "[budget] " << F.getName() << ": ROLLBACK '" << Entry.Name
+								<< "' (" << PostRunInsts << " > cap " << Cfg.budgetHardCap
+								<< "), skipping its changes\n";
+
+						if (llvm::ObfNoSkips) {
+							report_fatal_error(
+								Twine("obfuscator: -obf-no-skips: budget rollback on '")
+								+ Entry.Name + "' for '" + F.getName() + "'",
+								/*gen_crash_diag=*/false);
+						}
+
+						continue;
+					}
+					// Kept: the snapshot is no longer needed.
+					Snap->eraseFromParent();
+					Snap = nullptr;
 				}
 
 				// --- Pass-published skip channel ---
