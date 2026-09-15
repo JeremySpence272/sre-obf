@@ -243,6 +243,21 @@ ObfuscationConfig AnnotationParser::parseAnnotations(Function* F) {
 				finalConfig.passes.push_back(pc);
 			}
 		}
+
+		// Propagate this annotation's top-level budget overrides too --
+		// parseAnnotationString() already derived them from the passes'
+		// params (see the loop at the end of that function), but only the
+		// `.passes` vector was merged above. Without this, a per-function
+		// `budgetMax=`/`budget=`/`budgetMultiplier=` annotation override
+		// is parsed successfully yet silently discarded, leaving
+		// ObfuscationConfig::budgetHardCap/budgetMultiplier at 0 (CLI-only
+		// fallback) even though the annotation set them explicitly. Last
+		// annotation to set a given field wins, consistent with the
+		// per-pass param merge semantics above.
+		if (parsedConfig.budgetMultiplier)
+			finalConfig.budgetMultiplier = parsedConfig.budgetMultiplier;
+		if (parsedConfig.budgetHardCap)
+			finalConfig.budgetHardCap = parsedConfig.budgetHardCap;
 	}
 
 	if (ObfVerbose)
