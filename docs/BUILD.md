@@ -29,8 +29,13 @@ Mode-specific:
 
 | Build | Also needs |
 |---|---|
-| Static extension (toolchain) | A checkout of **stock LLVM** (`release/22.x`) and an **external `clang`** on `PATH` (see the cycle note below) |
-| Loadable plugin | An **installed LLVM 22** with CMake config + dev headers (`llvm-22-dev`) and `clang-22` |
+| Static extension (toolchain) | A checkout of **stock LLVM** (`release/22.x` **or** `release/23.x`) and an **external `clang`** on `PATH` (see the cycle note below) |
+| Loadable plugin | An **installed LLVM 22 or 23** with CMake config + dev headers (`llvm-22-dev` / `llvm-23-dev`) and `clang-22` / `clang-23` |
+
+> [!NOTE]
+> xollvm supports **LLVM 22 and 23** from the same sources — the version is detected at compile
+> time (`LLVM_VERSION_MAJOR`), no flags to set. Every command below that pins `release/22.x`
+> works identically with `release/23.x`. Changes are validated against both before merge.
 
 ### The external-clang requirement (static extension only)
 
@@ -38,7 +43,7 @@ The AES runtime stub is compiled to LLVM bitcode by `clang`. When the obfuscator
 the tools (`LINK_INTO_TOOLS`), it **cannot** use the in-tree `clang` being built — that would form a
 dependency cycle (`clang` → `LLVMExtensions` → `Obfuscator` → aes → `clang`). So the build uses a
 **separate, already-installed `clang`** found on `PATH`. Any reasonably recent clang works; its
-bitcode is read by the LLVM 22 you're building (LLVM reads older bitcode).
+bitcode is read by the LLVM 22/23 you're building (LLVM reads older bitcode).
 
 - **Linux:** `sudo apt-get install -y clang` (or `clang-NN`)
 - **Windows:** `choco install llvm` (provides `C:\Program Files\LLVM\bin\clang.exe`)
@@ -124,7 +129,7 @@ cmake --build build --target install-distribution
 
 ## 3. Loadable plugin — `Obfuscator.so` (Linux / macOS)
 
-Builds only the pass, against an **installed** LLVM 22. No LLVM source build needed — fast.
+Builds only the pass, against an **installed** LLVM 22 or 23. No LLVM source build needed — fast.
 
 ```bash
 # Ubuntu 24.04 has no clang-22/llvm-22 in its default repos; add apt.llvm.org:

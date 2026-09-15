@@ -4,9 +4,9 @@
 
 # xollvm
 
-**🛡️ Annotation-driven LLVM 22 obfuscator · new pass manager · zero LLVM source edits**
+**🛡️ Annotation-driven LLVM 22 & 23 obfuscator · new pass manager · zero LLVM source edits**
 
-![LLVM](https://img.shields.io/badge/LLVM-22.x-262D3A?logo=llvm&logoColor=white)
+![LLVM](https://img.shields.io/badge/LLVM-22.x%20%7C%2023.x-262D3A?logo=llvm&logoColor=white)
 ![License](https://img.shields.io/badge/license-Apache--2.0%20WITH%20LLVM--exception-4C7EF3)
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20·%20Windows%20·%20macOS-16A34A)
 ![Passes](https://img.shields.io/badge/passes-11-8B5CF6)
@@ -119,10 +119,12 @@ Backends included: `X86;AArch64;ARM;RISCV`.
 
 ### Option 2 — Build the toolchain from stock LLVM (static extension)
 
-No fork, no patch — point LLVM's build at this repo:
+No fork, no patch — point LLVM's build at this repo. xollvm builds against **both
+LLVM 22 and LLVM 23** (`release/22.x` or `release/23.x`) from the same sources — the
+version is detected at compile time, no flags to flip:
 
 ```bash
-git clone --depth 1 --branch release/22.x https://github.com/llvm/llvm-project
+git clone --depth 1 --branch release/22.x https://github.com/llvm/llvm-project  # or release/23.x
 git clone https://github.com/und3ath/xollvm
 
 cmake -S llvm-project/llvm -B build -G Ninja \
@@ -144,8 +146,8 @@ cmake --build build --target install
 ### Option 3 — Build the loadable plugin (`.so`)
 
 ```bash
-# needs an installed LLVM 22 (e.g. apt llvm-22-dev)
-cmake -S xollvm -B build -G Ninja -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm
+# needs an installed LLVM 22 or 23 (e.g. apt llvm-22-dev / llvm-23-dev)
+cmake -S xollvm -B build -G Ninja -DLLVM_DIR=/usr/lib/llvm-22/lib/cmake/llvm  # or .../llvm-23/...
 ninja -C build Obfuscator          # -> build/Obfuscator.so
 ```
 

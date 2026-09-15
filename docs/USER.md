@@ -221,9 +221,20 @@ opt -passes=obf-metrics -S test.ll -o /dev/null > metrics.jsonl
 | `-obf-ir-budget-multiplier=<N>` | 50 | Budget limit = `insts_before × N` (clamped by `-obf-ir-budget-max`). 0 = unlimited. |
 | `-obf-ir-budget-max=<N>` | 0 (off) | Absolute IR instruction ceiling per function. 0 = no hard cap. |
 
+The multiplier limit is **advisory**: budget-aware passes self-throttle toward it, and the
+driver skips remaining passes once it is already exceeded before a pass runs. The hard cap
+(`-obf-ir-budget-max`, or the `budgetMax=` annotation token) is a **hard guarantee**: when a
+single pass expands a function past the cap, the driver **rolls that function back** to its
+pre-pass body (snapshot/restore) and records the pass as skipped with reason `budget_rollback`.
+This stops a non-throttling or pathological pass (e.g. flattening on a nasty CFG) from ever
+shipping a function larger than the cap. With no hard cap set (the default) no snapshot is
+taken and output is unchanged.
+
 > [!NOTE]
-> Budget knobs are global — they cannot currently be expressed as per-function annotation tokens.
-> Use the command-line options above to tune budgets globally.
+> Budgets can be set **globally** via the command-line options above, or **per function** via
+> annotation tokens: `budget=<N>` / `budgetMultiplier=<N>` (the multiplier) and `budgetMax=<N>`
+> (the hard cap). Per-function annotation values override the global CLI defaults for that
+> function; the last annotation to set a given field wins.
 
 ### Pipeline ordering overrides
 
