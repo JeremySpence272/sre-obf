@@ -211,7 +211,24 @@ Each pass consumes from the remaining budget as the instruction count grows.
 When the budget is exhausted (or the hard cap is hit), later passes in the pipeline
 may be skipped. Budget state and utilization are recorded in the report JSON.
 
-Global knobs: `-obf-ir-budget-multiplier` (default 50×), `-obf-ir-budget-max` (default 0 = no hard cap).
+Two enforcement tiers:
+
+- **Advisory (multiplier limit).** Before each pass the driver checks `isExhausted(current)`
+  and skips the remaining pipeline if already over; budget-aware passes also read
+  `FOC.BudgetRemaining` and self-throttle toward the limit. This is best-effort — a pass that
+  starts under the limit but expands past it in one run, or a pass that ignores the budget
+  (e.g. `split`, `flattening`), is not stopped mid-flight.
+- **Transactional (hard cap).** When `budgetHardCap > 0`, the driver snapshots the function
+  (`CloneFunction`) *before* running a pass; if the post-pass instruction count exceeds the
+  hard cap it **restores** the pre-pass body (`deleteBody` + `CloneFunctionInto`, remapping
+  arguments and `blockaddress` via the value map) and records the pass as skipped with reason
+  `budget_rollback`. This makes the hard cap a real ceiling rather than an advisory check.
+  Snapshotting is gated on `Budget.isEnabled() && budgetHardCap > 0`, so with no hard cap
+  configured no clone is taken and behavior is byte-identical to a budget-free run.
+
+Knobs: `-obf-ir-budget-multiplier` (default 50×) and `-obf-ir-budget-max` (default 0 = no hard
+cap), or per-function annotation tokens `budgetMultiplier=`/`budget=` and `budgetMax=` (merged
+into the function's `ObfuscationConfig` by `AnnotationParser::parseAnnotations`, last wins).
 
 ---
 
@@ -364,6 +381,26 @@ Every obfuscation pass **must**:
 
 Incorrect preservation causes stale analyses to be reused, corrupts the "changed" signal in
 reports, and can introduce subtle correctness bugs.
+
+### MBA operand freeze (undef/poison)
+
+Every MBA identity in `MbaUtils::applyMBARecursive` duplicates one or both operands. A raw
+`undef` operand may take a different bit pattern at each use (poison behaves similarly), so an
+identity that is correct for a fixed bit-vector can be wrong after duplication. The rewrite
+therefore `freeze`s each operand that is **not** provably defined
+(`isGuaranteedNotToBeUndefOrPoison`) before duplicating it. The guard avoids emitting a freeze
+for the common defined-operand case, so IR size and downstream MBA coverage are unchanged.
+
+### Optimization-resistant indirect branches (ADec)
+
+The ADec `indirectBr` technique must survive the **stock `-O2`** that runs after the obfuscator.
+A single statically-known `BlockAddress` routed through a volatile slot is constant-propagated
+and folded straight back to a direct branch. Instead the technique routes through two live,
+semantically-equivalent destination blocks (each doing a *distinct* volatile store so CSE cannot
+merge them) that join before the original target, and selects between them with an
+address-derived value (`ptrtoint` of a stack slot) the optimizer cannot resolve. PHIs at the
+target have their incoming edge rewired from the source block to the join block. The result is
+opaque yet correct, and the `indirectbr` survives `-O2`.
 
 ### SSA repair
 
