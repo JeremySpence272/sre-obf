@@ -1,0 +1,33 @@
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Several unconditional-branch join points, most landing on a PHI node
+ * (ternaries lower to two unconditional-branch predecessors joining on a
+ * `phi` even at -O0), used to exercise ADec's indirectBr technique: each
+ * converted branch must still land on the correct successor AND leave any
+ * PHI at that successor with a working incoming edge. */
+__attribute__((noinline, annotate("{annotation}")))
+uint32_t obf_target(uint32_t x, uint32_t y) {{
+    uint32_t a = (x > y) ? (x - y) : (x + y);
+    uint32_t b = (x & 1u) ? (y ^ 0x5A5Au) : (y * 3u + 1u);
+
+    uint32_t c;
+    if (a > b) {{
+        c = a - b;
+    }} else {{
+        c = a + b;
+    }}
+
+    uint32_t d = ((a ^ b) > c) ? (c + 7u) : (c - 7u);
+    uint32_t e = (d & 2u) ? (a ^ c) : (b ^ d);
+
+    return e + (x ^ y);
+}}
+
+int main(int argc, char** argv) {{
+    uint32_t x = (argc > 1) ? (uint32_t)strtoul(argv[1], 0, 0) : 123u;
+    uint32_t y = (argc > 2) ? (uint32_t)strtoul(argv[2], 0, 0) : 456u;
+    printf("R=%u\n", obf_target(x, y));
+    return 0;
+}}

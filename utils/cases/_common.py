@@ -77,6 +77,16 @@ EXTRA_ANN: Dict[str, str] = {
         "adec(prob=70,strength=2,maxSites=30)"
     ),
     "adec_selective": "adec(prob=100,strength=2,maxSites=40,asm=0,alias=0)",
+    # Isolate indirectBr: prob=100 + maxSites high enough to convert every
+    # eligible unconditional branch, every other technique disabled so the
+    # emitted IR pattern is unambiguous (regression guard for the
+    # opt-O2-folds-the-trampoline-back-to-a-direct-branch bug).
+    "adec_indirectbr_only": (
+        "adec(prob=100,strength=2,maxSites=30,indirectBr=1,"
+        "asmAntiDisasm=0,stackPollution=0,deadCodeDecoys=0,"
+        "callObfuscation=0,aliasConfusion=0,fakeLoop=0,"
+        "rdtscStretch=0,constLaunder=0)"
+    ),
     "adec_with_flat": (
         "flattening(minBlocks=3,maxBlocks=120), "
         "adec(prob=70,strength=2,maxSites=25)"
