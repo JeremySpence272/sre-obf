@@ -956,10 +956,10 @@ namespace {
                 Changed = true;
             }
 
-            ++EncryptedStrings;
-
-            if (GV->use_empty())
+            if (GV->use_empty()) {
                 GV->eraseFromParent();
+                ++EncryptedStrings;
+            }
         }
 
         return Changed;
@@ -1171,7 +1171,6 @@ namespace {
             }
 
             AllCandGVs.push_back(GV);
-            ++EncryptedStrings;
         }
 
         // ── Phase 2: per using function — single forward-advancing IRBuilder ──
@@ -1404,8 +1403,10 @@ namespace {
 
         // ── Phase 3: cleanup — erase candidate globals now fully replaced ──
         for (GlobalVariable* GV : AllCandGVs)
-            if (GV->use_empty())
+            if (GV->use_empty()) {
                 GV->eraseFromParent();
+                ++EncryptedStrings;
+            }
 
         return Changed;
     }
