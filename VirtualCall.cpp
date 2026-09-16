@@ -237,7 +237,10 @@ namespace {
 		// Make it unattractive to inline/merge
 		Thunk->addFnAttr(Attribute::NoInline);
 		Thunk->addFnAttr(Attribute::Cold);
-		Thunk->addFnAttr(Attribute::NoUnwind);
+		// Only claim nounwind if the callee truly can't unwind; a nounwind thunk
+		// wrapping a throwing callee aborts the program on unwind.
+		if (Callee->doesNotThrow())
+			Thunk->addFnAttr(Attribute::NoUnwind);
 
 		// Match calling convention to avoid ABI surprises
 		Thunk->setCallingConv(Callee->getCallingConv());
