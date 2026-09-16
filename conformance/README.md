@@ -44,6 +44,13 @@ the expected output count must match. Arithmetic requires flattening to have
 actually changed the function. One-block fixtures explicitly lack that
 requirement. All runtime execution belongs to trusted correctness testing.
 
+An ordinary source `clang -O2` release arm is also checked, so backend/wrapper
+differences cannot be mistaken for obfuscation. Correctness precedes optional
+decompilation. Use `--no-diversity`, `--no-data`, `--no-helpers`, `--no-late`
+for F1–F3 ablations; `--family 0..3` forces a representation family. `--passes`
+filters application passes, while feature/helper flags remain independent.
+The widths fixture requires all four supported array widths to be encoded.
+
 Assembly, relocations, stripped ELF, Ghidra C and high-pcode counts are saved.
 The literal positive control must be recovered by Ghidra; the deliberately
 foldable negative control must simplify. `--require-literal-hiding` additionally

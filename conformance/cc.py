@@ -12,7 +12,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from conformance.process import Runner, ToolFailure, digest, dump
-from conformance.run import ROOT, opt_command
+from conformance.run import ROOT, opt_command, image_identity
 
 PAIRED = {"-I", "-isystem", "-iquote", "-include", "-imacros", "-D", "-U",
           "-target", "--target", "-MF", "-MT", "-MQ", "-isysroot", "--sysroot"}
@@ -97,16 +97,18 @@ def main(args: list[str] | None = None) -> int:
         mounts = tuple({Path(arg).resolve().parent for arg in args
                         if not arg.startswith("-") and Path(arg).is_file()} |
                        {output.parent})
-        runner = Runner(ROOT, work / "logs", image, mounts=mounts)
+        runner = Runner(Path.cwd(), work / "logs", image, mounts=mounts)
         runner.run(["clang", *args])
         dump(Path(str(output) + ".sre.json"), {
             "schema": "sre-native-link-v1", "output_sha256": digest(output),
+            "toolchain_image": image_identity(image),
             "commands": runner.records})
         return 0
 
     source, output, flags = compile_args(args)
     work = Path(tempfile.mkdtemp(prefix=f".{output.name}.sre-", dir=output.parent))
-    runner = Runner(ROOT, work / "logs", image, mounts=(source.parent, output.parent))
+    runner = Runner(Path.cwd(), work / "logs", image,
+                    mounts=(source.parent, output.parent, plugin.parent))
     optimized, protected = work / "optimized.ll", work / "protected.ll"
     runner.run(["clang", *flags, "-S", "-emit-llvm", str(source), "-o", str(optimized)])
     if profile == "none":
@@ -123,6 +125,8 @@ def main(args: list[str] | None = None) -> int:
                 "-c", str(protected), "-o", str(output)])
     dump(Path(str(output) + ".sre.json"), {
         "schema": "sre-native-object-v1", "profile": profile, "seed": seed,
+        "toolchain_image": image_identity(image),
+        "adapter_sha256": digest(Path(__file__)),
         "plugin_sha256": digest(plugin) if profile != "none" else None,
         "source_sha256": digest(source), "optimized_ir_sha256": digest(optimized),
         "protected_ir_sha256": digest(protected), "output_sha256": digest(output),

@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/OpaqueUtils.h"
+#include "llvm/Transforms/Obfuscator/NativeEncoding.h"
 #include "llvm/Transforms/Obfuscator/Utils.h" 
 
 #include "llvm/IR/Constants.h"
@@ -73,11 +74,13 @@ namespace llvm::obf {
 		Type* I32 = Type::getInt32Ty(C);
 
 		BasicBlock& Entry = F->getEntryBlock();
+		bool Late = F->getFnAttribute("sre.native.stage").getValueAsString() == "late";
+		std::string AnchorName = Late ? SlotName + ".native.late" : SlotName;
 
 		// Reuse if present in entry.
 		for (Instruction& I : Entry) {
 			if (auto* AI = dyn_cast<AllocaInst>(&I)) {
-				if (AI->getName() == SlotName && AI->getAllocatedType()->isIntegerTy(32)) {
+				if (AI->getName() == AnchorName && AI->getAllocatedType()->isIntegerTy(32)) {
 					CachedFn = F;
 					CachedSlot = AI;
 					return AI;
@@ -90,14 +93,18 @@ namespace llvm::obf {
 		if (!AllocaIP) AllocaIP = Entry.getTerminator();
 		IRBuilder<> EB(AllocaIP);
 
-		AllocaInst* Slot = EB.CreateAlloca(I32, nullptr, SlotName);
+		AllocaInst* Slot = EB.CreateAlloca(I32, nullptr, AnchorName);
 		Slot->setAlignment(Align(4));
 
 
 		// Init depends on entropy; store volatile to pin it.
-		Value* E = loadEntropyI32(EB);
 		uint32_t K = R.u32();
-		Value* Init = EB.CreateXor(E, ConstantInt::get(I32, K), "obf.salt.init");
+		// A fresh late anchor must dominate earlier passes' initializers.
+		// Reusing their later entropy/anchor allocas can violate dominance or
+		// read an uninitialized slot. A seeded constant is sufficient here.
+		Value* Init = ConstantInt::get(I32, K);
+		if (!Late)
+			Init = EB.CreateXor(loadEntropyI32(EB), Init, "obf.salt.init");
 
 		auto* St = EB.CreateStore(Init, Slot);
 		St->setVolatile(true);
@@ -934,6 +941,10 @@ namespace llvm::obf {
 		Type* I32 = Type::getInt32Ty(B.getContext());
 		if (!Opts.EnableOpaqueConsts || !Opts.EnableHardPreds)
 			return ConstantInt::get(I32, Cst);
+
+		if (B.GetInsertBlock()->getParent()->hasFnAttribute("sre.native.families"))
+			if (Value *V = materializeNative(B, APInt(32, Cst), R, SlotName, NativeSite++))
+				return V;
 
 		// Two volatile loads from same slot; runtime equal, optimizer cannot assume.
 		Value* A = loadVolatileI32(B);

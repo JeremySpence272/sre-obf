@@ -1,7 +1,10 @@
 #include "llvm/Transforms/Obfuscator/NativeObfuscation.h"
+#include "llvm/Transforms/Obfuscator/NativeEncoding.h"
+#include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -23,6 +26,25 @@ cl::list<std::string> NativePasses(
 cl::opt<std::string> NativeReport(
     "native-report-json", cl::desc("Private native-profile provenance/coverage JSON"),
     cl::init(""));
+cl::opt<bool> NativeDiversity("native-diversity",
+    cl::desc("F1: shared seeded representation families"), cl::init(true));
+cl::opt<bool> NativeData("native-data",
+    cl::desc("F2: encode non-escaping immutable integer arrays"), cl::init(true));
+cl::opt<bool> NativeHelpers("native-helper-hardening",
+    cl::desc("F3: process registered generated helpers once"), cl::init(true));
+cl::opt<bool> NativeLate("native-late-constants",
+    cl::desc("F2: one bounded late constant sweep"), cl::init(true));
+
+void enableFamilies(Function &F) {
+  if (NativeDiversity) F.addFnAttr("sre.native.families");
+}
+
+void checkModuleBudget(const Module &M) {
+  uint64_t Total = 0;
+  for (const Function &F : M) Total += F.getInstructionCount();
+  if (Total > 250000)
+    report_fatal_error("native module instruction cap exceeded (250000)");
+}
 
 std::string profile(bool Structural) {
   const bool Max = NativeLevel == "max";
@@ -106,10 +128,12 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   // Output-directory names must not change RNG streams or encoded data.
   M.setModuleIdentifier(sys::path::filename(M.getSourceFileName()));
   json::Array Coverage;
+  SmallPtrSet<Function *, 32> Originals;
   auto &Cache = AM.getResult<ObfuscationAnnotationAnalysis>(M);
   Cache.PerFunction.clear();
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
+    Originals.insert(&F);
     std::string Blocker = structuralBlocker(F);
     bool Protect = selected(F);
     // Do not transform naked/asm bodies at all. Other blockers get a reported
@@ -119,6 +143,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     F.addFnAttr("sre.native.spec", Spec);
     if (Protect) {
       F.addFnAttr("sre.native.original");
+      F.addFnAttr("sre.native.stage", "application");
+      enableFamilies(F);
       // Added volatile storage invalidates optimized input's memory claims.
       F.setMemoryEffects(MemoryEffects::unknown());
       F.removeFnAttr(Attribute::Speculatable);
@@ -131,12 +157,104 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
         {"instructions_before", static_cast<int64_t>(F.getInstructionCount())}});
   }
 
+  json::Array DataCoverage;
+  if (NativeData)
+    DataCoverage = obf::encodeNativeData(M, Cache.ModuleSeed);
+  // O2 may put call-site memory(none)/readonly promises on calls. Updating only
+  // the callee's attributes is insufficient when protection adds volatile reads.
+  for (Function &F : M)
+    for (Instruction &I : instructions(F))
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (!isa<IntrinsicInst>(CB) && !CB->isInlineAsm()) {
+          CB->setMemoryEffects(MemoryEffects::unknown());
+          CB->removeFnAttr(Attribute::Speculatable);
+        }
   ObfuscationModulePass().run(M, AM);
+  checkModuleBudget(M);
+
+  // Closed, generation-one worklist. New helpers are captured by identity,
+  // never inferred solely from prefixes. The helper profile cannot create
+  // further call-table/VM/string helpers.
+  SmallVector<Function *, 32> Helpers;
+  for (Function &F : M) {
+    if (F.isDeclaration() || Originals.contains(&F)) continue;
+    if (!F.hasFnAttribute("sre.native.helper"))
+      F.addFnAttr("sre.native.helper", "upstream-generated");
+    if (!F.hasFnAttribute("sre.native.origin"))
+      F.addFnAttr("sre.native.origin", "native-application-pipeline");
+    Helpers.push_back(&F);
+  }
+  if (Helpers.size() > 256)
+    report_fatal_error("native generated-helper cap exceeded (256)");
+  auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+  json::Array HelperCoverage;
+  for (Function *H : Helpers) {
+    std::string Reason = structuralBlocker(*H);
+    const bool Safe = Reason != "naked" && Reason != "source-inline-asm" &&
+                      !H->hasPersonalityFn() && H->getInstructionCount() < 3000;
+    std::string Status = !NativeHelpers ? "disabled" : !Safe ? "exempt" : "processed";
+    unsigned Before = H->getInstructionCount();
+    if (NativeHelpers && Safe) {
+      H->addFnAttr("sre.native.stage", "helper");
+      enableFamilies(*H);
+      H->setMemoryEffects(MemoryEffects::unknown());
+      H->removeFnAttr(Attribute::Speculatable);
+      std::string Spec = "obf: constenc(prob=100,maxSites=24,encFP=0),"
+                         "sdiff(prob=50,slots=2,maxSites=8),shield(maxSites=12)";
+      if (Reason.empty())
+        Spec += ",flattening(minBlocks=2,maxBlocks=500,opaqueState=1,fakeCases=2)";
+      H->addFnAttr("sre.native.spec", Spec);
+      H->addFnAttr("sre.native.helper.run");
+      auto &HC = AM.getResult<ObfuscationAnnotationAnalysis>(M);
+      HC.PerFunction[H] = AnnotationParser::parseAnnotationString(Spec);
+      FAM.invalidate(*H, PreservedAnalyses::none());
+      auto PA = ObfuscationFunctionDriverPass().run(*H, FAM);
+      FAM.invalidate(*H, PA);
+      H->removeFnAttr("sre.native.helper.run");
+      H->addFnAttr("sre.native.helper.processed");
+      checkModuleBudget(M);
+    }
+    HelperCoverage.push_back(json::Object{{"function", H->getName().str()},
+        {"role", H->getFnAttribute("sre.native.helper").getValueAsString().str()},
+        {"origin", H->getFnAttribute("sre.native.origin").getValueAsString().str()},
+        {"generation", 1}, {"status", Status}, {"structural_reason", Reason},
+        {"instructions_before", Before},
+        {"instructions_after", H->getInstructionCount()}});
+  }
+  json::Array LateCoverage;
+  if (NativeLate) {
+    for (Function &F : M) {
+      if (!F.hasFnAttribute("sre.native.original") &&
+          !F.hasFnAttribute("sre.native.helper.processed")) continue;
+      if (F.getInstructionCount() > 29000) {
+        LateCoverage.push_back(json::Object{{"function", F.getName().str()},
+            {"status", "skipped"}, {"reason", "late-function-budget"}});
+        continue;
+      }
+      auto &LC = AM.getResult<ObfuscationAnnotationAnalysis>(M);
+      F.addFnAttr("sre.native.stage", "late");
+      auto Saved = LC.PerFunction[&F];
+      LC.PerFunction[&F] = AnnotationParser::parseAnnotationString(
+          "obf: constenc(prob=100,maxSites=16,encFP=0)");
+      FAM.invalidate(F, PreservedAnalyses::none());
+      auto PA = ConstEncPass().run(F, FAM);
+      FAM.invalidate(F, PA);
+      LC.PerFunction[&F] = std::move(Saved);
+      LateCoverage.push_back(json::Object{{"function", F.getName().str()},
+          {"status", PA.areAllPreserved() ? "no-change" : "processed"}});
+    }
+    checkModuleBudget(M);
+  }
+  // Rewrite after helper passes so they cannot disappear from the legacy sink.
+  if (obf::isReportEnabled())
+    if (Error E = obf::maybeWriteObfReportJson(M, AM))
+      report_fatal_error(Twine("native pass report: ") + toString(std::move(E)));
   // This entry point only supplies known IR-only configurations. Check actual
   // generated code as well: do not allow source annotations to enable a VM or
   // an assembly/timing technique behind the profile's back.
   for (const Function &F : M) {
-    if (F.isDeclaration() || !F.hasFnAttribute("sre.native.original")) continue;
+    if (F.isDeclaration() || (!F.hasFnAttribute("sre.native.original") &&
+                             !F.hasFnAttribute("sre.native.helper"))) continue;
     for (const Instruction &I : instructions(F)) {
       if (const auto *CB = dyn_cast<CallBase>(&I)) {
         if (CB->isInlineAsm())
@@ -159,6 +277,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"profile", "native-" + NativeLevel.getValue() + "-ir"},
                         {"seed", std::to_string(static_cast<uint64_t>(ObfSeed))},
                         {"vm", false}, {"injected_assembly", false},
+                        {"features", json::Object{{"diversity", NativeDiversity.getValue()},
+                            {"data", NativeData.getValue()}, {"helpers", NativeHelpers.getValue()},
+                            {"late_constants", NativeLate.getValue()}}},
+                        {"encodings", obf::nativeEncodingInventory(M)},
+                        {"data", std::move(DataCoverage)},
+                        {"helpers", std::move(HelperCoverage)},
+                        {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
     OS << formatv("{0:2}\n", json::Value(std::move(Result)));
   }

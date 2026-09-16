@@ -39,8 +39,9 @@ def c_metrics(text: str) -> dict:
             "switch_count": len(re.findall(r"\bswitch\b", text))}
 
 
-def flattening_ran(report: dict) -> bool:
+def flattening_ran(report: dict, function: str | None = None) -> bool:
     return any(p.get("id") == "flattening" and p.get("status") == "ran"
                and p.get("changed") is True
                for fn in report.get("functions", [])
+               if function is None or fn.get("name") == function
                for p in fn.get("passes", []))

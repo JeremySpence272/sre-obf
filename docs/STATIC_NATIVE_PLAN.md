@@ -1,6 +1,8 @@
 # Static-only native obfuscation plan
 
-Status: implementation plan, not an implemented or benchmark-validated preset.
+Status: native entry point, conformance foundation and initial F1–F3 mechanisms
+implemented; research acceptance and agent-hardness validation are not complete.
+See [implementation status](NATIVE_IR_STATUS.md) for the tested subset and limits.
 Written 2026-09-16 against fork revision
 `c6da83bac36efb9e216cc752b12060159acf4a62`.
 
@@ -93,9 +95,9 @@ Before claiming solver/tool resistance, revise and version the harness contract:
 - Keep target source, answers, instance-generation seeds, maps, and previous
   runs private. Obfuscation seeds are not assumed to be cryptographic secrets.
 
-The current harness prompt also prohibits symbolic execution. That existing
-contract is narrower than this proposed evaluation model and must be updated
-as a named protocol change, not silently mixed into historical results.
+New standalone-harness bundles use the named `static-recovery-v2` protocol,
+allowing static symbolic interpretation. Historical v1 bundles prohibited it;
+do not silently mix results across these contracts.
 
 The current runner is not a security sandbox. A launcher must isolate private
 files, expose the allowed tools, record traces, and clean up workloads on
@@ -130,11 +132,11 @@ Relevant sources: [PluginEntry.cpp](../registration/PluginEntry.cpp),
 
 ## 4. Proposed profile: `native-max-ir`
 
-This is a **new planned profile name**, not an existing CLI option. The following
-settings are a high-intensity starting candidate built from existing pass knobs;
-they have not been compiled or proven strongest together. "Max" means the
-strongest validated native candidate selected under explicit resource and
-correctness limits, not every numeric knob at its largest legal value.
+The implemented entry point is `-passes=native-obfuscation -native-level=max`.
+The settings below remain the design candidate, not a promise of every pass
+running on every function. The tested profile prioritizes flattening before
+expression expansion: the original order exhausted its budget before flattening.
+"Max" is a bounded high-intensity candidate, not a proven strongest configuration.
 
 ### Protected-function candidate
 
@@ -234,9 +236,9 @@ source
   -> clang -O2 -> shared optimized IR
   -> select/annotate + assign stable origin IDs
   -> module preparation: bounded fmerge, string/data handling
-  -> constant/expression/dataflow transformations with F1 diversity
   -> native flattening
   -> indirect-call transformation
+  -> constant/expression/dataflow transformations with F1 diversity
   -> bounded generated-helper hardening and late-data coverage
   -> final shield / IR-only adec / verification
   -> same object-generation settings as the matched clean control

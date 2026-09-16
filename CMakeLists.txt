@@ -74,6 +74,7 @@ add_subdirectory(aes_stub)
 # ---------------------------------------------------------------------------
 set(OBF_SOURCES
   NativeObfuscation.cpp
+  NativeEncoding.cpp
   Utils.cpp
   OpaqueUtils.cpp
   ObfDebug.cpp

@@ -102,6 +102,7 @@ namespace llvm::obf {
 		Rng& R;
 		std::string SlotName;
 		Options Opts;
+		unsigned NativeSite = 0;
 
 		// Per-instance cache (safe even if reused across functions)
 		Function* CachedFn = nullptr;

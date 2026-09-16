@@ -15,7 +15,7 @@ from .process import Runner, ToolFailure, digest, dump
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "conformance" / "fixtures"
-CASES = ("arithmetic", "data", "constructors", "literal", "foldable")
+CASES = ("arithmetic", "data", "widths", "constructors", "literal", "foldable")
 
 
 def test_inputs(count: int = 128) -> bytes:
@@ -48,6 +48,14 @@ def opt_command(plugin: Path) -> list[str]:
     return ["opt", f"-load={plugin}", f"-load-pass-plugin={plugin}"]
 
 
+def feature_flags(args: argparse.Namespace) -> list[str]:
+    return [f"-native-diversity={int(not args.no_diversity)}",
+            f"-native-data={int(not args.no_data)}",
+            f"-native-helper-hardening={int(not args.no_helpers)}",
+            f"-native-late-constants={int(not args.no_late)}",
+            f"-native-family={args.family}"]
+
+
 def decompile(runner: Runner, binary: Path, link_map: Path, out: Path,
               args: argparse.Namespace) -> dict:
     if not args.ghidra_image and not args.ghidra:
@@ -74,9 +82,11 @@ def compile_variant(runner: Runner, ir: Path, driver: Path, directory: Path) -> 
     obj, assembly = directory / "target.o", directory / "target.s"
     binary, link_map = directory / "binary", directory / "link.map"
     # Deliberately no second -O2. Both arms receive identical backend settings.
-    runner.run(["clang", "-Wno-override-module", "-fPIE", "-S", str(ir),
+    # The release arm is an ordinary source -O2 compile, not another IR arm.
+    optimization = ["-std=c11", "-O2", "-ffp-contract=off"] if ir.suffix == ".c" else []
+    runner.run(["clang", *optimization, "-Wno-override-module", "-fPIE", "-S", str(ir),
                 "-o", str(assembly)])
-    runner.run(["clang", "-Wno-override-module", "-fPIE", "-c", str(ir),
+    runner.run(["clang", *optimization, "-Wno-override-module", "-fPIE", "-c", str(ir),
                 "-o", str(obj)])
     runner.run(["clang", "-pie", "-Wl,-s", f"-Wl,-Map={link_map}",
                 str(obj), str(driver), "-o", str(binary)])
@@ -95,7 +105,8 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
     case.mkdir()
     runner = Runner(ROOT, case / "logs", args.toolchain_image, args.timeout)
     result = {"case": name, "seed": seed, "status": "incomplete",
-              "profile": args.profile}
+              "profile": args.profile, "passes": args.passes,
+              "feature_flags": feature_flags(args)}
     try:
         source = FIXTURES / f"{name}.c"
         optimized, protected = case / "optimized.ll", case / "protected.ll"
@@ -107,7 +118,7 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
                     str(FIXTURES / "driver.c"), "-o", str(driver)])
         report = case / "passes.json"
         ablation = [f"-native-passes={args.passes}"] if args.passes else []
-        runner.run(opt_command(args.plugin) + ablation + [
+        runner.run(opt_command(args.plugin) + ablation + feature_flags(args) + [
             "-passes=native-obfuscation", f"-native-level={args.profile}",
             f"-obf-seed={seed}", "-obf-deterministic", "-obf-verify",
             "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
@@ -116,25 +127,36 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
         result["source_sha256"] = digest(source)
         result["optimized_ir_sha256"] = digest(optimized)
         result["protected_ir_sha256"] = digest(protected)
-        result["flattening_ran"] = flattening_ran(json.loads(report.read_text()))
+        result["flattening_ran"] = flattening_ran(json.loads(report.read_text()), "obf_target")
+        native_report = json.loads((case / "native.json").read_text())
+        result["feature_coverage"] = native_report
+        if name in ("data", "widths") and not args.no_data:
+            encoded = [entry for entry in native_report["data"]
+                       if entry["status"] == "encoded"]
+            if not encoded:
+                raise ToolFailure("required array encoding did not run")
+            if name == "widths" and {entry["width"] for entry in encoded} != {8, 16, 32, 64}:
+                raise ToolFailure("required array widths were not all encoded")
+            if not args.no_helpers and any(entry["status"] != "processed"
+                                           for entry in native_report["helpers"]):
+                raise ToolFailure("required generated helper was not processed")
         inputs = test_inputs(args.random_inputs)
         (case / "inputs.txt").write_bytes(inputs)
         outputs = {}
         arms = {}
-        for arm, ir in (("control", optimized), ("native", protected)):
+        for arm, ir in (("release", source), ("control", optimized), ("native", protected)):
             variant = compile_variant(runner, ir, driver, case / arm)
             outputs[arm] = runner.run([str(variant["binary"])], stdin=inputs,
                                        timeout=args.run_timeout)
             (case / arm / "outputs.txt").write_bytes(outputs[arm])
-            variant["decompiler"] = decompile(
-                runner, variant["binary"], variant["link_map"],
-                case / arm / "ghidra.json", args)
+            variant["decompiler"] = {"status": "not_run",
+                                      "reason": "execution gates run before analysis"}
             arms[arm] = {key: str(value) if isinstance(value, Path) else value
                          for key, value in variant.items()}
         result["arms"] = arms
         result["vectors"] = len(inputs.splitlines())
         result["correctness"] = (
-            outputs["control"] == outputs["native"] and
+            outputs["release"] == outputs["control"] == outputs["native"] and
             len(outputs["control"].splitlines()) == result["vectors"])
         if not result["correctness"]:
             raise ToolFailure("full-output differential mismatch")
@@ -142,6 +164,10 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
             not args.passes or "flattening" in args.passes.split(","))
         if result["flattening_required"] and not result["flattening_ran"]:
             raise ToolFailure("required native flattening did not run")
+        for arm in ("control", "native"):
+            arms[arm]["decompiler"] = decompile(
+                runner, Path(arms[arm]["binary"]), Path(arms[arm]["link_map"]),
+                case / arm / "ghidra.json", args)
 
         clean_dec, obf_dec = arms["control"]["decompiler"], arms["native"]["decompiler"]
         result["decompiler_status"] = (
@@ -187,6 +213,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--ghidra", help="Headless executable path (inside image if configured)")
     p.add_argument("--profile", choices=("max", "smoke"), default="max")
     p.add_argument("--passes", help="Explicit comma-separated native pass ablation")
+    p.add_argument("--no-diversity", action="store_true")
+    p.add_argument("--no-data", action="store_true")
+    p.add_argument("--no-helpers", action="store_true")
+    p.add_argument("--no-late", action="store_true")
+    p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--case", choices=CASES, action="append")
     p.add_argument("--seed", type=int, action="append")
     p.add_argument("--random-inputs", type=int, default=128)
@@ -208,6 +239,8 @@ def main(argv=None) -> int:
         raise SystemExit("counts/timeouts must be valid positive limits")
     if any(seed < 0 or seed >= 2**64 for seed in args.seed or [1]):
         raise SystemExit("seeds must fit unsigned 64-bit integers")
+    if args.require_literal_hiding and not set(args.case or CASES) & {"literal", "data"}:
+        raise SystemExit("--require-literal-hiding requires a literal or data probe")
     if args.toolchain_image or args.ghidra_image:
         if not args.out.is_relative_to(ROOT) or not args.plugin.is_relative_to(ROOT):
             raise SystemExit("container runs require output/plugin inside this checkout")

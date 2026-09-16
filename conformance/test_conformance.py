@@ -31,6 +31,7 @@ class MetricsTests(unittest.TestCase):
             report = {"functions": [{"passes": [
                 {"id": "flattening", "status": status, "changed": changed}]}]}
             self.assertEqual(flattening_ran(report), expected)
+            self.assertFalse(flattening_ran(report, "obf_target"))
 
     def test_vectors_include_edges_and_are_reproducible(self):
         values = test_inputs(12)

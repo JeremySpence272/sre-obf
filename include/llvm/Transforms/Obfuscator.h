@@ -91,7 +91,8 @@ namespace llvm {
 			// (VM engine/handlers, helpers). On LLVM 23 the function-pass
 			// adaptor visits functions appended mid-run, which would feed
 			// the 100k+ instruction __vm_engine back through here.
-			if (llvm::obf::isObfGenerated(F))
+			if (llvm::obf::isObfGenerated(F) &&
+			    !F.hasFnAttribute("sre.native.helper.run"))
 				return PreservedAnalyses::all();
 
 			// Global cost/safety caps (deterministic skip).
