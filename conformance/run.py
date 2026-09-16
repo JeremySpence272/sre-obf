@@ -15,7 +15,8 @@ from .process import Runner, ToolFailure, digest, dump
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "conformance" / "fixtures"
-CASES = ("arithmetic", "data", "widths", "constructors", "literal", "foldable")
+CASES = ("arithmetic", "data", "widths", "constructors", "merging", "strings",
+         "literal", "foldable")
 
 
 def test_inputs(count: int = 128) -> bytes:
@@ -53,11 +54,13 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             f"-native-data={int(not args.no_data)}",
             f"-native-helper-hardening={int(not args.no_helpers)}",
             f"-native-late-constants={int(not args.no_late)}",
+            f"-native-strings={int(not args.no_strings)}",
+            f"-native-merge={int(not args.no_merge)}",
             f"-native-family={args.family}"]
 
 
 def decompile(runner: Runner, binary: Path, link_map: Path, out: Path,
-              args: argparse.Namespace) -> dict:
+              args: argparse.Namespace, offset: int | None = None) -> dict:
     if not args.ghidra_image and not args.ghidra:
         return {"status": "not_run", "reason": "Ghidra was not configured"}
     project = out.parent / ("project-" + out.stem)
@@ -66,7 +69,7 @@ def decompile(runner: Runner, binary: Path, link_map: Path, out: Path,
     runner.run([headless, str(project), "conformance", "-import", str(binary),
                 "-scriptPath", str(ROOT / "conformance" / "ghidra"),
                 "-postScript", "ExportConformance.java", str(out),
-                f"{target_offset(link_map):x}", "-deleteProject",
+                f"{target_offset(link_map) if offset is None else offset:x}", "-deleteProject",
                 "-analysisTimeoutPerFile", "120", "-max-cpu", "2"],
                image=args.ghidra_image, timeout=args.decompile_timeout)
     if not out.is_file():
@@ -88,8 +91,12 @@ def compile_variant(runner: Runner, ir: Path, driver: Path, directory: Path) -> 
                 "-o", str(assembly)])
     runner.run(["clang", *optimization, "-Wno-override-module", "-fPIE", "-c", str(ir),
                 "-o", str(obj)])
-    runner.run(["clang", "-pie", "-Wl,-s", f"-Wl,-Map={link_map}",
-                str(obj), str(driver), "-o", str(binary)])
+    unstripped = directory / "binary.unstripped"
+    runner.run(["clang", "-pie", f"-Wl,-Map={link_map}",
+                str(obj), str(driver), "-o", str(unstripped)])
+    symbols = runner.run(["llvm-nm", "--defined-only", "-n", str(unstripped)])
+    (directory / "symbols.txt").write_bytes(symbols)
+    runner.run(["llvm-strip", "--strip-all", "-o", str(binary), str(unstripped)])
     relocations = runner.run(["llvm-readobj", "--relocations", str(obj)])
     (directory / "relocations.txt").write_bytes(relocations)
     disassembly = runner.run(["llvm-objdump", "-d", str(binary)])
@@ -108,6 +115,8 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
               "profile": args.profile, "passes": args.passes,
               "feature_flags": feature_flags(args)}
     try:
+        if digest(args.plugin) != args.plugin_sha256:
+            raise ToolFailure("plugin changed during this run; start a new artifact set")
         source = FIXTURES / f"{name}.c"
         optimized, protected = case / "optimized.ll", case / "protected.ll"
         driver = case / "driver.o"
@@ -124,12 +133,23 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
             "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
             f"-obf-report-json={report}", f"-native-report-json={case / 'native.json'}",
             "-S", str(optimized), "-o", str(protected)])
+        if digest(args.plugin) != args.plugin_sha256:
+            raise ToolFailure("plugin changed during transformation")
         result["source_sha256"] = digest(source)
         result["optimized_ir_sha256"] = digest(optimized)
         result["protected_ir_sha256"] = digest(protected)
         result["flattening_ran"] = flattening_ran(json.loads(report.read_text()), "obf_target")
         native_report = json.loads((case / "native.json").read_text())
         result["feature_coverage"] = native_report
+        enabled_pass = lambda name: not args.passes or name in args.passes.split(",")
+        if name == "merging" and not args.no_merge and enabled_pass("fmerge"):
+            groups = native_report["merged_groups"]
+            if not groups:
+                raise ToolFailure("required function merging did not run")
+            if enabled_pass("flattening") and not all(
+                    flattening_ran(json.loads(report.read_text()), group["function"])
+                    for group in groups):
+                raise ToolFailure("a merged application group was not flattened")
         if name in ("data", "widths") and not args.no_data:
             encoded = [entry for entry in native_report["data"]
                        if entry["status"] == "encoded"]
@@ -160,6 +180,12 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
             len(outputs["control"].splitlines()) == result["vectors"])
         if not result["correctness"]:
             raise ToolFailure("full-output differential mismatch")
+        if name == "strings" and not args.no_strings and enabled_pass("strenc"):
+            canary = b"cobalt-kinetic-conformance"
+            if canary in Path(arms["native"]["binary"]).read_bytes():
+                raise ToolFailure("required string encoding left the plaintext probe")
+            if not native_report["helpers"]:
+                raise ToolFailure("string runtime is missing from helper inventory")
         result["flattening_required"] = name == "arithmetic" and (
             not args.passes or "flattening" in args.passes.split(","))
         if result["flattening_required"] and not result["flattening_ran"]:
@@ -168,6 +194,27 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
             arms[arm]["decompiler"] = decompile(
                 runner, Path(arms[arm]["binary"]), Path(arms[arm]["link_map"]),
                 case / arm / "ghidra.json", args)
+        if args.probe_helpers:
+            symbols = {}
+            for line in (case / "native/symbols.txt").read_text().splitlines():
+                fields = line.split()
+                if len(fields) == 3 and fields[1].lower() == "t":
+                    symbols[fields[2]] = int(fields[0], 16)
+            probes, seen_roles = [], set()
+            for helper in native_report["helpers"]:
+                if len(probes) >= args.probe_helpers:
+                    break
+                helper_name, role = helper["function"], helper["role"]
+                if role in seen_roles or helper_name not in symbols:
+                    continue
+                seen_roles.add(role)
+                exported = decompile(runner, Path(arms["native"]["binary"]),
+                    Path(arms["native"]["link_map"]),
+                    case / "native" / f"helper-{len(probes)}.json", args, symbols[helper_name])
+                probes.append({"function": helper_name, "role": role, "decompiler": exported})
+            if native_report["helpers"] and not probes:
+                raise ToolFailure("requested helper probes found no helper entry symbols")
+            result["helper_probes"] = probes
 
         clean_dec, obf_dec = arms["control"]["decompiler"], arms["native"]["decompiler"]
         result["decompiler_status"] = (
@@ -196,6 +243,9 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
         result["status"] = "pass" if result["decompiler_status"] == "ok" else "partial"
         if result["decompiler_status"] == "decompiler_error":
             result["status"] = "inconclusive"
+        if any(probe["decompiler"]["status"] != "ok"
+               for probe in result.get("helper_probes", [])):
+            result["status"] = "inconclusive"
     except (ToolFailure, OSError, ValueError, KeyError) as exc:
         result["status"] = "fail"
         result["error"] = str(exc)
@@ -217,7 +267,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-data", action="store_true")
     p.add_argument("--no-helpers", action="store_true")
     p.add_argument("--no-late", action="store_true")
+    p.add_argument("--no-strings", action="store_true")
+    p.add_argument("--no-merge", action="store_true")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
+    p.add_argument("--probe-helpers", type=int, default=0,
+                   help="Informed-entry probes for up to N distinct helper roles")
     p.add_argument("--case", choices=CASES, action="append")
     p.add_argument("--seed", type=int, action="append")
     p.add_argument("--random-inputs", type=int, default=128)
@@ -237,6 +291,8 @@ def main(argv=None) -> int:
     if args.random_inputs < 0 or any(x <= 0 for x in (
             args.timeout, args.run_timeout, args.decompile_timeout)):
         raise SystemExit("counts/timeouts must be valid positive limits")
+    if not 0 <= args.probe_helpers <= 8:
+        raise SystemExit("--probe-helpers must be between 0 and 8")
     if any(seed < 0 or seed >= 2**64 for seed in args.seed or [1]):
         raise SystemExit("seeds must fit unsigned 64-bit integers")
     if args.require_literal_hiding and not set(args.case or CASES) & {"literal", "data"}:
@@ -247,7 +303,8 @@ def main(argv=None) -> int:
     args.out.mkdir(parents=True, exist_ok=False)
     os.chmod(args.out, 0o700)
     tools = Runner(ROOT, args.out / "tool-identity", args.toolchain_image)
-    metadata = {"schema": "sre-conformance-v1", "plugin_sha256": digest(args.plugin),
+    args.plugin_sha256 = digest(args.plugin)
+    metadata = {"schema": "sre-conformance-v1", "plugin_sha256": args.plugin_sha256,
                 "toolchain_image": image_identity(args.toolchain_image),
                 "ghidra_image": image_identity(args.ghidra_image),
                 "clang": tools.run(["clang", "--version"]).decode(),

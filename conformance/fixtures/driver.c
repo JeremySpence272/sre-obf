@@ -1,5 +1,11 @@
 #include <inttypes.h>
 #include <stdint.h>
+
+/* Separate-TU consumer: keeps string semantics observable after source O2. */
+uint32_t fixture_text(const char *text, uint32_t seed) {
+    while (*text) seed = seed * 33u ^ (unsigned char)*text++;
+    return seed;
+}
 #include <stdio.h>
 
 extern uint32_t obf_target(uint32_t, uint32_t);

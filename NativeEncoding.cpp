@@ -38,7 +38,8 @@ bool findLoads(Value *V, ArrayType *AT, SmallPtrSetImpl<Value *> &Seen,
           L->isVolatile() || L->isAtomic()) {
         Reason = "non-scalar-or-volatile-access"; return false;
       }
-      if (!L->getFunction()->hasFnAttribute("sre.native.original")) {
+      if (!L->getFunction()->hasFnAttribute("sre.native.original") &&
+          !L->getFunction()->hasFnAttribute("sre.native.helper")) {
         Reason = "unselected-reader"; return false;
       }
       Loads.push_back(L);
@@ -233,6 +234,11 @@ json::Array encodeNativeData(Module &M, uint64_t Seed) {
     B.CreateRet(decodeNative(B, H->getArg(0), Key, Family, Odd, Rotation));
 
     for (LoadInst *L : Loads) {
+      // A generated reader can be exempt from the later helper profile. Its
+      // decoder may still acquire volatile reads, so invalidate the reader's
+      // original memory promises at the rewrite boundary itself.
+      L->getFunction()->setMemoryEffects(MemoryEffects::unknown());
+      L->getFunction()->removeFnAttr(Attribute::Speculatable);
       IRBuilder<> At(L->getNextNode());
       // Both pointers refer into the same proven, non-escaping array.
       Value *IndexV = At.CreatePtrDiff(T, L->getPointerOperand(), G);

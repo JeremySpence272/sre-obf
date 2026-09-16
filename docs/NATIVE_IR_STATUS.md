@@ -24,6 +24,11 @@ The legacy automatic Clang hook and legacy VM presets remain separate.
   the new data decoders and upstream indirect-call initializers/thunks. The
   helper profile cannot recursively generate more call-table or VM helpers.
   At most 256 generated helpers and 250,000 module instructions are allowed.
+- Module preparation: AES string encoding and bounded internal function merging
+  run once before the array inventory. Merged application groups inherit the
+  native profile and required flattening. Cipher helpers join the bounded F3
+  worklist. Call helpers report explicit origin/role and direct function/global
+  dependencies. Modules without eligible strings do not acquire a cipher runtime.
 
 These are initial mechanisms, not completed resistance research. Registered
 family counts are **emission counts**, including possible rollback artifacts;
@@ -57,16 +62,35 @@ probe. A decompiler error is inconclusive; absent Ghidra is partial.
 
 Verified during initial development:
 
-- Eight conformance unit tests and eleven standalone-harness regression tests.
+- Ten conformance unit tests and eleven standalone-harness regression tests.
 - Six fixtures × two seeds × 593 vectors for both smoke and maximum profiles.
+- Final integrated maximum profile: eight fixtures × two seeds × 593 vectors
+  (9,488 cases), each compared against both release and matched-IR controls.
+- Six leave-one-feature-out smoke matrices across data, widths, strings and
+  merging: 24 configurations, 209 vectors each; all correctness/coverage gates pass.
 - Every forced family on signed/narrow/wide array and scalar fixtures, including
   constructor reads; 593 vectors per fixture. Legacy-family late-anchor ablation.
 - Actual maximum-profile crackme build, with twelve trusted semantic checks.
 - Maximum-profile Ghidra literal and array probes pass the explicit compiler/
   decompiler literal-hiding gate; the foldable negative control also passes.
+- Integrated data/string target probes and directly identified decoder/cipher
+  helper probes all decompile successfully. This verifies that the probes work,
+  not that those helpers resist semantic recovery. The final build reproduces
+  the exact binaries used for those successful decompiler checks.
 - Same-seed literal and data fixtures reproduce byte-identical protected IR
   and final binaries in different output directories. A matched clean crackme
   control is built from the same private instance and also passes twelve checks.
+
+Local retained reports (private, ignored by Git):
+
+- `out/conformance/final-verified/summary.json`: integrated maximum correctness.
+- `out/conformance/final-helper-ghidra/summary.json`: data/string/helper probes.
+- `out/conformance/final-controls-ghidra/summary.json`: literal/negative controls.
+- `out/conformance/ablation-no-*/summary.json`: leave-one-feature-out checks.
+
+The separate harness's `out/native-final/public/` is the validated final crackme
+bundle; `out/native-control/public/` is its matched unobfuscated instance.
+Only public bundles may be copied into an attacker workspace.
 
 Two regressions were caught and fixed: LLVM 22 narrow APInts require explicit
 truncation of random 64-bit values; a late opaque anchor must not reuse storage
@@ -82,9 +106,9 @@ coverage of both. Finite differential tests are not an equivalence proof.
   trace auditing belong to the eventual launcher.
 - Original immutable-array handling is conservative; pointers exposed to real
   APIs, initializer dependency graphs and generated data need further coverage.
-- The plan's module-wide string encryption and bounded function merging are not
-  yet enabled by the initial native profile. Existing implementations remain
-  available separately; their helper/cache integration needs its own validation.
+- Module string handling follows upstream eligibility restrictions, including
+  exclusions for format strings and address-sensitive uses. It is not universal
+  protection of all strings or arbitrary data exposed to external APIs.
 - Helper processing is reported separately from required pass effectiveness.
   Function budgets can skip later passes; inspect reports instead of treating
   a profile name or binary growth as full coverage. Function rollback does not

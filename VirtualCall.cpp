@@ -236,6 +236,8 @@ namespace {
 		FunctionType* FTy = Callee->getFunctionType();
 		Function* Thunk =
 			Function::Create(FTy, GlobalValue::PrivateLinkage, Name, M);
+		Thunk->addFnAttr("obf.helper.role", "call-forwarder");
+		Thunk->addFnAttr("obf.helper.origin", Callee->getName());
 
 		// Make it unattractive to inline/merge
 		Thunk->addFnAttr(Attribute::NoInline);
@@ -282,6 +284,8 @@ namespace {
 		
 		FunctionType * FTy = Callee->getFunctionType();
 		Function * Thunk = Function::Create(FTy, GlobalValue::PrivateLinkage, Name, M);
+		Thunk->addFnAttr("obf.helper.role", "call-decoy");
+		Thunk->addFnAttr("obf.helper.origin", Callee->getName());
 		
 		Thunk->addFnAttr(Attribute::NoInline);
 		Thunk->addFnAttr(Attribute::Cold);
@@ -447,6 +451,8 @@ namespace {
 		if (!CtorFn) {
 			FunctionType* CtorTy = FunctionType::get(Type::getVoidTy(C), /*isVarArg=*/false);
 			CtorFn = Function::Create(CtorTy, GlobalValue::PrivateLinkage, CtorName, M);
+			CtorFn->addFnAttr("obf.helper.role", "call-table-initializer");
+			CtorFn->addFnAttr("obf.helper.origin", VTable->getName());
 			CtorFn->addFnAttr(Attribute::NoInline);
 			CtorFn->addFnAttr(Attribute::NoUnwind);
 

@@ -691,6 +691,7 @@ namespace {
     }
 
     bool StrEncImpl::shouldEncrypt(GlobalVariable& GV, int minLength) {
+        if (GV.getMetadata("sre.native.encoding")) return false;
         if (!GV.hasInitializer() || !GV.isConstant()) return false;
         // Never rewrite/erase a symbol another TU may link against. isDiscardableIfUnused()
         // covers private/internal AND linkonce_odr (how clang-cl emits string literals on
@@ -835,6 +836,12 @@ namespace {
     // StrEncImpl::encryptStrings
 
     bool StrEncImpl::encryptStrings(Module& M, StrEncCtx& Ctx) {
+        // Do not link a complete cipher runtime into modules with no eligible
+        // strings. Besides cost, doing so used to mutate IR while returning
+        // "unchanged" when candidate collection below was empty.
+        if (!llvm::any_of(M.globals(), [&](GlobalVariable &G) {
+                return shouldEncrypt(G, Ctx.Cfg.minLength);
+            })) return false;
         //  link the AES stub
         Function* DecryptFn = linkStub(M);
         if (!DecryptFn) {

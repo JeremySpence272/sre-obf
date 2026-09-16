@@ -8,6 +8,7 @@ from conformance.metrics import CANARY, contains_integer, flattening_ran, normal
 from conformance.process import Runner, ToolFailure
 from conformance.run import target_offset, test_inputs
 from conformance.cc import backend_flags, compile_args
+from conformance.compare import compare
 
 
 class MetricsTests(unittest.TestCase):
@@ -77,6 +78,23 @@ class AdapterTests(unittest.TestCase):
         for extra in ("-O3", "-flto", "-fpass-plugin=other.so", "-Xclang"):
             with self.assertRaises(ValueError):
                 compile_args(["-c", "a.c", "-o", "a.o", extra])
+
+
+class ComparisonTests(unittest.TestCase):
+    def test_missing_and_failed_are_not_reproducible(self):
+        case = {"case": "literal", "seed": 1, "correctness": False}
+        self.assertEqual(compare({"cases": [case]}, {"cases": []})[0]["status"],
+                         "missing_case")
+        self.assertEqual(compare({"cases": [case]}, {"cases": [case]})[0]["status"],
+                         "invalid_correctness")
+
+    def test_identical_bytes_do_not_imply_decompiler_was_measured(self):
+        case = {"case": "literal", "seed": 1, "correctness": True,
+                "source_sha256": "source", "protected_ir_sha256": "ir",
+                "arms": {"native": {"binary_sha256": "binary", "binary_bytes": 123}}}
+        row = compare({"cases": [case]}, {"cases": [case]})[0]
+        self.assertTrue(row["binary_equal"])
+        self.assertIsNone(row["decompiled_c_equal"])
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@
 #include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
@@ -34,6 +35,10 @@ cl::opt<bool> NativeHelpers("native-helper-hardening",
     cl::desc("F3: process registered generated helpers once"), cl::init(true));
 cl::opt<bool> NativeLate("native-late-constants",
     cl::desc("F2: one bounded late constant sweep"), cl::init(true));
+cl::opt<bool> NativeStrings("native-strings",
+    cl::desc("Module-local AES string encoding with bounded helper hardening"), cl::init(true));
+cl::opt<bool> NativeMerge("native-merge",
+    cl::desc("Bounded internal application-function merging"), cl::init(true));
 
 void enableFamilies(Function &F) {
   if (NativeDiversity) F.addFnAttr("sre.native.families");
@@ -72,6 +77,9 @@ std::string profile(bool Structural) {
         "fakeLoop=0,constLaunder=1)"
       : "vcall(prob=50,maxSites=8,indexStrength=2,encryptTable=1,mergeVTables=0),"
         "shield(maxSites=12),adec(prob=25,strength=1,maxSites=8,asm=0,rdtsc=0)";
+  if (NativeStrings) Spec += ",strenc(cipher=aes,keysplit=1,minlen=1)";
+  if (NativeMerge)
+    Spec += ",fmerge(chunk=4,opaqueSel=1,launderSel=1,dispatch=switch,thunkAddrTaken=0)";
   if (NativePasses.empty()) return Spec;
   ObfuscationConfig Parsed = AnnotationParser::parseAnnotationString(Spec);
   std::string Filtered = "obf: ";
@@ -116,7 +124,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   for (const std::string &Name : NativePasses)
     if (!llvm::is_contained(
             ArrayRef<StringRef>{"constenc", "mba", "substitution", "split", "sdiff",
-                                "bcf", "flattening", "vcall", "shield", "adec"}, Name))
+                                "bcf", "flattening", "vcall", "shield", "adec",
+                                "strenc", "fmerge"}, Name))
       report_fatal_error(Twine("unsupported native pass ablation: ") + Name);
   if (!Triple(M.getTargetTriple()).isX86() ||
       !Triple(M.getTargetTriple()).isArch64Bit())
@@ -128,16 +137,15 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   // Output-directory names must not change RNG streams or encoded data.
   M.setModuleIdentifier(sys::path::filename(M.getSourceFileName()));
   json::Array Coverage;
-  SmallPtrSet<Function *, 32> Originals;
   auto &Cache = AM.getResult<ObfuscationAnnotationAnalysis>(M);
   Cache.PerFunction.clear();
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
-    Originals.insert(&F);
+    F.addFnAttr("sre.native.source");
     std::string Blocker = structuralBlocker(F);
     bool Protect = selected(F);
     // Do not transform naked/asm bodies at all. Other blockers get a reported
-    // expression-only fallback, never an unreported claim of flattening.
+    // no-flattening fallback, never an unreported claim of flattening.
     if (Blocker == "naked" || Blocker == "source-inline-asm") Protect = false;
     std::string Spec = Protect ? profile(Blocker.empty()) : "";
     F.addFnAttr("sre.native.spec", Spec);
@@ -157,9 +165,36 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
         {"instructions_before", static_cast<int64_t>(F.getInstructionCount())}});
   }
 
+  // Run module preparation exactly once, before data inventory and application
+  // transforms. Rebuild native cache entries after merging removes originals.
+  ModulePassManager Preparation;
+  Preparation.addPass(FunctionMergingPass());
+  Preparation.addPass(StringEncryptionPass());
+  Preparation.run(M, AM);
+  auto &PreparedCache = AM.getResult<ObfuscationAnnotationAnalysis>(M);
+  PreparedCache.PerFunction.clear();
+  json::Array MergedCoverage;
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    if (F.hasFnAttribute("sre.native.merged")) {
+      std::string Spec = profile(structuralBlocker(F).empty());
+      F.addFnAttr("sre.native.spec", Spec);
+      MergedCoverage.push_back(json::Object{{"function", F.getName().str()},
+          {"members", F.getFnAttribute("sre.native.merged").getValueAsString().str()}});
+    }
+    if (!F.hasFnAttribute("sre.native.source") &&
+        !F.hasFnAttribute("sre.native.original")) {
+      F.addFnAttr("sre.native.helper", "module-runtime");
+      F.addFnAttr("sre.native.origin", "native-module-preparation");
+      F.addFnAttr("sre.native.spec", "");
+    }
+    if (F.hasFnAttribute("sre.native.original"))
+      PreparedCache.PerFunction[&F] = AnnotationParser::parseAnnotationString(
+          F.getFnAttribute("sre.native.spec").getValueAsString().str());
+  }
   json::Array DataCoverage;
   if (NativeData)
-    DataCoverage = obf::encodeNativeData(M, Cache.ModuleSeed);
+    DataCoverage = obf::encodeNativeData(M, PreparedCache.ModuleSeed);
   // O2 may put call-site memory(none)/readonly promises on calls. Updating only
   // the callee's attributes is insufficient when protection adds volatile reads.
   for (Function &F : M)
@@ -169,7 +204,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
           CB->setMemoryEffects(MemoryEffects::unknown());
           CB->removeFnAttr(Attribute::Speculatable);
         }
-  ObfuscationModulePass().run(M, AM);
+  if (obf::isReportEnabled()) (void)AM.getResult<ObfReportAnalysis>(M);
+  ModulePassManager Applications;
+  Applications.addPass(createModuleToFunctionPassAdaptor(ObfuscationFunctionDriverPass()));
+  Applications.run(M, AM);
   checkModuleBudget(M);
 
   // Closed, generation-one worklist. New helpers are captured by identity,
@@ -177,11 +215,14 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   // further call-table/VM/string helpers.
   SmallVector<Function *, 32> Helpers;
   for (Function &F : M) {
-    if (F.isDeclaration() || Originals.contains(&F)) continue;
+    if (F.isDeclaration() || F.hasFnAttribute("sre.native.source") ||
+        F.hasFnAttribute("sre.native.original")) continue;
     if (!F.hasFnAttribute("sre.native.helper"))
-      F.addFnAttr("sre.native.helper", "upstream-generated");
+      F.addFnAttr("sre.native.helper", F.hasFnAttribute("obf.helper.role")
+          ? F.getFnAttribute("obf.helper.role").getValueAsString() : "upstream-generated");
     if (!F.hasFnAttribute("sre.native.origin"))
-      F.addFnAttr("sre.native.origin", "native-application-pipeline");
+      F.addFnAttr("sre.native.origin", F.hasFnAttribute("obf.helper.origin")
+          ? F.getFnAttribute("obf.helper.origin").getValueAsString() : "native-application-pipeline");
     Helpers.push_back(&F);
   }
   if (Helpers.size() > 256)
@@ -194,6 +235,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                       !H->hasPersonalityFn() && H->getInstructionCount() < 3000;
     std::string Status = !NativeHelpers ? "disabled" : !Safe ? "exempt" : "processed";
     unsigned Before = H->getInstructionCount();
+    if (Before >= 3000) Reason = "helper-size-cap";
     if (NativeHelpers && Safe) {
       H->addFnAttr("sre.native.stage", "helper");
       enableFamilies(*H);
@@ -214,10 +256,23 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       H->addFnAttr("sre.native.helper.processed");
       checkModuleBudget(M);
     }
+    json::Array Calls, Globals;
+    SmallPtrSet<GlobalValue *, 16> Dependencies;
+    for (Instruction &I : instructions(*H)) {
+      if (auto *CB = dyn_cast<CallBase>(&I))
+        if (Function *C = CB->getCalledFunction())
+          if (!C->isIntrinsic() && Dependencies.insert(C).second)
+            Calls.push_back(C->getName().str());
+      for (Value *V : I.operands())
+        if (V->getType()->isPointerTy())
+          if (auto *G = dyn_cast<GlobalVariable>(getUnderlyingObject(V)))
+            if (Dependencies.insert(G).second) Globals.push_back(G->getName().str());
+    }
     HelperCoverage.push_back(json::Object{{"function", H->getName().str()},
         {"role", H->getFnAttribute("sre.native.helper").getValueAsString().str()},
         {"origin", H->getFnAttribute("sre.native.origin").getValueAsString().str()},
         {"generation", 1}, {"status", Status}, {"structural_reason", Reason},
+        {"direct_calls", std::move(Calls)}, {"referenced_globals", std::move(Globals)},
         {"instructions_before", Before},
         {"instructions_after", H->getInstructionCount()}});
   }
@@ -279,7 +334,9 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"vm", false}, {"injected_assembly", false},
                         {"features", json::Object{{"diversity", NativeDiversity.getValue()},
                             {"data", NativeData.getValue()}, {"helpers", NativeHelpers.getValue()},
+                            {"strings", NativeStrings.getValue()}, {"merge", NativeMerge.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
+                        {"merged_groups", std::move(MergedCoverage)},
                         {"encodings", obf::nativeEncodingInventory(M)},
                         {"data", std::move(DataCoverage)},
                         {"helpers", std::move(HelperCoverage)},

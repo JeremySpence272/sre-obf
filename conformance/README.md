@@ -18,8 +18,11 @@ docker run --rm --network none --user "$(id -u):$(id -g)" \
 ```
 
 Initial tested toolchain: stock LLVM 22.1.8 (`ca7933e47d3a`), Ubuntu 24.04.
-The Docker recipe selects the LLVM 22 channel; it is not a hermetic package
-lock. Retain the built image by digest. Runs record actual image IDs, compiler
+The Docker recipe pins the exact LLVM package version; the Ubuntu/development
+dependencies are not a hermetic lock. Retain the built image by digest. If the
+upstream apt mirror stops retaining that version, reuse the retained image or
+explicitly select and revalidate a replacement; never silently upgrade. Runs
+record actual image IDs, compiler
 versions, plugin hashes, commands, time limits, outputs, and return codes.
 Do not substitute an existing prebuilt xollvm image for this fork's plugin.
 
@@ -50,6 +53,14 @@ decompilation. Use `--no-diversity`, `--no-data`, `--no-helpers`, `--no-late`
 for F1–F3 ablations; `--family 0..3` forces a representation family. `--passes`
 filters application passes, while feature/helper flags remain independent.
 The widths fixture requires all four supported array widths to be encoded.
+Module string encoding and function merging are enabled by default; use
+`--no-strings` and `--no-merge` for their ablations. The merging fixture requires
+actual flattening of each merged group, not just of an unrelated function.
+
+`--probe-helpers 2` additionally decompiles up to two distinct generated-helper
+roles at known entry addresses. It uses private symbols from an unstripped
+intermediate, but Ghidra still receives the stripped final binary. A missing or
+failed requested helper probe cannot count as successful normalization survival.
 
 Assembly, relocations, stripped ELF, Ghidra C and high-pcode counts are saved.
 The literal positive control must be recovered by Ghidra; the deliberately
@@ -57,6 +68,12 @@ foldable negative control must simplify. `--require-literal-hiding` additionally
 requires the declared literal probes to disappear from assembly and decompiled
 C. A missing literal does not establish resistance to static evaluation or SMT.
 Pseudocode length and normalized hashes are diagnostics, not hardness scores.
+
+Compare saved runs with `python3 -m conformance.compare LEFT/summary.json
+RIGHT/summary.json`. Add `--require-identical-binaries` and/or
+`--require-identical-ir` for reproducibility gates. Comparisons reject missing
+cases, incorrect builds and mismatched source. Missing decompiler measurements
+remain null, never "equal" evidence.
 
 `--profile max` is the default bounded high-intensity native candidate.
 `--profile smoke` is a separately labeled faster integration profile.

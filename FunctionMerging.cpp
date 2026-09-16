@@ -364,6 +364,20 @@ namespace {
 		Function* Merged = Function::Create(FT, GlobalValue::InternalLinkage,
 			(Twine("__obf_merged_") + Label).str(), &M);
 		Merged->addFnAttr(Attribute::NoInline);
+		if (Members.front()->F->hasFnAttribute("sre.native.original")) {
+			std::string Origins;
+			for (const auto *Member : Members) {
+				if (!Origins.empty()) Origins += ",";
+				Origins += Member->F->getName().str();
+			}
+			Merged->addFnAttr("sre.native.original");
+			Merged->addFnAttr("sre.native.merged", Origins);
+			Merged->addFnAttr("sre.native.spec",
+				Members.front()->F->getFnAttribute("sre.native.spec").getValueAsString());
+			Merged->addFnAttr("sre.native.stage", "application");
+			if (Members.front()->F->hasFnAttribute("sre.native.families"))
+				Merged->addFnAttr("sre.native.families");
+		}
 		Merged->getArg(0)->setName("selector");
 		Merged->getArg(1)->setName("argpack");
 		Merged->getArg(2)->setName("retslot");
@@ -744,12 +758,20 @@ PreservedAnalyses FunctionMergingPass::run(Module& M, ModuleAnalysisManager& AM)
 		Changed = true;
 	}
 
+	// Make native merged configurations visible to the immediately following
+	// module string pass even if no llvm.global.annotations initializer changed.
+	for (Function &F : M)
+		if (F.hasFnAttribute("sre.native.merged"))
+			Cache.PerFunction[&F] = AnnotationParser::parseAnnotationString(
+				F.getFnAttribute("sre.native.spec").getValueAsString().str());
+
 	// Erase the functions fully folded away (their only remaining uses were
 	// those annotation references, now pruned above).
 	if (!Dead.empty()) {
 		for (Function* F : Dead) {
 			F->removeDeadConstantUsers();
 			if (F->use_empty()) {
+				Cache.PerFunction.erase(F);
 				F->eraseFromParent();
 				++FMergeFunctionsFolded;
 			}
