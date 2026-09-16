@@ -472,6 +472,11 @@ These research extensions stay entirely at IR level. Initial bounded R1,
 R2-coupling and R3-outlining infrastructure is implemented as described in the
 linked experiment document; the broader research objectives below are not all met.
 
+[v01](NATIVE_V01.md) now implements additional bounded versions of R1–R5,
+including cross-TU/native fusion, wide shares, mutable local memory, reachable
+witness semantics and static recovery selection. The table remains a research
+direction, not a claim of arbitrary-program coverage or tool resistance.
+
 | ID | Idea | Native implementation direction | Gate / principal risk |
 |---|---|---|---|
 | R1 | Persistent relational value encoding | Jointly encode two/few live integers and implement a restricted operation family without decoding at every use. Carry the representation across native blocks. | Prove transfer functions; test recovery of the joint representation. Local encode/decode wrappers that simplify away do not count. |

@@ -1,5 +1,11 @@
 # Native IR implementation status
 
+Latest addition: [v01 recovery-guided IR experiments](NATIVE_V01.md) adds linked
+application IR, bounded cross-function fusion, wide shared values, closed local
+memory (including small byte copies), a reachable witness invariant, and static
+recovery replay/selection. These remain opt-in; the historical milestones below
+are retained. Explicit O0/static builds are also supported by the adapters.
+
 The working path is source → stock Clang 22.1.8 `-O2` → this fork's explicit
 native opt pass → backend without a second `-O2` → PIE link. VM, MC/post-link
 changes, injected assembly and timing reads are not enabled by this entry point.

@@ -1,5 +1,9 @@
 # Experimental persistent values and native regions
 
+See [v01](NATIVE_V01.md) for subsequent wide values, cross-call fusion, local
+memory representations and invariant-dependent coupling. This document retains
+the original affine-pair/outlining/context design and its limitations.
+
 These IR-only experiments are implemented, independently selectable and
 conformance-tested. They are **not blocked on an agent benchmark**, but improved
 agent resistance is still a research claim to measure before default promotion.

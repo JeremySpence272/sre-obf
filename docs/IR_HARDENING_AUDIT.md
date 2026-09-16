@@ -1,5 +1,12 @@
 # IR-only expansion: audit and implementation ledger
 
+Latest implementation delta: [v01](NATIVE_V01.md). R1 has a wider operation
+family; R2 has a reachable witness relation; R3 includes bounded cross-call
+fusion; R4 includes closed mutable local objects; R5 has bounded static replay,
+overhead gates and held-out evaluation. Earlier ledger entries below describe
+their original milestones, not the current implementation ceiling. None of this
+turns the complete original technique wishlist into a completed feature list.
+
 Scope confirmed 2026-09-16: expand the native IR path; retain MC and post-link
 ideas in [FUTURE_MACHINE_BINARY_IDEAS.md](FUTURE_MACHINE_BINARY_IDEAS.md). No VM,
 prompt/tokenizer manipulation, environment/hardware checks, anti-debugging, or
