@@ -21,6 +21,7 @@
 #include "llvm/Transforms/Obfuscator/ObfuscationConfig.h"
 #include "llvm/Transforms/Obfuscator/TargetCompat.h"
 #include "llvm/Transforms/Obfuscator/PassCtx.h"
+#include "llvm/Transforms/Obfuscator/Utils.h"
 
 
 #include <cstring>
@@ -87,6 +88,19 @@ namespace llvm {
 		if (Cfg.maxBlocks > 0 && FOC.NumNormalBlocks > Cfg.maxBlocks) {
 			if (R)*R << "too many blocks(" << FOC.NumNormalBlocks << ">" << Cfg.maxBlocks << ")";
 			return false;
+		}
+		// Multi-value-return functions are unsafe: computeReturnInfo()/buildWrapper()
+		// read the return value from ONE fixed register-file slot (the first
+		// ReturnInst's), so any function with >1 value-returning ret can miscompute
+		// on non-first return paths. Bail conservatively.
+		{
+			unsigned ValueReturns = 0;
+			for (BasicBlock& BB : F) {
+				if (!llvm::obf::hasTerminatorCompat(&BB)) continue;
+				if (auto* RI = dyn_cast<ReturnInst>(BB.getTerminator()))
+					if (RI->getReturnValue()) ++ValueReturns;
+			}
+			if (ValueReturns > 1) { if (R) *R << "multi-value-return"; return false; }
 		}
 		return true;
 	}
