@@ -692,6 +692,10 @@ namespace {
 
     bool StrEncImpl::shouldEncrypt(GlobalVariable& GV, int minLength) {
         if (!GV.hasInitializer() || !GV.isConstant()) return false;
+        // Never rewrite/erase a symbol another TU may link against. isDiscardableIfUnused()
+        // covers private/internal AND linkonce_odr (how clang-cl emits string literals on
+        // Windows) while still excluding external/weak ABI symbols.
+        if (!GV.isDiscardableIfUnused()) return false;
         auto* CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
         if (!CDA || !CDA->isCString()) return false;
 
