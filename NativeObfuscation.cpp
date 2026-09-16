@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeObfuscation.h"
 #include "llvm/Transforms/Obfuscator/NativeEncoding.h"
+#include "llvm/Transforms/Obfuscator/NativeRegions.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InlineAsm.h"
@@ -43,6 +44,14 @@ cl::opt<bool> NativeMultiState("native-multistate",
     cl::desc("Three-word per-activation relational flattening state"), cl::init(true));
 cl::opt<unsigned> NativeStateFamily("native-state-family",
     cl::desc("Multi-state encoding family: 0..2 forced, 3 seeded"), cl::init(3));
+cl::opt<bool> NativeValues("native-values",
+    cl::desc("Experimental persistent two-lane integer SSA representations"), cl::init(false));
+cl::opt<unsigned> NativeValueNodes("native-value-nodes",
+    cl::desc("Maximum persistent-value nodes per eligible function (2..64)"), cl::init(24));
+cl::opt<bool> NativeOutline("native-outline",
+    cl::desc("Experimental bounded pure-integer region outlining"), cl::init(false));
+cl::opt<bool> NativeCoupledState("native-coupled-state",
+    cl::desc("Experimental per-activation coupling of encoded data and flattening"), cl::init(false));
 
 void enableFamilies(Function &F) {
   if (NativeDiversity) F.addFnAttr("sre.native.families");
@@ -128,6 +137,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-level must be max or smoke");
   if (NativeStateFamily > 3)
     report_fatal_error("native-state-family must be 0..3");
+  if (NativeValueNodes < 2 || NativeValueNodes > 64)
+    report_fatal_error("native-value-nodes must be 2..64");
+  if (NativeCoupledState && (!NativeValues || !NativeMultiState))
+    report_fatal_error("native-coupled-state requires native-values and native-multistate");
+  if (NativeCoupledState && !NativePasses.empty() &&
+      !llvm::is_contained(NativePasses, "flattening"))
+    report_fatal_error("native-coupled-state requires flattening in the pass ablation");
   if (ObfSeed.getNumOccurrences() == 0)
     report_fatal_error("native-obfuscation requires an explicit -obf-seed");
   for (const std::string &Name : NativePasses)
@@ -204,6 +220,19 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   json::Array DataCoverage;
   if (NativeData)
     DataCoverage = obf::encodeNativeData(M, PreparedCache.ModuleSeed);
+  json::Array OutlineCoverage, ValueCoverage;
+  if (NativeOutline)
+    OutlineCoverage = obf::outlineNativeRegions(M, PreparedCache.ModuleSeed);
+  if (NativeValues)
+    ValueCoverage = obf::encodeNativeValues(M, PreparedCache.ModuleSeed, NativeValueNodes, NativeCoupledState);
+  if (NativeOutline || NativeValues) {
+    auto &ChangedFAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    for (Function &F : M)
+      if (!F.isDeclaration()) ChangedFAM.invalidate(F, PreservedAnalyses::none());
+    if (verifyModule(M, &errs()))
+      report_fatal_error("native value/region preparation produced invalid IR");
+    checkModuleBudget(M);
+  }
   // O2 may put call-site memory(none)/readonly promises on calls. Updating only
   // the callee's attributes is insufficient when protection adds volatile reads.
   for (Function &F : M)
@@ -340,16 +369,22 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     // a budget rollback. Later passes may rewrite individual comparisons.
     json::Array StateCoverage;
     for (const Function &F : M) {
-      unsigned Words = 0, Comparisons = 0;
+      unsigned Words = 0, Comparisons = 0, DataUpdates = 0, ControlUpdates = 0;
       for (const Instruction &I : instructions(F)) {
         if (isa<AllocaInst>(I) &&
             (I.getName() == "fla.state" || I.getName() == "fla.multi.key" ||
              I.getName() == "fla.multi.salt")) ++Words;
         if (isa<ICmpInst>(I) && I.getName().starts_with("fla.multi.match"))
           ++Comparisons;
+        if (auto *Tag = I.getMetadata("sre.native.context.update")) {
+          StringRef Role = cast<MDString>(Tag->getOperand(0))->getString();
+          if (Role == "data") ++DataUpdates;
+          if (Role == "control") ++ControlUpdates;
+        }
       }
       if (Words) StateCoverage.push_back(json::Object{
           {"function", F.getName().str()}, {"words", Words},
+          {"coupled_data_updates", DataUpdates}, {"coupled_control_updates", ControlUpdates},
           {"remaining_named_comparisons", Comparisons}});
     }
     std::error_code EC;
@@ -364,9 +399,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"strings", NativeStrings.getValue()}, {"merge", NativeMerge.getValue()},
                             {"multistate", NativeMultiState.getValue()},
                             {"state_family", NativeStateFamily.getValue()},
+                            {"values", NativeValues.getValue()}, {"outline", NativeOutline.getValue()},
+                            {"coupled_state", NativeCoupledState.getValue()},
+                            {"value_nodes", NativeValueNodes.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
                         {"flattening_state", std::move(StateCoverage)},
+                        {"values", std::move(ValueCoverage)}, {"outlined_regions", std::move(OutlineCoverage)},
                         {"encodings", obf::nativeEncodingInventory(M)},
                         {"data", std::move(DataCoverage)},
                         {"helpers", std::move(HelperCoverage)},

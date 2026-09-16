@@ -78,6 +78,13 @@ def main(args: list[str] | None = None) -> int:
     multistate = os.environ.get("SRE_OBF_MULTISTATE", "1")
     if multistate not in ("0", "1"):
         raise ValueError("SRE_OBF_MULTISTATE must be 0 or 1")
+    values = os.environ.get("SRE_OBF_VALUES", "0")
+    outline = os.environ.get("SRE_OBF_OUTLINE", "0")
+    coupled = os.environ.get("SRE_OBF_COUPLED_STATE", "0")
+    if values not in ("0", "1") or outline not in ("0", "1"):
+        raise ValueError("SRE_OBF_VALUES and SRE_OBF_OUTLINE must be 0 or 1")
+    if coupled not in ("0", "1") or (coupled == "1" and (values != "1" or multistate != "1")):
+        raise ValueError("SRE_OBF_COUPLED_STATE requires enabled values and multistate")
     if profile not in ("max", "smoke", "none") or not 0 <= seed < 2**64:
         raise ValueError("invalid SRE_OBF_PROFILE or SRE_OBF_SEED")
     if args == ["--version"]:
@@ -120,6 +127,8 @@ def main(args: list[str] | None = None) -> int:
         runner.run(opt_command(plugin) + [
             "-passes=native-obfuscation", f"-native-level={profile}",
             f"-native-multistate={multistate}",
+            f"-native-values={values}", f"-native-outline={outline}",
+            f"-native-coupled-state={coupled}",
             f"-obf-seed={seed}", "-obf-deterministic", "-obf-verify",
             "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
             f"-obf-report-json={work / 'passes.json'}",
@@ -130,6 +139,9 @@ def main(args: list[str] | None = None) -> int:
     dump(Path(str(output) + ".sre.json"), {
         "schema": "sre-native-object-v1", "profile": profile, "seed": seed,
         "multistate": multistate == "1" if profile != "none" else False,
+        "values": values == "1" if profile != "none" else False,
+        "outline": outline == "1" if profile != "none" else False,
+        "coupled_state": coupled == "1" if profile != "none" else False,
         "toolchain_image": image_identity(image),
         "adapter_sha256": digest(Path(__file__)),
         "plugin_sha256": digest(plugin) if profile != "none" else None,

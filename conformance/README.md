@@ -105,6 +105,31 @@ remain null, never "equal" evidence.
 `--passes flattening,constenc` requests an explicit pass ablation. VM, injected
 assembly and timing reads are prohibited by the native entry point.
 
+## Further IR experiments
+
+`--values` enables persistent paired integer SSA representations; `--outline`
+enables bounded native pure-region outlining. They are independent and opt-in.
+`--coupled-state` additionally ties data masks to per-call flattening state and
+requires `--values` plus multi-state flattening. `--value-nodes 2..64` controls
+per-function value coverage (default 24). For example:
+
+```sh
+python3 -m conformance.run --out out/conformance/experiments-001 \
+  --toolchain-image sre-obf-dev:llvm22 --profile max --case values \
+  --values --outline --coupled-state --threads --post-o2-attack
+```
+
+The `values` fixture requires i8/i16/i32/i64 coverage, paired loop PHIs, and
+multiple real outputs from an outlined region. Coupling requires surviving
+updates from both data and control. Missing requested coverage fails the run.
+Inside the pinned image, `python3 -m conformance.value_edges --out
+out/conformance/value-edges-001` tests duplicate switch-predecessor PHIs under
+partial/full value coverage and combined flattening.
+
+See [the design and limits](../docs/NATIVE_VALUE_REGIONS.md). Enabled experiments
+are not a claim of measured agent resistance; known-representation inverse
+recovery is deliberately tested as a successful control.
+
 ## Standalone crackme adapter
 
 Use `python3 /absolute/path/sre-obf/conformance/cc.py` as the existing harness's
@@ -115,6 +140,8 @@ unobfuscated IR/backend control. The adapter supports separate C compile/link
 commands, refuses LTO and non-O2 frontend settings, and never silently falls
 back to an unobfuscated build. Sidecars and intermediate work stay beside
 private objects; only the validated final binary belongs in the public bundle.
+Set `SRE_OBF_VALUES=1`, `SRE_OBF_OUTLINE=1` and optionally
+`SRE_OBF_COUPLED_STATE=1` to enable the same experiments in crackme builds.
 
 No paid-agent solve or general obfuscation-hardness claim is established by
 these tests. The wider evaluation and remaining acceptance criteria are in

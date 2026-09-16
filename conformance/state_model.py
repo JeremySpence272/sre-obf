@@ -36,7 +36,10 @@ def recover(token: int, key: int, salt: int, family: int) -> int:
     raise ValueError("family must be 0..2")
 
 
-def advance(token: int, key: int, salt: int, site0: int, site1: int):
+def advance(token: int, key: int, salt: int, site0: int, site1: int, history=None):
     new_key = (rol(key ^ salt, 5) + site0) & MASK
     new_salt = rol(salt + token, 7) ^ ((new_key + site1) & MASK)
+    if history is not None:
+        new_key = (new_key + history) & MASK
+        new_salt ^= rol(history, 13)
     return new_key, new_salt

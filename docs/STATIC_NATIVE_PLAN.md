@@ -6,6 +6,10 @@ See [implementation status](NATIVE_IR_STATUS.md) for the tested subset and limit
 The expanded IR-only scope and source audit are tracked in
 [IR_HARDENING_AUDIT.md](IR_HARDENING_AUDIT.md), including the first relational
 flattening milestone. MC and post-link remain deferred.
+Initial persistent-value, pure-region outlining and data/control-coupling
+experiments are now implemented behind opt-in flags; see
+[NATIVE_VALUE_REGIONS.md](NATIVE_VALUE_REGIONS.md). Research acceptance is not
+a blocker to implementing experiments; it remains a gate for default promotion.
 Written 2026-09-16 against fork revision
 `c6da83bac36efb9e216cc752b12060159acf4a62`.
 
@@ -464,8 +468,9 @@ the same as demonstrating improved protection.
 
 ## 8. Follow-on IR roadmap: the newer ideas
 
-These are planned research extensions, not commitments to enable unvalidated
-features in the initial preset. They stay entirely at IR level.
+These research extensions stay entirely at IR level. Initial bounded R1,
+R2-coupling and R3-outlining infrastructure is implemented as described in the
+linked experiment document; the broader research objectives below are not all met.
 
 | ID | Idea | Native implementation direction | Gate / principal risk |
 |---|---|---|---|
@@ -509,6 +514,6 @@ Do not implement the full research features merely to build this scaffolding.
   documented but unimplemented until a measured reason justifies that scope.
 
 This is the roadmap, not an assertion that every acceptance item is complete.
-F1-F3 and the first state-hardening milestone have implementations; consult the
-linked status and audit for exact evidence. General R1-R6 and agent solve/repair
-measurements still require work.
+F1-F3, state hardening, and bounded value/region/coupling experiments have
+implementations; consult the linked status and audit for exact evidence.
+Generalized R1-R6 coverage and agent solve/repair measurements still require work.

@@ -45,12 +45,12 @@ coverage concern.
 | 5 | Tokenizer constants | Excluded under the agreed non-prompt/tokenizer direction. |
 | 6 | Seeded template diversity | Initial registry exists; multi-state adds three function-level state families. Neither establishes a 10% distribution cap or effective post-decompiler diversity. |
 | 7 | Distributed multi-state CFF | First implementation: local three-word, history-dependent state and encoded candidate dispatch. Cross-function activation contexts and global distribution are NOT implemented. Globals are not the default because recursion, threads and callbacks need isolation. |
-| 8 | Key-dependent MBA | Existing SLE/input-zero machinery is useful but not this feature. Persistent relational operation semantics remain R1/R2 work. |
+| 8 | Key-dependent MBA | Existing SLE/input-zero machinery is not LOKI. Initial two-lane modular transfers and optional data/control coupling are implemented; generalized invariant-dependent semantics remain research. |
 | 9 | Static dataflow denial | Existing slot/pointer techniques are ingredients. Plan nonescaping bounded objects with proven index/lifetime rules and changing representations (R4). |
-| 10 | Indirect calls / outlining | Existing call protection reused; call-table hardening and bounded pure-region outlining remain work. Do not expand arbitrary ABI boundaries. |
+| 10 | Indirect calls / outlining | Existing call protection reused; bounded native pure-integer outlining is now implemented, including multi-output helpers. Further call-table hardening remains work. External ABI is unchanged. |
 | 11 | Semantic mimicry blocks | Optional corpus experiment, not implemented. A checksum feeding an invariant branch may still disappear once that invariant is known; measure live semantic dependencies. |
 | 12 | Induction-head poisoning | Not promoted: depends on repetition/attention effects explicitly outside the primary strategy. Real template diversity belongs to #6. |
-| 13 | Function-boundary dissolution | Existing merge is only a starting point. Bounded native multi-output fusion/outlining is planned (R3), not unrestricted fragments across unrelated functions. |
+| 13 | Function-boundary dissolution | Existing merge plus new bounded multi-output outlining/value encoding are initial ingredients. Not unrestricted fragments across unrelated functions or general joint-output synthesis. |
 | 14 | Merged-handler virtualization | Excluded: native flattening, no VM. |
 | 15 | Anti-idiom/e-graph selection | Bounded verified candidate search is planned (R5). Score recovery-script transfer and cost, not assumed distance from unknown training data. |
 | 16 | Idiom transplant | Optional corpus experiment, not implemented. Arbitrary algorithms cannot acquire another algorithm's structure without a semantic matching restriction or substantial overhead. |
@@ -116,26 +116,32 @@ The recurrence and bijections give a hand-checkable invariant. Model tests and
 finite binary differentials supplement it; they are not an LLVM equivalence
 proof or a demonstrated cost increase against an agent.
 
-## Next IR implementation gates
+## Further implemented experiments and next gates
+
+See [NATIVE_VALUE_REGIONS.md](NATIVE_VALUE_REGIONS.md) for the new persistent-value,
+pure-region outlining and local data/control-coupling passes. They can be enabled
+now; research validation is not a prerequisite for adding an experimental pass.
+Default promotion remains separate from implementation and correctness.
 
 1. First state milestone implemented and conformance-checked. See
    [NATIVE_IR_STATUS.md](NATIVE_IR_STATUS.md) for state-family, recursion, thread,
    seed, legacy-ablation, stock-O2 and Ghidra evidence. Recovery-cost validation
    is still outstanding; this is not yet a demonstrated stronger preset.
-2. R1: carry a small jointly encoded integer representation through a supported
-   operation subset and joins; preserve source memory/poison semantics. Add an
-   algebraic recovery baseline before extending coverage.
-3. R3 / #10 / #13: fuse and outline bounded pure integer regions with multiple
-   real outputs; preserve external ABI and memory ordering. No interpreter.
-4. R2/R4: combine operation invariants and nonescaping object phases with an
-   activation context; only then consider safely sharing that context across
-   internal calls. Prove initialization, every transition and joins.
+2. R1: initial two-lane modular encoding carries supported operations and joins,
+   with a known-representation recovery control. Extend operation families and
+   evaluate normalization/repair before treating the research objective as met.
+3. R3 / #10 / #13: bounded pure-region outlining with real multiple outputs is
+   implemented and can receive R1 encoding. General joint-output synthesis and
+   cross-function fragmentation remain work. No interpreter.
+4. R2/R4: initial local data/control context coupling is implemented. Phase-
+   changing source objects and safely shared contexts across internal calls
+   remain work; prove initialization, transitions, joins and concurrency.
 5. R6 / #2: invariant-backed predicate candidates; retain proof artifacts
    privately. Known-hash evaluation and solver normalization are controls.
 6. R5 / #6 / #15: bounded selection against cheap recovery scripts, with held-out
    seeds, programs and tools. Corpus #11/#16 is a separate opt-in experiment.
 
-The next milestones remain unimplemented. None of the above requires MC or
+Remaining research milestones are not all implemented. None of the above requires MC or
 post-link changes, and none promises that angr, Z3, Ghidra or taint analysis
 becomes unusable. The target metric is additional verified recovery/repair work
 at matched binary, runtime and agent budgets.

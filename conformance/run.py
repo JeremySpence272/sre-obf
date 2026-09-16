@@ -16,7 +16,7 @@ from .process import Runner, ToolFailure, digest, dump
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "conformance" / "fixtures"
 CASES = ("arithmetic", "data", "widths", "constructors", "merging", "strings",
-         "literal", "foldable", "state")
+         "literal", "foldable", "state", "values")
 
 
 def test_inputs(count: int = 128) -> bytes:
@@ -58,6 +58,10 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             f"-native-merge={int(not args.no_merge)}",
             f"-native-multistate={int(not args.no_multistate)}",
             f"-native-state-family={args.state_family}",
+            f"-native-values={int(args.values)}",
+            f"-native-outline={int(args.outline)}",
+            f"-native-value-nodes={args.value_nodes}",
+            f"-native-coupled-state={int(args.coupled_state)}",
             f"-native-family={args.family}"]
 
 
@@ -157,7 +161,22 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
                           if item["function"] == "obf_target"), None)
             if not state or state["words"] != 3:
                 raise ToolFailure("target flattening lost required multi-state storage")
+            if args.coupled_state and name == "values" and not (
+                    state["coupled_data_updates"] and state["coupled_control_updates"]):
+                raise ToolFailure("required data/control coupling did not survive")
         enabled_pass = lambda name: not args.passes or name in args.passes.split(",")
+        if name == "values" and args.values:
+            encoded = [v for v in native_report["values"] if v["status"] == "encoded"]
+            if {w for v in encoded for w in v["widths"]} != {8, 16, 32, 64}:
+                raise ToolFailure("persistent-value width coverage is incomplete")
+            if not any(v["phi_pairs"] and v["persistent_edges"] for v in encoded):
+                raise ToolFailure("persistent-value loop/join coverage is missing")
+        if name == "values" and args.outline:
+            outlined = [v for v in native_report["outlined_regions"] if v["status"] == "outlined"]
+            if not outlined:
+                raise ToolFailure("required pure-region outlining did not run")
+            if not any(v["outputs"] >= 2 for v in outlined):
+                raise ToolFailure("required multi-output outlined region is missing")
         if name == "merging" and not args.no_merge and enabled_pass("fmerge"):
             groups = native_report["merged_groups"]
             if not groups:
@@ -300,6 +319,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-merge", action="store_true")
     p.add_argument("--no-multistate", action="store_true")
     p.add_argument("--state-family", type=int, choices=(0, 1, 2, 3), default=3)
+    p.add_argument("--values", action="store_true")
+    p.add_argument("--outline", action="store_true")
+    p.add_argument("--value-nodes", type=int, default=24)
+    p.add_argument("--coupled-state", action="store_true")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--probe-helpers", type=int, default=0,
                    help="Informed-entry probes for up to N distinct helper roles")
@@ -328,6 +351,10 @@ def main(argv=None) -> int:
         raise SystemExit("counts/timeouts must be valid positive limits")
     if args.threads and args.random_inputs + 81 > 4096:
         raise SystemExit("--threads supports at most 4096 total vectors")
+    if not 2 <= args.value_nodes <= 64:
+        raise SystemExit("--value-nodes must be 2..64")
+    if args.coupled_state and (not args.values or args.no_multistate):
+        raise SystemExit("--coupled-state requires --values and multi-state flattening")
     if not 0 <= args.probe_helpers <= 8:
         raise SystemExit("--probe-helpers must be between 0 and 8")
     if any(seed < 0 or seed >= 2**64 for seed in args.seed or [1]):

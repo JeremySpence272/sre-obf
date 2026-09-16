@@ -145,6 +145,7 @@ namespace {
 		llvm::obf::Rng MultiRng;
 		AllocaInst* MultiKey = nullptr;
 		AllocaInst* MultiSalt = nullptr;
+		AllocaInst* ValueContext = nullptr;
 		unsigned MultiFamily = 0;
 
 		llvm::obf::OpaqueUtils Opaque;
@@ -183,6 +184,10 @@ namespace {
 			PtrRng(R.fork("ptr")),
 			MultiRng(R.fork("multi-state-v1")),
 			Opaque(M, OpaqueRng, FlaImpl::kFlaOpaqueSlot, makeOpaqueOpts(Cfg)) {
+			for (Instruction& I : F.getEntryBlock())
+				if (auto* AI = dyn_cast<AllocaInst>(&I))
+					if (AI->getMetadata("sre.native.context") && AI->getAllocatedType()->isIntegerTy(32))
+						ValueContext = AI;
 		}
 	};
 
@@ -354,6 +359,7 @@ namespace {
 	}
 
 	void FlaImpl::storeState(IRBuilder<>& B, FlaCtx& PCtx, FunctionObfContext& Ctx, Value* V) {
+		Value* NextContext = nullptr;
 		if (PCtx.Cfg.MultiState) {
 			// Evolve representation on EVERY edge, including back edges. All three
 			// old words are initialized in the entry, and belong to this activation.
@@ -369,7 +375,17 @@ namespace {
 				B.getInt32(PCtx.MultiRng.u32()), "fla.multi.next.key");
 			Value* NS = B.CreateXor(rotl32ir(B, B.CreateAdd(S, T), 7),
 				B.CreateAdd(NK, B.getInt32(PCtx.MultiRng.u32())), "fla.multi.next.salt");
+			if (PCtx.ValueContext) {
+				// Entry initialization belongs to the value pass. Read only at
+				// transitions, after its dominating initialization, never in the
+				// flattening prologue where insertion order could precede that store.
+				auto* History = B.CreateLoad(B.getInt32Ty(), PCtx.ValueContext);
+				History->setVolatile(true);
+				NK = B.CreateAdd(NK, History);
+				NS = B.CreateXor(NS, rotl32ir(B, History, 13));
+			}
 			V = multiStateEncode(B, PCtx, V, NK, NS);
+			if (PCtx.ValueContext) NextContext = B.CreateXor(V, NS);
 			B.CreateStore(NK, PCtx.MultiKey)->setVolatile(true);
 			B.CreateStore(NS, PCtx.MultiSalt)->setVolatile(true);
 		}
@@ -377,6 +393,12 @@ namespace {
 		auto* S = B.CreateStore(V, P);
 		if (PCtx.Cfg.MultiState || PCtx.Cfg.OpaqueState || PCtx.Cfg.FakeTransitions || PCtx.Cfg.ObfuscateStatePtr)
 			S->setVolatile(true);
+		if (NextContext) {
+			auto* CS = B.CreateStore(NextContext, PCtx.ValueContext);
+			CS->setVolatile(true);
+			CS->setMetadata("sre.native.context.update", MDNode::get(B.getContext(),
+				MDString::get(B.getContext(), "control")));
+		}
 	}
 
 	void FlaImpl::initMultiState(FlaCtx& PCtx) {

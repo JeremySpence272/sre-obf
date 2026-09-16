@@ -5,6 +5,58 @@ native opt pass → backend without a second `-O2` → PIE link. VM, MC/post-lin
 changes, injected assembly and timing reads are not enabled by this entry point.
 The legacy automatic Clang hook and legacy VM presets remain separate.
 
+## Further implemented IR experiments
+
+[Persistent values, native regions and coupling](NATIVE_VALUE_REGIONS.md) are
+now implemented as independent opt-in experiments:
+
+- `native-values=1`: two-lane modular integer representations carried through
+  add/sub/mul/constant-shift computations and paired PHI/select joins; widths
+  8/16/32/64, explicit conversion boundaries and per-function node caps.
+- `native-outline=1`: bounded 3–8-instruction pure regions, up to six inputs/four
+  outputs, ordinary ABI, generated-helper provenance and existing hardening.
+  This is not unrestricted fragmentation or general multi-output synthesis.
+- `native-coupled-state=1`: optional per-activation data/control context shared
+  with multi-state flattening. Requires values and multi-state; final IR must
+  retain both data and control updates for the dedicated fixture's gate.
+
+No missing approval or MC dependency blocked this work. The experiments can be
+enabled now; agent resistance has not been demonstrated, so they are not
+silently added to the existing default preset.
+
+Validation in this round:
+
+- Seventeen conformance unit tests, including exact-width transfer/inverse and
+  coupled-round model controls. The inverse controls deliberately succeed.
+- Uncoupled and coupled maximum matrices: ten fixtures × two seeds × 593
+  vectors each (11,860 cases per matrix), against both clean build arms.
+- Values-only and outlining-only ablations: three fixtures × 593 vectors each,
+  four threads and stock-O2 normalization. Coupled smoke: three fixtures × two
+  seeds × 593 vectors, also threaded and normalized.
+- A hand-written LLVM duplicate-predecessor fixture passes with partial value
+  coverage, full coverage, and full coverage plus flattening.
+- Ghidra target, normalized-target and outlined-helper probes complete for
+  uncoupled and coupled maximum candidates. This is retention/tool coverage,
+  not a successful anti-agent benchmark.
+- The real crackme with all three flags passes twelve semantic checks.
+- With experiments disabled, arithmetic and state fixtures reproduce the
+  previous milestone's exact protected IR and stripped binaries.
+
+Retained reports: `out/conformance/regions-max`, `regions-coupled-max`,
+`regions-values-only`, `regions-outline-only`, `regions-coupled-smoke`,
+`regions-edges`, `regions-ghidra` and `regions-coupled-ghidra`.
+The separate harness bundle is `out/native-regions-coupled/public/`.
+
+Cost warning: on maximum seed 1 for the dedicated `values` fixture, the
+uncoupled experimental binary is 190,664 bytes versus 14,384 bytes for clean
+controls; stock O2 reduces it to 157,856 bytes. This comparison includes the
+entire native preset, not solely these two passes. Ghidra variable-multiply
+counts change from 188 to 64 after extra O2 (clean: 9); operation counts are
+not recovery scores. Boundaries and recoverable coefficients remain important
+targets for static simplification. Phase-changing objects, new predicate
+generators, search/corpus machinery and generalized interprocedural state are
+still pending engineering/research, not secretly implemented by these flags.
+
 ## IR-only expansion: first milestone
 
 The [full source audit and technique ledger](IR_HARDENING_AUDIT.md) records what

@@ -12,6 +12,52 @@ from conformance.cc import backend_flags, compile_args
 from conformance.compare import compare
 from conformance.state_model import encode, recover, advance
 from conformance.run import parser, feature_flags
+from conformance.value_model import encode as encode_value, recover as recover_value, transfer
+
+
+class ValueTests(unittest.TestCase):
+    def test_coupled_data_control_rounds_preserve_both_relations(self):
+        rng = random.Random(75)
+        for width in (8, 16, 32, 64):
+            modulus = 1 << width
+            a, b = rng.getrandbits(width) | 1, rng.getrandbits(width) | 1
+            for family in range(3):
+                token, key, salt, context = 7, 11, 17, 23
+                for _ in range(100):
+                    x, y, rx, ry = (rng.getrandbits(width) for _ in range(4))
+                    mask = (context ^ x ^ ry) % modulus
+                    ex, ey = encode_value(x, rx, a, b, width), encode_value(y, ry, a, b, width)
+                    value = transfer("mul", ex, rx, ey, ry, mask, a, b, width)
+                    self.assertEqual(recover_value(value, mask, a, b, width), x * y % modulus)
+                    context = (value ^ mask) & 0xffffffff
+                    key, salt = advance(token, key, salt, 31, 53, context)
+                    token = encode(101, key, salt, family)
+                    self.assertEqual(recover(token, key, salt, family), 101)
+                    context = token ^ salt
+
+    def test_transfer_functions_and_recovery_at_all_supported_widths(self):
+        rng = random.Random(1945)
+        for width in (8, 16, 32, 64):
+            mask = (1 << width) - 1
+            edges = (0, 1, mask >> 1, 1 << (width - 1), mask)
+            pairs = [(x, y) for x in edges for y in edges]
+            pairs += [(rng.getrandbits(width), rng.getrandbits(width)) for _ in range(2000)]
+            for x, y in pairs:
+                a, b = rng.getrandbits(width) | 1, rng.getrandbits(width) | 1
+                rx, ry, out = (rng.getrandbits(width) for _ in range(3))
+                ex, ey = encode_value(x, rx, a, b, width), encode_value(y, ry, a, b, width)
+                shift = rng.randrange(width)
+                for op, plain in (("add", x + y), ("sub", x - y),
+                                  ("mul", x * y), ("shl", x << shift)):
+                    result = transfer(op, ex, rx, ey, ry, out, a, b, width, shift)
+                    self.assertEqual(result, encode_value(plain, out, a, b, width))
+                    self.assertEqual(recover_value(result, out, a, b, width), plain & mask)
+
+    def test_value_and_outline_flags_are_independent(self):
+        args = parser().parse_args(["--out", "/tmp/not-created", "--values"])
+        self.assertIn("-native-values=1", feature_flags(args))
+        self.assertIn("-native-outline=0", feature_flags(args))
+        self.assertIn("-native-coupled-state=0", feature_flags(args))
 
 
 class StateTests(unittest.TestCase):
