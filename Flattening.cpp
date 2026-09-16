@@ -10,6 +10,7 @@
 
 #include "llvm/Transforms/Obfuscator/PassCtx.h"
 #include "llvm/Transforms/Obfuscator/FunctionObfContextAnalysis.h"
+#include "llvm/Transforms/Obfuscator/NativeInvariant.h"
 #include "llvm/Transforms/Obfuscator/Flattening.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
@@ -146,6 +147,7 @@ namespace {
 		AllocaInst* MultiKey = nullptr;
 		AllocaInst* MultiSalt = nullptr;
 		AllocaInst* ValueContext = nullptr;
+		AllocaInst* ValueWitness = nullptr;
 		unsigned MultiFamily = 0;
 
 		llvm::obf::OpaqueUtils Opaque;
@@ -185,9 +187,12 @@ namespace {
 			MultiRng(R.fork("multi-state-v1")),
 			Opaque(M, OpaqueRng, FlaImpl::kFlaOpaqueSlot, makeOpaqueOpts(Cfg)) {
 			for (Instruction& I : F.getEntryBlock())
-				if (auto* AI = dyn_cast<AllocaInst>(&I))
+				if (auto* AI = dyn_cast<AllocaInst>(&I)) {
 					if (AI->getMetadata("sre.native.context") && AI->getAllocatedType()->isIntegerTy(32))
 						ValueContext = AI;
+					else if (AI->getMetadata("sre.native.witness") && AI->getAllocatedType()->isIntegerTy(32))
+						ValueWitness = AI;
+				}
 		}
 	};
 
@@ -376,6 +381,8 @@ namespace {
 			Value* NS = B.CreateXor(rotl32ir(B, B.CreateAdd(S, T), 7),
 				B.CreateAdd(NK, B.getInt32(PCtx.MultiRng.u32())), "fla.multi.next.salt");
 			if (PCtx.ValueContext) {
+				if (PCtx.ValueWitness)
+					V = B.CreateXor(V, obf::nativeResidual(B, PCtx.ValueContext, PCtx.ValueWitness));
 				// Entry initialization belongs to the value pass. Read only at
 				// transitions, after its dominating initialization, never in the
 				// flattening prologue where insertion order could precede that store.
@@ -398,6 +405,7 @@ namespace {
 			CS->setVolatile(true);
 			CS->setMetadata("sre.native.context.update", MDNode::get(B.getContext(),
 				MDString::get(B.getContext(), "control")));
+			obf::storeNativeWitness(B, PCtx.ValueWitness, NextContext);
 		}
 	}
 

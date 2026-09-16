@@ -9,7 +9,10 @@ from .run import ROOT, FIXTURES, opt_command, test_inputs
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
-    out = parser.parse_args().out.resolve()
+    parser.add_argument("--wide", action="store_true")
+    parser.add_argument("--invariant", action="store_true")
+    args = parser.parse_args()
+    out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
     runner = Runner(ROOT, out / "logs")
     plugin = ROOT / "build/Obfuscator.so"
@@ -29,6 +32,9 @@ def main():
         command = opt_command(plugin) + ["-passes=native-obfuscation", "-obf-seed=11",
             "-obf-verify", "-obf-deterministic", "-native-level=smoke", "-native-values=1",
             f"-native-value-nodes={limit}", "-native-outline=0", "-native-merge=0",
+            f"-native-values-wide={int(args.wide)}",
+            f"-native-coupled-state={int(args.invariant and flattening)}",
+            f"-native-invariant={int(args.invariant and flattening)}",
             "-native-strings=0", "-native-data=0", "-native-diversity=0",
             "-native-helper-hardening=0", "-native-late-constants=0",
             "-native-passes=" + ("flattening" if flattening else "fmerge"),

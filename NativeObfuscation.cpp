@@ -52,6 +52,10 @@ cl::opt<bool> NativeOutline("native-outline",
     cl::desc("Experimental bounded pure-integer region outlining"), cl::init(false));
 cl::opt<bool> NativeCoupledState("native-coupled-state",
     cl::desc("Experimental per-activation coupling of encoded data and flattening"), cl::init(false));
+cl::opt<bool> NativeFusion("native-fusion", cl::desc("Bounded private cross-function fusion and SSA preparation"), cl::init(false));
+cl::opt<bool> NativeMemory("native-memory", cl::desc("Encode closed local integer objects across stores and loads"), cl::init(false));
+cl::opt<bool> NativeWide("native-values-wide", cl::desc("XOR-share regions including bitwise, shifts and casts"), cl::init(false));
+cl::opt<bool> NativeInvariant("native-invariant", cl::desc("Reachable witness invariant shared by data and control"), cl::init(false));
 
 void enableFamilies(Function &F) {
   if (NativeDiversity) F.addFnAttr("sre.native.families");
@@ -139,6 +143,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-state-family must be 0..3");
   if (NativeValueNodes < 2 || NativeValueNodes > 64)
     report_fatal_error("native-value-nodes must be 2..64");
+  if (NativeWide && !NativeValues) report_fatal_error("native-values-wide requires native-values");
+  if (NativeInvariant && !NativeCoupledState) report_fatal_error("native-invariant requires native-coupled-state");
   if (NativeCoupledState && (!NativeValues || !NativeMultiState))
     report_fatal_error("native-coupled-state requires native-values and native-multistate");
   if (NativeCoupledState && !NativePasses.empty() &&
@@ -161,6 +167,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
 
   // Output-directory names must not change RNG streams or encoded data.
   M.setModuleIdentifier(sys::path::filename(M.getSourceFileName()));
+  json::Array FusionCoverage;
+  if (NativeFusion) {
+    FusionCoverage = obf::fuseNativeFunctions(M, static_cast<uint64_t>(ObfSeed), NativeFunctions);
+    AM.invalidate(M, PreservedAnalyses::none());
+    if (verifyModule(M, &errs())) report_fatal_error("native fusion produced invalid IR");
+    checkModuleBudget(M);
+  }
   json::Array Coverage;
   auto &Cache = AM.getResult<ObfuscationAnnotationAnalysis>(M);
   Cache.PerFunction.clear();
@@ -220,12 +233,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   json::Array DataCoverage;
   if (NativeData)
     DataCoverage = obf::encodeNativeData(M, PreparedCache.ModuleSeed);
-  json::Array OutlineCoverage, ValueCoverage;
+  json::Array OutlineCoverage, ValueCoverage, MemoryCoverage;
   if (NativeOutline)
     OutlineCoverage = obf::outlineNativeRegions(M, PreparedCache.ModuleSeed);
   if (NativeValues)
-    ValueCoverage = obf::encodeNativeValues(M, PreparedCache.ModuleSeed, NativeValueNodes, NativeCoupledState);
-  if (NativeOutline || NativeValues) {
+    ValueCoverage = obf::encodeNativeValues(M, PreparedCache.ModuleSeed, NativeValueNodes, NativeCoupledState, NativeWide, NativeInvariant);
+  if (NativeMemory) MemoryCoverage = obf::encodeNativeMemory(M, PreparedCache.ModuleSeed);
+  if (NativeOutline || NativeValues || NativeMemory) {
     auto &ChangedFAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
     for (Function &F : M)
       if (!F.isDeclaration()) ChangedFAM.invalidate(F, PreservedAnalyses::none());
@@ -401,9 +415,12 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"state_family", NativeStateFamily.getValue()},
                             {"values", NativeValues.getValue()}, {"outline", NativeOutline.getValue()},
                             {"coupled_state", NativeCoupledState.getValue()},
+                            {"fusion", NativeFusion.getValue()}, {"memory", NativeMemory.getValue()},
+                            {"values_wide", NativeWide.getValue()}, {"invariant", NativeInvariant.getValue()},
                             {"value_nodes", NativeValueNodes.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
+                        {"fused_calls", std::move(FusionCoverage)}, {"memory", std::move(MemoryCoverage)},
                         {"flattening_state", std::move(StateCoverage)},
                         {"values", std::move(ValueCoverage)}, {"outlined_regions", std::move(OutlineCoverage)},
                         {"encodings", obf::nativeEncodingInventory(M)},

@@ -85,6 +85,10 @@ def main(args: list[str] | None = None) -> int:
     values = os.environ.get("SRE_OBF_VALUES", "0")
     outline = os.environ.get("SRE_OBF_OUTLINE", "0")
     coupled = os.environ.get("SRE_OBF_COUPLED_STATE", "0")
+    extras = {name: os.environ.get("SRE_OBF_" + name.upper(), "0")
+              for name in ("fusion", "memory", "values_wide", "invariant")}
+    if any(value not in ("0", "1") for value in extras.values()):
+        raise ValueError("experimental SRE_OBF flags must be 0 or 1")
     if values not in ("0", "1") or outline not in ("0", "1"):
         raise ValueError("SRE_OBF_VALUES and SRE_OBF_OUTLINE must be 0 or 1")
     if coupled not in ("0", "1") or (coupled == "1" and (values != "1" or multistate != "1")):
@@ -133,6 +137,7 @@ def main(args: list[str] | None = None) -> int:
             f"-native-multistate={multistate}",
             f"-native-values={values}", f"-native-outline={outline}",
             f"-native-coupled-state={coupled}",
+            *(f"-native-{name.replace('_', '-')}={value}" for name, value in extras.items()),
             f"-obf-seed={seed}", "-obf-deterministic", "-obf-verify",
             "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
             f"-obf-report-json={work / 'passes.json'}",
@@ -149,6 +154,7 @@ def main(args: list[str] | None = None) -> int:
         "values": values == "1" if profile != "none" else False,
         "outline": outline == "1" if profile != "none" else False,
         "coupled_state": coupled == "1" if profile != "none" else False,
+        "experiments": {name: value == "1" if profile != "none" else False for name, value in extras.items()},
         "toolchain_image": image_identity(image),
         "adapter_sha256": digest(Path(__file__)),
         "plugin_sha256": digest(plugin) if profile != "none" else None,

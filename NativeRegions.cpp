@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeRegions.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
+#include "llvm/Transforms/Obfuscator/NativeInvariant.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -47,8 +48,16 @@ bool outlineable(const Instruction &I) {
   }
 }
 
-bool valueCandidate(const Instruction &I) {
+bool valueCandidate(const Instruction &I, bool Wide) {
   if (!supportedWidth(I.getType())) return false;
+  if (Wide) {
+    if (isa<TruncInst, ZExtInst, SExtInst>(I)) return supportedWidth(I.getOperand(0)->getType());
+    if (I.getOpcode() == Instruction::And || I.getOpcode() == Instruction::Or || I.getOpcode() == Instruction::Xor) return true;
+    if (I.getOpcode() == Instruction::LShr || I.getOpcode() == Instruction::AShr) {
+      auto *C = dyn_cast<ConstantInt>(I.getOperand(1));
+      return C && C->getValue().ult(I.getType()->getIntegerBitWidth());
+    }
+  }
   if (isa<PHINode>(I) || isa<SelectInst>(I)) return true;
   switch (I.getOpcode()) {
   case Instruction::Add: case Instruction::Sub: case Instruction::Mul: return true;
@@ -86,7 +95,10 @@ class ValueEncoder {
   unsigned BoundaryInputs = 0, BoundaryOutputs = 0, PersistentEdges = 0, Phis = 0;
   unsigned Site = 0;
   bool CoupleState;
+  bool Wide, Invariant;
+  unsigned DecodeBridges = 0;
   AllocaInst *Context = nullptr;
+  AllocaInst *Witness = nullptr;
 
   Coefficients coeff(Type *T) { return Coefficients(T->getIntegerBitWidth(), R.fork(T->getIntegerBitWidth())); }
   Constant *constant(const APInt &V) { return ConstantInt::get(F.getContext(), V); }
@@ -95,6 +107,8 @@ class ValueEncoder {
     return B.CreateOr(B.CreateShl(V, N), B.CreateLShr(V, W - N));
   }
   Pair pin(IRBuilder<> &B, Pair P, unsigned ID) {
+    if (Witness) P.E = B.CreateXor(P.E, B.CreateZExtOrTrunc(
+        nativeResidual(B, Context, Witness), P.E->getType()));
     IRBuilder<> Entry(getAllocaIP(F));
     auto *Slot = Entry.CreateAlloca(ArrayType::get(P.E->getType(), 2), nullptr, "sre.value.pair");
     Slot->setMetadata("sre.native.value", MDNode::get(F.getContext(), MDString::get(F.getContext(), Twine(ID).str())));
@@ -113,6 +127,7 @@ class ValueEncoder {
       S->setVolatile(true);
       S->setMetadata("sre.native.context.update", MDNode::get(F.getContext(),
           MDString::get(F.getContext(), "data")));
+      storeNativeWitness(B, Witness, Next);
     }
     return {E, Mask};
   }
@@ -124,8 +139,62 @@ class ValueEncoder {
     unsigned W = V->getType()->getIntegerBitWidth();
     APInt Salt(W, R.fork(Site++).u64(), false, true);
     Value *Mask = At.CreateXor(rotate(At, X, 1 + R.range(W - 1)), constant(Salt));
+    if (Wide) return {At.CreateXor(X, Mask), Mask};
     return {At.CreateAdd(At.CreateMul(X, constant(C.A)),
                          At.CreateMul(Mask, constant(C.B))), Mask};
+  }
+  Pair bxor(IRBuilder<> &B, Pair X, Pair Y) {
+    return {B.CreateXor(X.E, Y.E), B.CreateXor(X.R, Y.R)};
+  }
+  Pair band(IRBuilder<> &B, Pair X, Pair Y) {
+    Value *Mask = B.CreateXor(X.R, rotate(B, Y.R, 1));
+    Value *E = B.CreateXor(B.CreateXor(B.CreateAnd(X.E, Y.E), B.CreateAnd(X.E, Y.R)),
+                          B.CreateXor(B.CreateAnd(X.R, Y.E), B.CreateAnd(X.R, Y.R)));
+    return {B.CreateXor(E, Mask), Mask};
+  }
+  Pair bor(IRBuilder<> &B, Pair X, Pair Y) { return bxor(B, bxor(B, X, Y), band(B, X, Y)); }
+  Pair shift(IRBuilder<> &B, Pair X, unsigned D) {
+    return {B.CreateShl(X.E, D), B.CreateShl(X.R, D)};
+  }
+  Pair badd(IRBuilder<> &B, Pair X, Pair Y) {
+    Pair P = bxor(B, X, Y), Original = P, G = band(B, X, Y);
+    // Parallel-prefix carry in shared coordinates; no plaintext x/y boundary.
+    for (unsigned D = 1; D < X.E->getType()->getIntegerBitWidth(); D *= 2) {
+      G = bor(B, G, band(B, P, shift(B, G, D)));
+      P = band(B, P, shift(B, P, D));
+    }
+    return bxor(B, Original, shift(B, G, 1));
+  }
+  Pair emitWide(Instruction *I, IRBuilder<> &At) {
+    Pair X = input(I->getOperand(0), At);
+    if (isa<CastInst>(I)) {
+      auto Op = static_cast<Instruction::CastOps>(I->getOpcode());
+      return {At.CreateCast(Op, X.E, I->getType()), At.CreateCast(Op, X.R, I->getType())};
+    }
+    if (I->isShift()) {
+      auto Op = static_cast<Instruction::BinaryOps>(I->getOpcode());
+      return {At.CreateBinOp(Op, X.E, I->getOperand(1)), At.CreateBinOp(Op, X.R, I->getOperand(1))};
+    }
+    Pair Y = input(I->getOperand(1), At);
+    switch (I->getOpcode()) {
+    case Instruction::Xor: return bxor(At, X, Y);
+    case Instruction::And: return band(At, X, Y);
+    case Instruction::Or: return bor(At, X, Y);
+    case Instruction::Add: return badd(At, X, Y);
+    case Instruction::Sub: {
+      Y.E = At.CreateNot(Y.E);
+      Pair One{ConstantInt::get(I->getType(), 1), ConstantInt::get(I->getType(), 0)};
+      return badd(At, badd(At, X, Y), One);
+    }
+    case Instruction::Mul: {
+      // Explicit bridge, reported rather than called persistent multiplication.
+      ++DecodeBridges;
+      Value *V = At.CreateMul(At.CreateXor(X.E, X.R), At.CreateXor(Y.E, Y.R));
+      Value *Mask = At.CreateAdd(X.R, Y.R);
+      return {At.CreateXor(V, Mask), Mask};
+    }
+    default: llvm_unreachable("unsupported wide value");
+    }
   }
   Pair emit(Instruction *I) {
     if (auto Found = Encoded.find(I); Found != Encoded.end()) return Found->second;
@@ -135,6 +204,8 @@ class ValueEncoder {
       Pair T = input(S->getTrueValue(), At), N = input(S->getFalseValue(), At);
       Value *Cond = At.CreateFreeze(S->getCondition());
       Out = {At.CreateSelect(Cond, T.E, N.E), At.CreateSelect(Cond, T.R, N.R)};
+    } else if (Wide) {
+      Out = emitWide(I, At);
     } else {
       Coefficients C = coeff(I->getType());
       Pair X = input(I->getOperand(0), At);
@@ -183,10 +254,11 @@ class ValueEncoder {
   }
 
 public:
-  ValueEncoder(Function &F, uint64_t Seed, unsigned MaxNodes, bool CoupleState)
-      : F(F), R(Rng(Seed).fork("native-values-v1").fork(F.getName())), CoupleState(CoupleState) {
+  ValueEncoder(Function &F, uint64_t Seed, unsigned MaxNodes, bool CoupleState, bool Wide, bool Invariant)
+      : F(F), R(Rng(Seed).fork("native-values-v1").fork(F.getName())), CoupleState(CoupleState),
+        Wide(Wide), Invariant(Invariant) {
     for (Instruction &I : instructions(F))
-      if (Nodes.size() < MaxNodes && valueCandidate(I)) {
+      if (Nodes.size() < MaxNodes && valueCandidate(I, Wide)) {
         Nodes.push_back(&I); Selected.insert(&I);
       }
   }
@@ -201,7 +273,13 @@ public:
       IRBuilder<> Entry(getAllocaIP(F));
       Context = Entry.CreateAlloca(Entry.getInt32Ty(), nullptr, "sre.value.context");
       Context->setMetadata("sre.native.context", MDNode::get(F.getContext(), {}));
-      Entry.CreateStore(Entry.getInt32(R.fork("context").u32()), Context)->setVolatile(true);
+      Value *Initial = Entry.getInt32(R.fork("context").u32());
+      Entry.CreateStore(Initial, Context)->setVolatile(true);
+      if (Invariant) {
+        Witness = Entry.CreateAlloca(Entry.getInt32Ty(), nullptr, "sre.value.witness");
+        Witness->setMetadata("sre.native.witness", MDNode::get(F.getContext(), {}));
+        storeNativeWitness(Entry, Witness, Initial);
+      }
     }
     SmallVector<Use *, 32> Exits;
     for (Instruction *I : Nodes) {
@@ -246,8 +324,9 @@ public:
       IRBuilder<> At(IP);
       Pair P = Encoded.lookup(Original);
       Coefficients C = coeff(Original->getType());
-      Value *Plain = At.CreateMul(At.CreateSub(P.E, At.CreateMul(constant(C.B), P.R)),
-                                  constant(C.Inverse), "sre.value.output");
+      Value *Plain = Wide ? At.CreateXor(P.E, P.R, "sre.value.output")
+          : At.CreateMul(At.CreateSub(P.E, At.CreateMul(constant(C.B), P.R)),
+                         constant(C.Inverse), "sre.value.output");
       U->set(Plain); ++BoundaryOutputs;
       DecodedAt[Key] = Plain;
     }
@@ -268,13 +347,14 @@ public:
         {"nodes", Count}, {"persistent_edges", PersistentEdges}, {"phi_pairs", Phis},
         {"widths", std::move(WidthReport)},
         {"coupled_context_created", Context != nullptr},
+        {"reachable_invariant", Witness != nullptr}, {"decode_bridges", DecodeBridges},
         {"boundary_inputs", BoundaryInputs}, {"boundary_outputs", BoundaryOutputs},
-        {"representation", "affine-two-lane-v1"}};
+        {"representation", Wide ? "xor-prefix-two-lane-v1" : "affine-two-lane-v1"}};
   }
 };
 } // namespace
 
-json::Array encodeNativeValues(Module &M, uint64_t Seed, unsigned MaxNodes, bool CoupleState) {
+json::Array encodeNativeValues(Module &M, uint64_t Seed, unsigned MaxNodes, bool CoupleState, bool Wide, bool Invariant) {
   json::Array Report;
   for (Function &F : M) {
     if (!F.hasFnAttribute("sre.native.original") &&
@@ -284,7 +364,7 @@ json::Array encodeNativeValues(Module &M, uint64_t Seed, unsigned MaxNodes, bool
                                    {"reason", "structure-or-size"}});
       continue;
     }
-    Report.push_back(ValueEncoder(F, Seed, MaxNodes, CoupleState).run());
+    Report.push_back(ValueEncoder(F, Seed, MaxNodes, CoupleState, Wide, Invariant).run());
   }
   return Report;
 }

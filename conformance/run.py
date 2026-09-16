@@ -16,7 +16,7 @@ from .process import Runner, ToolFailure, digest, dump
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "conformance" / "fixtures"
 CASES = ("arithmetic", "data", "widths", "constructors", "merging", "strings",
-         "literal", "foldable", "state", "values")
+         "literal", "foldable", "state", "values", "wide")
 
 
 def test_inputs(count: int = 128) -> bytes:
@@ -62,6 +62,10 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             f"-native-outline={int(args.outline)}",
             f"-native-value-nodes={args.value_nodes}",
             f"-native-coupled-state={int(args.coupled_state)}",
+            f"-native-fusion={int(getattr(args, 'fusion', False))}",
+            f"-native-memory={int(getattr(args, 'memory', False))}",
+            f"-native-values-wide={int(getattr(args, 'values_wide', False))}",
+            f"-native-invariant={int(getattr(args, 'invariant', False))}",
             f"-native-family={args.family}"]
 
 
@@ -212,6 +216,8 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
             variant = compile_variant(runner, ir, driver, case / arm, args.threads)
             outputs[arm] = runner.run([str(variant["binary"])], stdin=inputs,
                                        timeout=args.run_timeout)
+            variant["execution_seconds"] = runner.records[-1]["seconds"]
+            variant["execution_timing_scope"] = "trusted batch, includes container/process startup"
             (case / arm / "outputs.txt").write_bytes(outputs[arm])
             variant["decompiler"] = {"status": "not_run",
                                       "reason": "execution gates run before analysis"}
@@ -323,6 +329,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--outline", action="store_true")
     p.add_argument("--value-nodes", type=int, default=24)
     p.add_argument("--coupled-state", action="store_true")
+    p.add_argument("--fusion", action="store_true")
+    p.add_argument("--memory", action="store_true")
+    p.add_argument("--values-wide", action="store_true")
+    p.add_argument("--invariant", action="store_true")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--probe-helpers", type=int, default=0,
                    help="Informed-entry probes for up to N distinct helper roles")

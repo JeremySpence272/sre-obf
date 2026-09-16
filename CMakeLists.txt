@@ -76,6 +76,8 @@ set(OBF_SOURCES
   NativeObfuscation.cpp
   NativeEncoding.cpp
   NativeRegions.cpp
+  NativeFusion.cpp
+  NativeMemory.cpp
   Utils.cpp
   OpaqueUtils.cpp
   ObfDebug.cpp
