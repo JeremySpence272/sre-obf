@@ -7,6 +7,7 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/Obfuscator/EHUtils.h"
 
 #define DEBUG_TYPE "adec"
 STATISTIC(ADecIndirectCalls, "Direct calls converted to indirect trampolines");
@@ -39,6 +40,9 @@ static bool canConvertCall(llvm::CallInst* CI) {
 	if (Callee->hasPersonalityFn())
 		return false;
 
+	if (CI->hasOperandBundles())
+		return false; // dropping funclet/deopt/gc/ARC bundles is unsafe
+
 	return true;
 }
 
@@ -57,6 +61,8 @@ public:
 		for (llvm::BasicBlock& BB : Ctx.F) {
 			if (BB.isEHPad())
 				continue;
+			if (llvm::obf::isInEHRegion(&BB))
+				continue; // don't insert indirect calls inside EH funclets
 			for (llvm::Instruction& I : BB) {
 				if (auto* CI = llvm::dyn_cast<llvm::CallInst>(&I)) {
 					if (canConvertCall(CI))

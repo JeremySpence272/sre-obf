@@ -389,8 +389,10 @@ Value* MbaUtils::applyByIndex(IRBuilder<>& B, Instruction::BinaryOps Op,
 		return nullptr;
 
 	unsigned Idx = K % Size;
+	unsigned BW = A->getType()->getScalarSizeInBits();
 	switch (Op) {
 	case Instruction::Add:
+		if (BW < 2) return nullptr; // add/addAlt2 use shl-by-1 -> poison on i1
 		switch (Idx) {
 		case 0: return add(B, A, V);
 		case 1: return addAlt(B, A, V);
@@ -398,6 +400,7 @@ Value* MbaUtils::applyByIndex(IRBuilder<>& B, Instruction::BinaryOps Op,
 		default: return addAlt3(B, A, V);
 		}
 	case Instruction::Sub:
+		if (BW < 2) return nullptr; // sub uses shl-by-1 -> poison on i1
 		switch (Idx) {
 		case 0: return sub(B, A, V);
 		case 1: return subAlt(B, A, V);
@@ -423,6 +426,7 @@ Value* MbaUtils::applyByIndex(IRBuilder<>& B, Instruction::BinaryOps Op,
 		default: return bitwiseXorAlt2(B, A, V);
 		}
 	case Instruction::Mul:
+		if (BW < 32) Idx %= 2; // mulAlt2 (idx>=2) is a 16-bit split-mul, needs BW>=32
 		switch (Idx) {
 		case 0: return mul(B, A, V);
 		case 1: return mulAlt(B, A, V);

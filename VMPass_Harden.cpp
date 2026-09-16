@@ -205,51 +205,13 @@ void VMImpl::hardenVMEngine(Function* EF, VMEngine::SharedState* SS) {
 		}
 	}
 
-	// Hard-true guards on ~30% of handler entries
-	// For a random subset of handler blocks, split at entry and add
-	// a hard-true guard branching to a bogus block.
-	SmallVector<BasicBlock*, 64> HandlerBBs;
-	for (BasicBlock& BB : *EF) {
-		if (BB.getName().starts_with("vm.opc."))
-			HandlerBBs.push_back(&BB);
-	}
-
-	for (BasicBlock* HBB : HandlerBBs) {
-		if (HardenRng.range(100) >= 30) continue; // ~30% probability
-
-		// Create guard block before the handler.
-		BasicBlock* GuardBB = BasicBlock::Create(Ctx,
-			HBB->getName().str() + ".guard", EF, HBB);
-
-		// Create bogus block (junk + back to dispatch / next-instruction
-		// tail -- nextInsn() picks whichever this build uses).
-		BasicBlock* BogusBB = BasicBlock::Create(Ctx,
-			HBB->getName().str() + ".bogus", EF);
-		{
-			IRBuilder<> BB(BogusBB);
-			Value* J = Opaque.opaqueI32Const(BB, HardenRng.u32());
-			(void)BB.CreateXor(J, J, "vm.bogus.j");
-			nextInsn(BB);
-		}
-
-		// Redirect predecessors of handler to guard block.
-		SmallVector<BasicBlock*, 8> HPreds(predecessors(HBB));
-		for (BasicBlock* Pred : HPreds) {
-			if (Pred == GuardBB) continue;
-			Instruction* Term = Pred->getTerminator();
-			if (!Term) continue;
-			for (unsigned i = 0, e = Term->getNumSuccessors(); i < e; ++i) {
-				if (Term->getSuccessor(i) == HBB)
-					Term->setSuccessor(i, GuardBB);
-			}
-		}
-
-		// Guard: hard-true → real handler, else → bogus.
-		IRBuilder<> GB(GuardBB);
-		Value* Guard = Opaque.randomHardTrue(GB);
-		GB.CreateCondBr(Guard, HBB, BogusBB);
-		++GuardedHandlers;
-	}
+	// NOTE: guarded-handler splicing disabled (P0). It ran before the handler
+	// table was built, so the loaded blockaddress still jumped straight to the
+	// real handler (guard never executed) while setSuccessor() dropped the real
+	// target from the fetch indirectbr's successor list — an indirectbr langref
+	// violation (all possible destinations must be listed) = runtime UB. A
+	// correct reimplementation must repoint SS->OpcBB[op][var] at the guard
+	// block so the table jumps there. Deferred to VM-hardening (P3).
 
 	// handler spot-check timing traps 
 	// Inject a micro-timing gate into ~10% of handler entry blocks.

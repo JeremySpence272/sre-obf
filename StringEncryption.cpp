@@ -692,6 +692,10 @@ namespace {
 
     bool StrEncImpl::shouldEncrypt(GlobalVariable& GV, int minLength) {
         if (!GV.hasInitializer() || !GV.isConstant()) return false;
+        // Never rewrite/erase a symbol another TU may link against. isDiscardableIfUnused()
+        // covers private/internal AND linkonce_odr (how clang-cl emits string literals on
+        // Windows) while still excluding external/weak ABI symbols.
+        if (!GV.isDiscardableIfUnused()) return false;
         auto* CDA = dyn_cast<ConstantDataArray>(GV.getInitializer());
         if (!CDA || !CDA->isCString()) return false;
 
@@ -952,10 +956,10 @@ namespace {
                 Changed = true;
             }
 
-            ++EncryptedStrings;
-
-            if (GV->use_empty())
+            if (GV->use_empty()) {
                 GV->eraseFromParent();
+                ++EncryptedStrings;
+            }
         }
 
         return Changed;
@@ -1167,7 +1171,6 @@ namespace {
             }
 
             AllCandGVs.push_back(GV);
-            ++EncryptedStrings;
         }
 
         // ── Phase 2: per using function — single forward-advancing IRBuilder ──
@@ -1400,8 +1403,10 @@ namespace {
 
         // ── Phase 3: cleanup — erase candidate globals now fully replaced ──
         for (GlobalVariable* GV : AllCandGVs)
-            if (GV->use_empty())
+            if (GV->use_empty()) {
                 GV->eraseFromParent();
+                ++EncryptedStrings;
+            }
 
         return Changed;
     }

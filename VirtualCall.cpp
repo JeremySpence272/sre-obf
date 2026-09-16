@@ -170,13 +170,17 @@ namespace {
 			NameRng(R.fork("names")),
 			DecoyRng(R.fork("decoys")),
 			SiteRng(R.fork("site")) {
+		}
 
-			// Create one volatile slot per function to generate "unknown but runtime-zero" deltas.
+		// Lazily create (and cache) the volatile slot used to generate "unknown
+		// but runtime-zero" deltas. Only called on the path where a call is
+		// actually being virtualized, so functions that end up unchanged are
+		// never mutated — keeping the pass's PreservedAnalyses::all() truthful.
+		llvm::AllocaInst* getVolSlot() {
+			if (VolSlot) return VolSlot;
 			LLVMContext& C = F.getContext();
 			IRBuilder<> B(&*F.getEntryBlock().getFirstInsertionPt());
-
 			VolSlot = B.CreateAlloca(Type::getInt32Ty(C), nullptr, "vcall.slot");
-
 			VolSlot->setAlignment(Align(4));
 			Type* I32 = Type::getInt32Ty(C);
 			Type* I64 = Type::getInt64Ty(C);
@@ -184,10 +188,9 @@ namespace {
 			Value* P32 = B.CreateTrunc(P2I, I32, "vcall.slot.p2i32");
 			uint32_t K = IndexRng.u32();
 			Value* Init = B.CreateXor(P32, ConstantInt::get(I32, K), "vcall.slot.init");
-
-
 			auto* St = B.CreateStore(Init, VolSlot);
 			St->setVolatile(true);
+			return VolSlot;
 		}
 	};
 
@@ -237,7 +240,10 @@ namespace {
 		// Make it unattractive to inline/merge
 		Thunk->addFnAttr(Attribute::NoInline);
 		Thunk->addFnAttr(Attribute::Cold);
-		Thunk->addFnAttr(Attribute::NoUnwind);
+		// Only claim nounwind if the callee truly can't unwind; a nounwind thunk
+		// wrapping a throwing callee aborts the program on unwind.
+		if (Callee->doesNotThrow())
+			Thunk->addFnAttr(Attribute::NoUnwind);
 
 		// Match calling convention to avoid ABI surprises
 		Thunk->setCallingConv(Callee->getCallingConv());
@@ -661,7 +667,7 @@ namespace {
 		Type* I32 = Type::getInt32Ty(C);
 
 		// Reuse runtime-zero delta to create �unknown but equals 0� value.
-		Value* Z = makeRuntimeZeroDelta(B, Ctx.VolSlot, Ctx.SiteRng);
+		Value* Z = makeRuntimeZeroDelta(B, Ctx.getVolSlot(), Ctx.SiteRng);
 		Value* V = B.CreateAdd(IdxI32, Z, "vcall.idx.zadd");
 
 		unsigned S = Ctx.Cfg.indexStrength;
@@ -727,7 +733,7 @@ namespace {
 
 			// Same index math as the non-merged plaintext path (no BaseOff: encrypted
 			// tables are never merged).
-			Value* Delta0 = makeRuntimeZeroDelta(B, Ctx.VolSlot, Ctx.IndexRng);
+			Value* Delta0 = makeRuntimeZeroDelta(B, Ctx.getVolSlot(), Ctx.IndexRng);
 			Value* RealSlotV = ConstantInt::get(I32, (uint32_t)RealSlot);
 			Value* Idx = B.CreateAnd(B.CreateAdd(RealSlotV, Delta0, "vcall.idx.add"), Mask, "vcall.idx.seg");
 			Idx = obfuscateIndexPerCallsite(B, Idx, Ctx);
@@ -760,7 +766,7 @@ namespace {
 			// Compute Idx = BaseOff + ((RealSlot + delta0) & mask).
 			// The mask keeps the lookup inside this callee's kTableSize-sized segment;
 			// in merged mode BaseOff is the segment start and must not be masked away.
-			Value* Delta0 = makeRuntimeZeroDelta(B, Ctx.VolSlot, Ctx.IndexRng);
+			Value* Delta0 = makeRuntimeZeroDelta(B, Ctx.getVolSlot(), Ctx.IndexRng);
 			Value* RealSlotV = ConstantInt::get(I32, (uint32_t)RealSlot);
 			Value* InSeg = B.CreateAnd(B.CreateAdd(RealSlotV, Delta0, "vcall.idx.add"), Mask, "vcall.idx.seg");
 			Value* BaseV = ConstantInt::get(I32, (uint32_t)BaseOff);

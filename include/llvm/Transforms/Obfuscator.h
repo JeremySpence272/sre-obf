@@ -617,8 +617,9 @@ namespace llvm {
 			FPM.addPass(ObfuscationFunctionDriverPass());
 			MPM.addPass(createModuleToFunctionPassAdaptor(std::move(FPM)));
 
-			if (ObfVerify)
-				MPM.addPass(llvm::obf::ObfVerifyModulePass("final"));
+			// Always verify the final module: cheap end-of-pipeline safety net that
+			// aborts loudly (report_fatal_error) if any pass produced invalid IR.
+			MPM.addPass(llvm::obf::ObfVerifyModulePass("final"));
 
 			PreservedAnalyses PA = MPM.run(M, MAM);
 
