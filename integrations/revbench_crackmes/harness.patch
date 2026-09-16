@@ -1,0 +1,172 @@
+--- a/harness/harness.py
++++ b/harness/harness.py
+@@ -13,6 +13,7 @@
+ 
+ import yaml
+ from evaluator import evaluate
++from crackmes import build_crackmes_prompt
+ from image_builder import get_image
+ from network import NETWORK_NAME, setup_isolation, teardown_isolation
+ from prompt_builder import (
+@@ -103,6 +104,7 @@
+     os.path.join(ROOT, "binaries", "revmalware"),
+     os.path.join(ROOT, "binaries", "revcompress"),
+     os.path.join(ROOT, "binaries", "revdeflate"),
++    os.path.join(ROOT, "binaries", "crackmes"),
+ ]
+ # These types have short leaf names (c-opt, rust, ...) that collide across types,
+ # so their invocation key is namespaced by type, e.g. "revfirmware/c-opt".
+@@ -113,6 +115,7 @@
+     "revmalware",
+     "revcompress",
+     "revdeflate",
++    "crackmes",
+ )
+ TOOLS_DIR = os.path.join(ROOT, "tools")
+ AGENTS_DIR = os.path.join(ROOT, "agents")
+@@ -198,6 +201,7 @@
+     network=None,
+     extra_hosts=None,
+     environment=None,
++    read_only_challenge=False,
+ ):
+     # start the container and mount the prepared workspace tree
+     run_cmd = [
+@@ -209,6 +213,8 @@
+         "-v",
+         f"{workspace_dir}:/workspace",
+     ]
++    if read_only_challenge:
++        run_cmd += ["-v", f"{workspace_dir}/challenge:/workspace/challenge:ro"]
+     if network:
+         run_cmd += ["--network", network]
+     if extra_hosts:
+@@ -493,6 +499,8 @@
+         prompt = build_revcompress_prompt(prompt)
+     elif problem_type == "revdeflate":
+         prompt = build_revdeflate_prompt(prompt)
++    elif problem_type == "crackmes":
++        prompt = build_crackmes_prompt(prompt)
+ 
+     license_config = binary_config.get("license")
+     if license_config and args.packer_license_calls is not None:
+@@ -570,6 +578,7 @@
+             network=network,
+             extra_hosts=extra_hosts,
+             environment=container_environment,
++            read_only_challenge=problem_type == "crackmes",
+         )
+ 
+         # Attach the agent to its internal license-server network, if any. The
+--- a/harness/evaluator.py
++++ b/harness/evaluator.py
+@@ -10,6 +10,7 @@
+ import tempfile
+ import time
+ import uuid
++from crackmes import crackmes_exact
+ 
+ # ── Eval Docker image (single fat image for the egg_count grader) ──
+ 
+@@ -91,6 +92,8 @@
+         return malware_score(config, challenge_dir, submission_dir)
+     elif eval_type == "revcompress_score":
+         return revcompress_score(config, challenge_dir, submission_dir)
++    elif eval_type == "crackmes_exact":
++        return crackmes_exact(config, challenge_dir, submission_dir)
+     else:
+         raise ValueError(f"unknown evaluation type: {eval_type}")
+ 
+--- a/harness/workspace.py
++++ b/harness/workspace.py
+@@ -34,9 +34,19 @@
+     # source/agents/*/config.yaml in a provided source tree) must NOT be stripped.
+     def _ignore_top_level(dirpath, names):
+         if os.path.abspath(dirpath) == os.path.abspath(challenge_dir):
++            if config.get("type") == "crackmes":
++                # Binary-only allowlist: never expose eval, source, reports,
++                # generator seeds, or future sidecars added beside the target.
++                return set(names) - {"binary", "prompt.md"}
+             return {n for n in names if n in HIDDEN}
+         return set()
+ 
++    if config.get("type") == "crackmes":
++        for name in ("binary", "prompt.md"):
++            path = os.path.join(challenge_dir, name)
++            if os.path.islink(path) or not os.path.isfile(path):
++                raise ValueError(f"crackmes public asset must be a regular file: {name}")
++
+     shutil.copytree(
+         challenge_dir,
+         challenge_dest,
+--- a/tests/helpers.py
++++ b/tests/helpers.py
+@@ -13,6 +13,7 @@
+     os.path.join(ROOT, "binaries", "revmalware"),
+     os.path.join(ROOT, "binaries", "revcompress"),
+     os.path.join(ROOT, "binaries", "revdeflate"),
++    os.path.join(ROOT, "binaries", "crackmes"),
+ ]
+ 
+ 
+--- a/tests/test_schemas.py
++++ b/tests/test_schemas.py
+@@ -93,11 +93,11 @@
+ 
+ VALID_TYPES = {
+     "revgame", "revprotocol", "revfirmware", "revmalware",
+-    "revcompress", "revdeflate",
++    "revcompress", "revdeflate", "crackmes",
+ }
+ VALID_EVALUATIONS = {
+     "egg_count", "revprotocol_score", "firmware_score",
+-    "malware_score", "revcompress_score",
++    "malware_score", "revcompress_score", "crackmes_exact",
+ }
+ REQUIRED_BINARY_FIELDS = ["file", "format", "arch"]
+ 
+--- a/README.md
++++ b/README.md
+@@ -2,6 +2,24 @@
+ 
+ SRE-bench (Software Reverse Engineering Benchmark) is a reverse-engineering benchmark. It runs coding agents against real, compiled programs inside a locked-down Docker sandbox and scores how well they reverse-engineer behavior, formats, protocols, and devices. It spans five RE domains, each backed by a held-out component that makes grading deterministic, and every challenge is scored from 0 to 6 with partial credit. Each domain's program is compiled into many build variants so the same task can be studied across a controlled range of readability: 19 unique programs across the five domains, 346 total challenge cells.
+ 
++## Local crackmes control family
++
++The local `crackmes` extension adds two cells beyond the core matrix:
++`crackmes/c-noopt-nosym-static` and
++`crackmes/c-noopt-nosym-static-sre-obf-max`. Both are matched C/O0/static/stripped
++builds of one synthetic password checker; the latter uses the modified sre-obf
++native IR preset. This small control is intended for cheap obfuscation experiments.
++
++The agent statically recovers an eight-character flag and writes
++`/workspace/submission/flag.txt`. `crackmes_exact` scores **0 or 1**, with no partial
++credit and no submitted-code execution. The prompt explains owner authorization
++and the synthetic setting. Static-only compliance needs trace review; the current
++harness does not technically prevent target execution or emulation.
++
++Both cells support the usual run options and `--verify`. See
++[the family README](binaries/crackmes/README.md) for build settings, grader rules,
++private artifact layout, reproducible integration sources, and example commands.
++
+ ## Domains
+ 
+ For each domain, **Target** is what the software does, **RE Task** is what the agent must accomplish, **Infrastructure** is the held-out component that makes evaluation deterministic, and **Auxiliary** is what the agent receives beyond the binary.
+@@ -185,7 +203,7 @@
+ 
+ ```yaml
+ name: <human-readable name>
+-type: <revcompress | revdeflate | revfirmware | revgame | revmalware | revprotocol>
++type: <revcompress | revdeflate | revfirmware | revgame | revmalware | revprotocol | crackmes>
+ 
+ description: <what the challenge asks>
+ source: <origin>
+@@ -199,7 +217,7 @@
+ language: <c | cpp | go | rust>      # matrix families
+ variant: <e.g. opt-sym-static>       # matrix families
+ 
+-evaluation: <revcompress_score | egg_count | firmware_score | malware_score | revprotocol_score>
++evaluation: <revcompress_score | egg_count | firmware_score | malware_score | revprotocol_score | crackmes_exact>
+ 
+ tools:
+   <tool_name>: <tool_path>

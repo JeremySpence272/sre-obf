@@ -137,11 +137,19 @@ Use `python3 /absolute/path/sre-obf/conformance/cc.py` as the existing harness's
 `SRE_OBF_PROFILE=max`, and `SRE_OBF_SEED=1`. Set `SRE_OBF_MULTISTATE=0` for the old
 state representation with the other native settings unchanged. Profile `none` produces the matched
 unobfuscated IR/backend control. The adapter supports separate C compile/link
-commands, refuses LTO and non-O2 frontend settings, and never silently falls
+commands, refuses LTO and frontend settings other than O0/O2, and never silently falls
 back to an unobfuscated build. Sidecars and intermediate work stay beside
 private objects; only the validated final binary belongs in the public bundle.
 Set `SRE_OBF_VALUES=1`, `SRE_OBF_OUTLINE=1` and optionally
 `SRE_OBF_COUPLED_STATE=1` to enable the same experiments in crackme builds.
+
+O2 remains the default. An explicit `-O0` selects a no-opt experiment: both
+protected and control frontend commands disable only the `optnone` attribute so
+explicit transformations can run. No optimization pipeline is added, and the
+backend remains at its default O0. Object sidecars record these settings. The
+[Revbench crackmes integration](../integrations/revbench_crackmes/README.md) builds
+the matched stripped/static O0 pair, installs its exact-match grader and prompt,
+and retains private compiler provenance separately from agent-visible assets.
 
 No paid-agent solve or general obfuscation-hardness claim is established by
 these tests. The wider evaluation and remaining acceptance criteria are in

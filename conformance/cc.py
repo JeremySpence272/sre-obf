@@ -47,10 +47,14 @@ def compile_args(args: list[str]) -> tuple[Path, Path, list[str]]:
            for flag in flags):
         raise ValueError("LTO and injected frontend passes are outside this pipeline")
     levels = [flag for flag in flags if flag.startswith("-O")]
-    if levels and levels[-1] != "-O2":
-        raise ValueError("native adapter requires -O2 optimized input")
+    if levels and levels[-1] not in ("-O0", "-O2"):
+        raise ValueError("native adapter supports explicit -O0 or -O2 input")
     if not levels:
         flags.append("-O2")
+    if levels and levels[-1] == "-O0":
+        # Suppress only the attribute that blocks explicit transformation passes.
+        # This does not run an optimization pipeline. Apply to BOTH paired arms.
+        flags.extend(["-Xclang", "-disable-O0-optnone"])
     return sources[0], output, flags
 
 
@@ -138,6 +142,9 @@ def main(args: list[str] | None = None) -> int:
                 "-c", str(protected), "-o", str(output)])
     dump(Path(str(output) + ".sre.json"), {
         "schema": "sre-native-object-v1", "profile": profile, "seed": seed,
+        "frontend_optimization": [f for f in flags if f.startswith("-O")][-1],
+        "backend_optimization": "-O0 (clang default)",
+        "disable_o0_optnone": "-disable-O0-optnone" in flags,
         "multistate": multistate == "1" if profile != "none" else False,
         "values": values == "1" if profile != "none" else False,
         "outline": outline == "1" if profile != "none" else False,

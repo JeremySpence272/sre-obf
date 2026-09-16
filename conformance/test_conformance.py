@@ -145,6 +145,16 @@ class ProcessTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_noopt_is_explicit_and_does_not_silently_use_o2(self):
+        _, _, flags = compile_args(["-O0", "-c", "a.c", "-o", "a.o"])
+        self.assertIn("-O0", flags)
+        self.assertNotIn("-O2", flags)
+        self.assertEqual(flags[-2:], ["-Xclang", "-disable-O0-optnone"])
+        self.assertNotIn("-Xclang", backend_flags(flags))
+        _, _, default = compile_args(["-c", "a.c", "-o", "a.o"])
+        self.assertIn("-O2", default)
+        self.assertNotIn("-disable-O0-optnone", default)
+
     def test_compile_order_and_backend_flags(self):
         source, output, flags = compile_args(
             ["-std=c11", "-O2", "-fPIE", "-I", "/tmp/include", "-c", "a.c", "-o", "a.o"])
