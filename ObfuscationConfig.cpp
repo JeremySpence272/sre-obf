@@ -407,6 +407,8 @@ FlatteningConfig FlatteningConfig::fromPassConfig(const PassConfig& pc) {
 		if (P.count("indirect")) getB("indirect", cfg.AllowIndirect);
 
 		if (P.count("hybrid")) getB("hybrid", cfg.Hybrid);
+		if (P.count("multistate")) getB("multistate", cfg.MultiState);
+		if (P.count("statefamily")) getU("statefamily", cfg.StateFamily);
 
 		if (P.count("opaquestate")) getB("opaquestate", cfg.OpaqueState);
 		if (P.count("opaque")) getB("opaque", cfg.OpaqueState);
@@ -445,6 +447,10 @@ FlatteningConfig FlatteningConfig::fromPassConfig(const PassConfig& pc) {
 
 bool FlatteningConfig::validate() const {
 	if (!enable) return true;
+	if (StateFamily > 3) {
+		errs() << "Flattening: stateFamily must be 0..3\n";
+		return false;
+	}
 
 	if (MinBlocks < 2 || MinBlocks > 100000) {
 		errs() << "Flattening: Invalid MinBlocks " << MinBlocks

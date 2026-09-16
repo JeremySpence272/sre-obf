@@ -45,11 +45,23 @@ public class ExportConformance extends GhidraScript {
                 result.put("status", "ok");
                 result.put("c", decompiled.getDecompiledFunction().getC());
                 ArrayList<String> pcode = new ArrayList<>();
+                Map<String, Integer> counts = new LinkedHashMap<>();
+                int variableProducts = 0;
                 java.util.Iterator<PcodeOpAST> operations =
                     decompiled.getHighFunction().getPcodeOps();
-                while (operations.hasNext())
-                    pcode.add(operations.next().toString());
+                while (operations.hasNext()) {
+                    PcodeOpAST operation = operations.next();
+                    pcode.add(operation.toString());
+                    String mnemonic = operation.getMnemonic();
+                    counts.put(mnemonic, counts.getOrDefault(mnemonic, 0) + 1);
+                    if (mnemonic.equals("INT_MULT") && operation.getNumInputs() == 2 &&
+                        !operation.getInput(0).isConstant() && !operation.getInput(1).isConstant())
+                        ++variableProducts;
+                }
                 result.put("high_pcode", pcode);
+                // Descriptive retention metrics, NOT semantic recovery scores.
+                result.put("operation_counts", counts);
+                result.put("nonconstant_multiplications", variableProducts);
                 result.put("blocks", decompiled.getHighFunction().getBasicBlocks().size());
             }
         } finally {

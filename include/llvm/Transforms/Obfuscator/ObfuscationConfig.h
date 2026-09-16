@@ -78,6 +78,10 @@ namespace llvm {
 		unsigned MaxBlocks = 200;
 		bool AllowIndirect = false;
 		bool Hybrid = true;
+		// Per-activation token plus two evolving masks. Dispatch compares encoded
+		// candidates directly rather than decoding a scalar switch selector.
+		bool MultiState = false; // preserve legacy annotations by default
+		unsigned StateFamily = 3; // 0..2 forced; 3 = seeded per-function choice
 		// If true: state updates are stored as opaque expressions (volatile anchored),
 		// instead of plain constants.
 		bool OpaqueState = true;
@@ -387,4 +391,3 @@ namespace llvm {
 
 
 } // namespace llvm
-

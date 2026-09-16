@@ -16,7 +16,7 @@ from .process import Runner, ToolFailure, digest, dump
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "conformance" / "fixtures"
 CASES = ("arithmetic", "data", "widths", "constructors", "merging", "strings",
-         "literal", "foldable")
+         "literal", "foldable", "state")
 
 
 def test_inputs(count: int = 128) -> bytes:
@@ -56,6 +56,8 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             f"-native-late-constants={int(not args.no_late)}",
             f"-native-strings={int(not args.no_strings)}",
             f"-native-merge={int(not args.no_merge)}",
+            f"-native-multistate={int(not args.no_multistate)}",
+            f"-native-state-family={args.state_family}",
             f"-native-family={args.family}"]
 
 
@@ -80,7 +82,8 @@ def decompile(runner: Runner, binary: Path, link_map: Path, out: Path,
     return result
 
 
-def compile_variant(runner: Runner, ir: Path, driver: Path, directory: Path) -> dict:
+def compile_variant(runner: Runner, ir: Path, driver: Path, directory: Path,
+                    threaded: bool = False) -> dict:
     directory.mkdir()
     obj, assembly = directory / "target.o", directory / "target.s"
     binary, link_map = directory / "binary", directory / "link.map"
@@ -89,10 +92,14 @@ def compile_variant(runner: Runner, ir: Path, driver: Path, directory: Path) -> 
     optimization = ["-std=c11", "-O2", "-ffp-contract=off"] if ir.suffix == ".c" else []
     runner.run(["clang", *optimization, "-Wno-override-module", "-fPIE", "-S", str(ir),
                 "-o", str(assembly)])
-    runner.run(["clang", *optimization, "-Wno-override-module", "-fPIE", "-c", str(ir),
+    # Preserve assembler-local function labels in the PRIVATE intermediate so
+    # informed probes can locate private LLVM helpers. Final --strip-all still
+    # removes them from the attacker binary.
+    runner.run(["clang", *optimization, "-Wno-override-module", "-fPIE", "-Wa,-L", "-c", str(ir),
                 "-o", str(obj)])
     unstripped = directory / "binary.unstripped"
-    runner.run(["clang", "-pie", f"-Wl,-Map={link_map}",
+    runner.run(["clang", *(["-pthread"] if threaded else []), "-pie", "-Wl,--discard-none",
+                f"-Wl,-Map={link_map}",
                 str(obj), str(driver), "-o", str(unstripped)])
     symbols = runner.run(["llvm-nm", "--defined-only", "-n", str(unstripped)])
     (directory / "symbols.txt").write_bytes(symbols)
@@ -112,6 +119,7 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
     case.mkdir()
     runner = Runner(ROOT, case / "logs", args.toolchain_image, args.timeout)
     result = {"case": name, "seed": seed, "status": "incomplete",
+              "threads": 4 if args.threads else 1,
               "profile": args.profile, "passes": args.passes,
               "feature_flags": feature_flags(args)}
     try:
@@ -123,8 +131,11 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
         runner.run(["clang", "-std=c11", "-O2", "-fPIE", "-ffp-contract=off",
                     "-fno-discard-value-names", "-S", "-emit-llvm", str(source),
                     "-o", str(optimized)])
-        runner.run(["clang", "-std=c11", "-O2", "-fPIE", "-c",
-                    str(FIXTURES / "driver.c"), "-o", str(driver)])
+        driver_source = FIXTURES / ("driver_threads.c" if args.threads else "driver.c")
+        runner.run(["clang", *(["-pthread"] if args.threads else []),
+                    "-std=c11", "-O2", "-fPIE", "-c",
+                    str(driver_source), "-o", str(driver)])
+        result["driver_sha256"] = digest(driver_source)
         report = case / "passes.json"
         ablation = [f"-native-passes={args.passes}"] if args.passes else []
         runner.run(opt_command(args.plugin) + ablation + feature_flags(args) + [
@@ -141,6 +152,11 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
         result["flattening_ran"] = flattening_ran(json.loads(report.read_text()), "obf_target")
         native_report = json.loads((case / "native.json").read_text())
         result["feature_coverage"] = native_report
+        if result["flattening_ran"] and not args.no_multistate:
+            state = next((item for item in native_report["flattening_state"]
+                          if item["function"] == "obf_target"), None)
+            if not state or state["words"] != 3:
+                raise ToolFailure("target flattening lost required multi-state storage")
         enabled_pass = lambda name: not args.passes or name in args.passes.split(",")
         if name == "merging" and not args.no_merge and enabled_pass("fmerge"):
             groups = native_report["merged_groups"]
@@ -164,8 +180,17 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
         (case / "inputs.txt").write_bytes(inputs)
         outputs = {}
         arms = {}
-        for arm, ir in (("release", source), ("control", optimized), ("native", protected)):
-            variant = compile_variant(runner, ir, driver, case / arm)
+        variants = [("release", source), ("control", optimized), ("native", protected)]
+        if args.post_o2_attack:
+            # Deliberate normalization attack, not a change to the production
+            # after-O2 pipeline. Stock LLVM gets the entire protected module.
+            reoptimized = case / "post-o2.ll"
+            runner.run(["opt", "-passes=default<O2>", "-S", str(protected),
+                        "-o", str(reoptimized)])
+            variants.append(("post_o2", reoptimized))
+            result["post_o2_ir_sha256"] = digest(reoptimized)
+        for arm, ir in variants:
+            variant = compile_variant(runner, ir, driver, case / arm, args.threads)
             outputs[arm] = runner.run([str(variant["binary"])], stdin=inputs,
                                        timeout=args.run_timeout)
             (case / arm / "outputs.txt").write_bytes(outputs[arm])
@@ -175,9 +200,8 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
                          for key, value in variant.items()}
         result["arms"] = arms
         result["vectors"] = len(inputs.splitlines())
-        result["correctness"] = (
-            outputs["release"] == outputs["control"] == outputs["native"] and
-            len(outputs["control"].splitlines()) == result["vectors"])
+        result["correctness"] = (all(value == outputs["release"] for value in outputs.values())
+                                 and len(outputs["release"].splitlines()) == result["vectors"])
         if not result["correctness"]:
             raise ToolFailure("full-output differential mismatch")
         if name == "strings" and not args.no_strings and enabled_pass("strenc"):
@@ -186,11 +210,12 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
                 raise ToolFailure("required string encoding left the plaintext probe")
             if not native_report["helpers"]:
                 raise ToolFailure("string runtime is missing from helper inventory")
-        result["flattening_required"] = name == "arithmetic" and (
+        result["flattening_required"] = name in ("arithmetic", "state") and (
             not args.passes or "flattening" in args.passes.split(","))
         if result["flattening_required"] and not result["flattening_ran"]:
             raise ToolFailure("required native flattening did not run")
-        for arm in ("control", "native"):
+        for arm in (["control", "native", "post_o2"] if args.post_o2_attack
+                    else ["control", "native"]):
             arms[arm]["decompiler"] = decompile(
                 runner, Path(arms[arm]["binary"]), Path(arms[arm]["link_map"]),
                 case / arm / "ghidra.json", args)
@@ -200,6 +225,8 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
                 fields = line.split()
                 if len(fields) == 3 and fields[1].lower() == "t":
                     symbols[fields[2]] = int(fields[0], 16)
+                    if fields[2].startswith(".L"):
+                        symbols.setdefault(fields[2][2:], int(fields[0], 16))
             probes, seen_roles = [], set()
             for helper in native_report["helpers"]:
                 if len(probes) >= args.probe_helpers:
@@ -243,6 +270,8 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
         result["status"] = "pass" if result["decompiler_status"] == "ok" else "partial"
         if result["decompiler_status"] == "decompiler_error":
             result["status"] = "inconclusive"
+        if args.post_o2_attack and arms["post_o2"]["decompiler"]["status"] not in ("ok", "not_run"):
+            result["status"] = "inconclusive"
         if any(probe["decompiler"]["status"] != "ok"
                for probe in result.get("helper_probes", [])):
             result["status"] = "inconclusive"
@@ -269,12 +298,18 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--no-late", action="store_true")
     p.add_argument("--no-strings", action="store_true")
     p.add_argument("--no-merge", action="store_true")
+    p.add_argument("--no-multistate", action="store_true")
+    p.add_argument("--state-family", type=int, choices=(0, 1, 2, 3), default=3)
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--probe-helpers", type=int, default=0,
                    help="Informed-entry probes for up to N distinct helper roles")
     p.add_argument("--case", choices=CASES, action="append")
     p.add_argument("--seed", type=int, action="append")
     p.add_argument("--random-inputs", type=int, default=128)
+    p.add_argument("--threads", action="store_true",
+                   help="Run each binary with four concurrent callers (max 4096 vectors)")
+    p.add_argument("--post-o2-attack", action="store_true",
+                   help="Also normalize protected IR with stock O2, compile, compare and decompile")
     p.add_argument("--timeout", type=float, default=180)
     p.add_argument("--run-timeout", type=float, default=15)
     p.add_argument("--decompile-timeout", type=float, default=240)
@@ -291,6 +326,8 @@ def main(argv=None) -> int:
     if args.random_inputs < 0 or any(x <= 0 for x in (
             args.timeout, args.run_timeout, args.decompile_timeout)):
         raise SystemExit("counts/timeouts must be valid positive limits")
+    if args.threads and args.random_inputs + 81 > 4096:
+        raise SystemExit("--threads supports at most 4096 total vectors")
     if not 0 <= args.probe_helpers <= 8:
         raise SystemExit("--probe-helpers must be between 0 and 8")
     if any(seed < 0 or seed >= 2**64 for seed in args.seed or [1]):

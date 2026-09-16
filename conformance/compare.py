@@ -24,6 +24,9 @@ def compare(left: dict, right: dict) -> list[dict]:
         if not source or source != y.get("source_sha256"):
             rows.append({**row, "status": "different_source"})
             continue
+        if x.get("driver_sha256") != y.get("driver_sha256"):
+            rows.append({**row, "status": "different_or_unknown_driver"})
+            continue
         nx, ny = x["arms"]["native"], y["arms"]["native"]
         equal = lambda u, v: u == v if u is not None and v is not None else None
         row.update({

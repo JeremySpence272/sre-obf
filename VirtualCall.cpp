@@ -150,7 +150,6 @@ namespace {
 		llvm::obf::Rng PickRng;   // shuffle candidate order (stable)
 		llvm::obf::Rng TableRng;  // vtable layout + real slot
 		llvm::obf::Rng IndexRng;  // volatile-delta masking salt
-		llvm::obf::Rng KeyRng;    // encrypted-vtable XOR key material (encryptTable)
 
 		llvm::obf::Rng NameRng;   // vtable naming salt
 		llvm::obf::Rng DecoyRng;  // decoy selection
@@ -166,7 +165,6 @@ namespace {
 			PickRng(R.fork("pick")),
 			TableRng(R.fork("table")),
 			IndexRng(R.fork("index")),
-			KeyRng(R.fork("enckey")),
 			NameRng(R.fork("names")),
 			DecoyRng(R.fork("decoys")),
 			SiteRng(R.fork("site")) {
@@ -405,12 +403,13 @@ namespace {
 		uint32_t& RealSlotOut, uint64_t& KeyOut) {
 		std::string Name = (Twine(".vtable.enc.") + Callee->getName()).str();
 
-		// Always resolve real slot + key deterministically (even if the table
-		// already exists) -- both are forked purely from stable seeds, so
-		// recomputing them is cheap and side-effect free.
+		// The table is module-local and shared by every caller of Callee. Its
+		// key MUST NOT depend on the caller's function/pass RNG: that gave later
+		// callers a different key from the one used by the table initializer.
 		RealSlotOut = getOrCreateRealSlot(M, Callee, Ctx.TableRng);
 
-		llvm::obf::Rng KLocal = Ctx.KeyRng.fork(Callee->getName());
+		llvm::obf::Rng TableKeys(llvm::obf::deriveSeed(Ctx.MasterSeed, "vcall.table-key.v1"));
+		llvm::obf::Rng KLocal = TableKeys.fork(Callee->getName());
 		uint64_t K = ((uint64_t)KLocal.u32() << 32) | KLocal.u32();
 		if (K == 0)
 			K = 0x9e3779b97f4a7c15ull;

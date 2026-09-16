@@ -66,6 +66,10 @@ namespace {
 		static Value* getStateI32Ptr(IRBuilder<>& B, FlaCtx& PCtx, FunctionObfContext& Ctx);
 		static Value* loadState(IRBuilder<>& B, FlaCtx& PCtx, FunctionObfContext& Ctx);
 		static void storeState(IRBuilder<>& B, FlaCtx& PCtx, FunctionObfContext& Ctx, Value* V);
+		static void initMultiState(FlaCtx& PCtx);
+		static Value* multiStateEncode(IRBuilder<>& B, FlaCtx& PCtx,
+			Value* ID, Value* Key, Value* Salt);
+		static void buildMultiStateDispatch(Function& F, FunctionObfContext& Ctx, FlaCtx& PCtx);
 		static Instruction* getAllocaIP(Function& F);
 
 		// --------------------------------------------------------------------------
@@ -138,6 +142,10 @@ namespace {
 		llvm::obf::Rng FakeRng;   // fake edges/cases selection
 		llvm::obf::Rng DomainRng;
 		llvm::obf::Rng PtrRng;
+		llvm::obf::Rng MultiRng;
+		AllocaInst* MultiKey = nullptr;
+		AllocaInst* MultiSalt = nullptr;
+		unsigned MultiFamily = 0;
 
 		llvm::obf::OpaqueUtils Opaque;
 
@@ -168,11 +176,12 @@ namespace {
 			Cfg(FlaImpl::getFlatteningConfig(F, AM)),
 			FOC(*AM.getResult<llvm::FunctionObfContextAnalysis>(F)),
 			KeysRng(R.fork("keys")),
+			IdRng(R.fork("ids")),
 			OpaqueRng(R.fork("opaque")),
 			FakeRng(R.fork("fake")),
-			IdRng(R.fork("ids")),
 			DomainRng(R.fork("domain")),
 			PtrRng(R.fork("ptr")),
+			MultiRng(R.fork("multi-state-v1")),
 			Opaque(M, OpaqueRng, FlaImpl::kFlaOpaqueSlot, makeOpaqueOpts(Cfg)) {
 		}
 	};
@@ -339,16 +348,76 @@ namespace {
 		Type* I32 = Type::getInt32Ty(B.getContext());
 		Value* P = getStateI32Ptr(B, PCtx, Ctx);
 		auto* L = B.CreateLoad(I32, P, "fla.state");
-		if (PCtx.Cfg.OpaqueState || PCtx.Cfg.FakeTransitions || PCtx.Cfg.ObfuscateStatePtr)
+		if (PCtx.Cfg.MultiState || PCtx.Cfg.OpaqueState || PCtx.Cfg.FakeTransitions || PCtx.Cfg.ObfuscateStatePtr)
 			L->setVolatile(true);
 		return B.CreateFreeze(L, "fla.state.fr");
 	}
 
 	void FlaImpl::storeState(IRBuilder<>& B, FlaCtx& PCtx, FunctionObfContext& Ctx, Value* V) {
+		if (PCtx.Cfg.MultiState) {
+			// Evolve representation on EVERY edge, including back edges. All three
+			// old words are initialized in the entry, and belong to this activation.
+			auto Load = [&](AllocaInst* P) -> Value* {
+				auto* L = B.CreateLoad(B.getInt32Ty(), P);
+				L->setVolatile(true);
+				return L;
+			};
+			Value* K = Load(PCtx.MultiKey);
+			Value* S = Load(PCtx.MultiSalt);
+			Value* T = loadState(B, PCtx, Ctx);
+			Value* NK = B.CreateAdd(rotl32ir(B, B.CreateXor(K, S), 5),
+				B.getInt32(PCtx.MultiRng.u32()), "fla.multi.next.key");
+			Value* NS = B.CreateXor(rotl32ir(B, B.CreateAdd(S, T), 7),
+				B.CreateAdd(NK, B.getInt32(PCtx.MultiRng.u32())), "fla.multi.next.salt");
+			V = multiStateEncode(B, PCtx, V, NK, NS);
+			B.CreateStore(NK, PCtx.MultiKey)->setVolatile(true);
+			B.CreateStore(NS, PCtx.MultiSalt)->setVolatile(true);
+		}
 		Value* P = getStateI32Ptr(B, PCtx, Ctx);
 		auto* S = B.CreateStore(V, P);
-		if (PCtx.Cfg.OpaqueState || PCtx.Cfg.FakeTransitions || PCtx.Cfg.ObfuscateStatePtr)
+		if (PCtx.Cfg.MultiState || PCtx.Cfg.OpaqueState || PCtx.Cfg.FakeTransitions || PCtx.Cfg.ObfuscateStatePtr)
 			S->setVolatile(true);
+	}
+
+	void FlaImpl::initMultiState(FlaCtx& PCtx) {
+		if (!PCtx.Cfg.MultiState) return;
+		IRBuilder<> B(getAllocaIP(PCtx.F));
+		PCtx.MultiKey = B.CreateAlloca(B.getInt32Ty(), nullptr, "fla.multi.key");
+		PCtx.MultiSalt = B.CreateAlloca(B.getInt32Ty(), nullptr, "fla.multi.salt");
+		PCtx.MultiFamily = PCtx.Cfg.StateFamily == 3
+			? PCtx.MultiRng.range(3) : PCtx.Cfg.StateFamily;
+		Value* Input = B.getInt32(0);
+		// Do not dereference pointers or add uses of potentially poison values
+		// without freezing. This contributes data dependence, not secret entropy.
+		for (Argument& A : PCtx.F.args()) {
+			if (!A.getType()->isIntegerTy()) continue;
+			Input = B.CreateZExtOrTrunc(B.CreateFreeze(&A), B.getInt32Ty());
+			break;
+		}
+		B.CreateStore(B.CreateXor(Input, B.getInt32(PCtx.MultiRng.u32())),
+			PCtx.MultiKey)->setVolatile(true);
+		B.CreateStore(B.CreateAdd(rotl32ir(B, Input, 13), B.getInt32(PCtx.MultiRng.u32())),
+			PCtx.MultiSalt)->setVolatile(true);
+		B.CreateStore(B.getInt32(PCtx.MultiRng.u32()), PCtx.FOC.StatVar)->setVolatile(true);
+	}
+
+	Value* FlaImpl::multiStateEncode(IRBuilder<>& B, FlaCtx& PCtx,
+		Value* ID, Value* Key, Value* Salt) {
+		// Each family is a permutation in ID for EVERY Key/Salt pair in Z/2^32.
+		// Odd multiplication, xor, addition and fixed nonzero rotates are all
+		// bijective. No nsw/nuw, oversized shifts, pointer casts or UB assumptions.
+		Value* Odd = B.CreateOr(Salt, B.getInt32(1));
+		switch (PCtx.MultiFamily) {
+		case 0:
+			return B.CreateAdd(B.CreateMul(B.CreateXor(ID, Key), Odd),
+				rotl32ir(B, Key, 11), "fla.multi.token");
+		case 1:
+			return B.CreateXor(rotl32ir(B, B.CreateMul(B.CreateAdd(ID, Key), Odd), 9),
+				B.CreateAdd(Key, Salt), "fla.multi.token");
+		default:
+			return B.CreateMul(B.CreateAdd(rotl32ir(B, B.CreateXor(ID, Salt), 17), Key),
+				B.CreateOr(Key, B.getInt32(1)), "fla.multi.token");
+		}
 	}
 
 
@@ -1139,7 +1208,8 @@ namespace {
 				return false;
 
 		Ctx.StatVar = createStateVariable(F);
-		Ctx.NumDispatchers = computeNumDispatchers(Ctx);
+		Ctx.NumDispatchers = PCtx.Cfg.Hybrid ? computeNumDispatchers(Ctx) : 1;
+		initMultiState(PCtx);
 		// State encoding keys
 		Ctx.StateXorKey = PCtx.KeysRng.u32();
 		Ctx.StateAddKey = PCtx.KeysRng.u32();
@@ -1226,6 +1296,17 @@ namespace {
 		LLVMContext& LC = F.getContext();
 		Type* I32Ty = Type::getInt32Ty(LC);
 		IRBuilder<> B(Ctx.Router);
+		if (PCtx.Cfg.MultiState) {
+			// Start a ring of candidate groups from a history-dependent position.
+			// No operation reconstructs the logical ID to use as a switch key.
+			auto* K = B.CreateLoad(I32Ty, PCtx.MultiKey, "fla.multi.route");
+			K->setVolatile(true);
+			Value* Start = B.CreateURem(K, B.getInt32(Ctx.Dispatchers.size()));
+			auto* Sw = B.CreateSwitch(Start, Ctx.Dispatchers.front(), Ctx.Dispatchers.size() - 1);
+			for (unsigned I = 1; I < Ctx.Dispatchers.size(); ++I)
+				Sw->addCase(B.getInt32(I), Ctx.Dispatchers[I]);
+			return;
+		}
 
 
 		Value* EncState = loadState(B, PCtx, Ctx);
@@ -1249,6 +1330,10 @@ namespace {
 
 
 	void FlaImpl::buildDispatcherSwitchesEncoded(Function& F, FunctionObfContext& Ctx, FlaCtx& PCtx) {
+		if (PCtx.Cfg.MultiState) {
+			buildMultiStateDispatch(F, Ctx, PCtx);
+			return;
+		}
 		LLVMContext& LC = F.getContext();
 		Type* I32 = Type::getInt32Ty(LC);
 		BasicBlock* ExitTrampoline = getOrCreateExitTrampline(F);
@@ -1324,6 +1409,54 @@ namespace {
 		}
 	}
 
+
+	void FlaImpl::buildMultiStateDispatch(Function& F, FunctionObfContext& Ctx, FlaCtx& PCtx) {
+		initPerDispatcherDomains(PCtx, Ctx);
+		std::set<uint32_t> Used;
+		for (BasicBlock* BB : Ctx.FlattenedBlocks)
+			Used.insert(encodeStateConst(Ctx.BlockIDs.lookup(BB), Ctx));
+		for (unsigned I = 0, N = Ctx.Dispatchers.size(); I < N; ++I) {
+			std::vector<std::pair<uint32_t, BasicBlock*>> Cases;
+			for (BasicBlock* BB : Ctx.FlattenedBlocks)
+				if (Ctx.DispatcherGroups.lookup(BB) == I)
+					Cases.emplace_back(encodeStateConst(Ctx.BlockIDs.lookup(BB), Ctx), BB);
+			unsigned RealCount = Cases.size();
+			if (PCtx.Cfg.FakeTransitions && RealCount)
+				for (unsigned J = 0; J < PCtx.Cfg.FakeCases; ++J) {
+					uint32_t ID;
+					do { ID = PCtx.FakeRng.u32(); } while (!Used.insert(ID).second);
+					Cases.emplace_back(ID, Cases[PCtx.FakeRng.range(RealCount)].second);
+				}
+			for (unsigned J = Cases.size(); J > 1; --J)
+				std::swap(Cases[J - 1], Cases[PCtx.MultiRng.range(J)]);
+			BasicBlock* Current = Ctx.Dispatchers[I];
+			BasicBlock* Miss = N == 1 ? getOrCreateExitTrampline(F) : Ctx.Dispatchers[(I + 1) % N];
+			if (Cases.empty()) {
+				IRBuilder<>(Current).CreateBr(Miss);
+				continue;
+			}
+			IRBuilder<> B(Current);
+			Value* Token = loadState(B, PCtx, Ctx);
+			auto* K = B.CreateLoad(B.getInt32Ty(), PCtx.MultiKey, "fla.multi.key.load");
+			auto* S = B.CreateLoad(B.getInt32Ty(), PCtx.MultiSalt, "fla.multi.salt.load");
+			K->setVolatile(true);
+			S->setVolatile(true);
+			if (PCtx.Cfg.PerDispatcherDomain)
+				Token = dispatcherDomainIR(B, Token, I, Ctx);
+			for (unsigned J = 0; J < Cases.size(); ++J) {
+				B.SetInsertPoint(Current);
+				Value* Candidate = PCtx.Opaque.opaqueI32Const(B, Cases[J].first);
+				Value* Expected = multiStateEncode(B, PCtx, Candidate, K, S);
+				if (PCtx.Cfg.PerDispatcherDomain)
+					Expected = dispatcherDomainIR(B, Expected, I, Ctx);
+				Value* Match = B.CreateICmpEQ(Token, Expected, "fla.multi.match");
+				BasicBlock* Next = J + 1 == Cases.size() ? Miss
+					: BasicBlock::Create(F.getContext(), "fla.multi.check", &F);
+				B.CreateCondBr(Match, Cases[J].second, Next);
+				Current = Next;
+			}
+		}
+	}
 
 	void FlaImpl::rewriteEntryBlockRouter(Function& F, FunctionObfContext& Ctx, FlaCtx& PCtx) {
 		BasicBlock& Entry = F.getEntryBlock();
@@ -1504,11 +1637,15 @@ namespace {
 		llvm::obf::promoteDemotedAllocas(F, DemotedAllocas);
 
 #ifndef NDEBUG
-		insertStateValidation(F, PCtx, Ctx);
-		insertDispatcherLogging(F, PCtx, Ctx);
+		// Legacy diagnostics assume StatVar contains a scalar encoded ID.
+		// Do not inject that invalid runtime check into the relational mode.
+		if (!PCtx.Cfg.MultiState) {
+			insertStateValidation(F, PCtx, Ctx);
+			insertDispatcherLogging(F, PCtx, Ctx);
+		}
 
 		dumpStateTransitions(F, Ctx, errs());
-		verifyDispatcherCoverage(F, PCtx, Ctx, errs());
+		if (!PCtx.Cfg.MultiState) verifyDispatcherCoverage(F, PCtx, Ctx, errs());
 		if (verifyFlatteningIR(F, Ctx, errs())) {
 			F.dump();
 			llvm_unreachable("Invalid IR produced by flattening");

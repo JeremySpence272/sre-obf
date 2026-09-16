@@ -5,6 +5,67 @@ native opt pass → backend without a second `-O2` → PIE link. VM, MC/post-lin
 changes, injected assembly and timing reads are not enabled by this entry point.
 The legacy automatic Clang hook and legacy VM presets remain separate.
 
+## IR-only expansion: first milestone
+
+The [full source audit and technique ledger](IR_HARDENING_AUDIT.md) records what
+exists, what this milestone changes, and what remains unimplemented. MC and
+post-link/LIEF stay in the backlog.
+
+- Native flattening now requests per-activation three-word state, with two
+  evolving masks and encoded candidate comparisons instead of centrally
+  decoding a scalar switch selector. Three seeded/forceable families, explicit
+  legacy-state ablation, final-IR storage coverage. This is not cross-function
+  global state, general application-data encoding or a claim of irreversibility.
+- The previously ignored `hybrid` flattening flag now controls dispatcher count.
+- Fixed shared encrypted-call-table keys being incorrectly derived per caller,
+  which the new recursion/multiple-caller fixture exposed as an invalid call.
+- Added four-thread and recursive differential execution; inverse-recovery
+  model controls; Ghidra operation metrics; and an optional fourth arm that
+  subjects protected IR to stock O2 before compiling/decompiling it. Private
+  assembler labels are retained for informed helper probes and stripped from
+  the final agent binary.
+
+Verified during this expansion:
+
+- Maximum preset: nine fixtures × two seeds × 593 vectors = 10,674 cases,
+  compared against both ordinary source-O2 and matched optimized-IR controls.
+- Every state family: arithmetic and recursion, seed 17, 593 vectors, four
+  concurrent callers; six configurations. Legacy-state ablation: three
+  fixtures × two seeds × 593 vectors. All correctness/coverage gates pass.
+- Stock-O2 normalization attack: arithmetic, recursion and data, maximum seed
+  1, 593 vectors; all four execution arms agree.
+- The actual standalone maximum-preset crackme passes twelve semantic checks.
+- Fourteen conformance unit tests and eleven standalone-harness regressions.
+- Eight isolated annotated-pass configurations (hybrid on/off, old state and
+  every new family), 593 vectors each, pass structure and correctness checks.
+- Ghidra 12.0.3 successfully decompiles the state target, a call-forwarder helper
+  and the stock-O2-normalized target. The target matches the final matrix's
+  exact stripped binary. Data target/decoder probes and old-state target
+  controls also pass; the data run predates private-label retention, which
+  changes only the link build ID in the checked binary, not IR or assembly.
+- Repeated final-pipeline state/data builds reproduce protected IR and stripped
+  binaries in different directories.
+
+These correctness-only runs are labelled `partial` because they do not run
+Ghidra. Retained reports: `out/conformance/multistate-max`,
+`multistate-family-{0,1,2}`, `multistate-off`, and `multistate-o2-attack`.
+The finalized pipeline's full matrix is `multistate-final`; isolated flags are
+in `multistate-flags-final`; successful state/normalized/helper probes are in
+`multistate-ghidra-verified`. The earlier `multistate-initial` caught the call-key
+miscompile, and `multistate-ghidra` records a failed state helper-map gate; these
+failed runs are retained for diagnosis, not counted as successful protection.
+The new public crackme bundle is the separate harness's
+`out/native-multistate/public/`. Agent recovery/repair cost remains unmeasured;
+candidate scanning introduces O(block-count) worst-case transition overhead.
+
+Measured warning: for maximum seed 1 on the state fixture, the old-state binary
+is 27,600 bytes and the new-state binary 31,656 bytes. Stock O2 reduces the latter
+to 23,464 bytes. Ghidra reports 8 variable-operand multiplications before that
+normalization and 3 after (clean control: 0). This is partial retention plus
+substantial simplification, not a proof that the state representation resisted
+semantic recovery. No decompiler-hash/operation-count threshold is presented as
+an anti-agent success gate.
+
 ## Implemented first pass
 
 - F1: a shared, versioned family registry used by OpaqueUtils consumers,

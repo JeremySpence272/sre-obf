@@ -3,12 +3,46 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+import random
 
 from conformance.metrics import CANARY, contains_integer, flattening_ran, normalize_c
 from conformance.process import Runner, ToolFailure
 from conformance.run import target_offset, test_inputs
 from conformance.cc import backend_flags, compile_args
 from conformance.compare import compare
+from conformance.state_model import encode, recover, advance
+from conformance.run import parser, feature_flags
+
+
+class StateTests(unittest.TestCase):
+    def test_every_family_is_invertible_at_wrap_edges_and_random_states(self):
+        edges = (0, 1, 2, 0x7fffffff, 0x80000000, 0xfffffffe, 0xffffffff)
+        rng = random.Random(712)
+        cases = [(v, k, s) for v in edges for k in edges for s in edges]
+        cases += [tuple(rng.getrandbits(32) for _ in range(3)) for _ in range(10000)]
+        for family in range(3):
+            for v, k, s in cases:
+                self.assertEqual(recover(encode(v, k, s, family), k, s, family), v)
+
+    def test_label_relation_survives_history_dependent_back_edges(self):
+        for family in range(3):
+            t, k, s = 5, 7, 0xffffffff
+            tokens = set()
+            for _ in range(100):
+                k, s = advance(t, k, s, 0x12345678, 0xabcdef12)
+                t = encode(42, k, s, family)
+                tokens.add(t)
+                self.assertEqual(recover(t, k, s, family), 42)
+                self.assertNotEqual(t, encode(43, k, s, family))
+            self.assertGreater(len(tokens), 90)
+
+    def test_state_ablation_is_explicit(self):
+        args = parser().parse_args(["--out", "/tmp/not-created", "--no-multistate",
+                                   "--state-family", "2", "--post-o2-attack", "--threads"])
+        self.assertIn("-native-multistate=0", feature_flags(args))
+        self.assertIn("-native-state-family=2", feature_flags(args))
+        self.assertTrue(args.post_o2_attack)
+        self.assertTrue(args.threads)
 
 
 class MetricsTests(unittest.TestCase):
@@ -81,6 +115,13 @@ class AdapterTests(unittest.TestCase):
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_driver_changes_are_not_matched_ablations(self):
+        case = {"case": "state", "seed": 1, "correctness": True,
+                "source_sha256": "same", "driver_sha256": "serial"}
+        other = {**case, "driver_sha256": "threaded"}
+        self.assertEqual(compare({"cases": [case]}, {"cases": [other]})[0]["status"],
+                         "different_or_unknown_driver")
+
     def test_missing_and_failed_are_not_reproducible(self):
         case = {"case": "literal", "seed": 1, "correctness": False}
         self.assertEqual(compare({"cases": [case]}, {"cases": []})[0]["status"],

@@ -39,6 +39,10 @@ cl::opt<bool> NativeStrings("native-strings",
     cl::desc("Module-local AES string encoding with bounded helper hardening"), cl::init(true));
 cl::opt<bool> NativeMerge("native-merge",
     cl::desc("Bounded internal application-function merging"), cl::init(true));
+cl::opt<bool> NativeMultiState("native-multistate",
+    cl::desc("Three-word per-activation relational flattening state"), cl::init(true));
+cl::opt<unsigned> NativeStateFamily("native-state-family",
+    cl::desc("Multi-state encoding family: 0..2 forced, 3 seeded"), cl::init(3));
 
 void enableFamilies(Function &F) {
   if (NativeDiversity) F.addFnAttr("sre.native.families");
@@ -64,13 +68,16 @@ std::string profile(bool Structural) {
         "substitution(loop=1,maxSites=8),split(num=2),"
         "sdiff(prob=50,slots=2,maxSites=8),"
         "bcf(prob=15,loop=1,maxBlocks=200),";
-  if (Structural)
+  if (Structural) {
+    Spec += "flattening(multiState=" + std::to_string(NativeMultiState.getValue()) +
+        ",stateFamily=" + std::to_string(NativeStateFamily.getValue()) + ",";
     Spec += Max
-        ? "flattening(minBlocks=2,maxBlocks=1500,allowIndirect=0,hybrid=1,"
+        ? "minBlocks=2,maxBlocks=1500,allowIndirect=0,hybrid=1,"
           "opaqueState=1,fakeTransitions=1,fakeCases=4,perDispatcherDomain=1,"
           "obfuscateStatePtr=1,opaqueAliasStatePtr=1),"
-        : "flattening(minBlocks=2,maxBlocks=500,opaqueState=1,"
+        : "minBlocks=2,maxBlocks=500,opaqueState=1,"
           "fakeTransitions=1,fakeCases=2),";
+  }
   Spec += Max
       ? "vcall(prob=100,maxSites=128,indexStrength=3,encryptTable=1,mergeVTables=0),"
         "shield(maxSites=400),adec(prob=100,strength=3,maxSites=100,asm=0,rdtsc=0,"
@@ -119,6 +126,8 @@ bool selected(const Function &F) {
 PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &AM) {
   if (NativeLevel != "max" && NativeLevel != "smoke")
     report_fatal_error("native-level must be max or smoke");
+  if (NativeStateFamily > 3)
+    report_fatal_error("native-state-family must be 0..3");
   if (ObfSeed.getNumOccurrences() == 0)
     report_fatal_error("native-obfuscation requires an explicit -obf-seed");
   for (const std::string &Name : NativePasses)
@@ -244,7 +253,9 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       std::string Spec = "obf: constenc(prob=100,maxSites=24,encFP=0),"
                          "sdiff(prob=50,slots=2,maxSites=8),shield(maxSites=12)";
       if (Reason.empty())
-        Spec += ",flattening(minBlocks=2,maxBlocks=500,opaqueState=1,fakeCases=2)";
+        Spec += ",flattening(minBlocks=2,maxBlocks=500,opaqueState=1,fakeCases=2,multiState=" +
+            std::to_string(NativeMultiState.getValue()) + ",stateFamily=" +
+            std::to_string(NativeStateFamily.getValue()) + ")";
       H->addFnAttr("sre.native.spec", Spec);
       H->addFnAttr("sre.native.helper.run");
       auto &HC = AM.getResult<ObfuscationAnnotationAnalysis>(M);
@@ -325,6 +336,22 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-obfuscation produced invalid IR");
 
   if (!NativeReport.empty()) {
+    // Inventory final IR, not emission counters or attributes that can survive
+    // a budget rollback. Later passes may rewrite individual comparisons.
+    json::Array StateCoverage;
+    for (const Function &F : M) {
+      unsigned Words = 0, Comparisons = 0;
+      for (const Instruction &I : instructions(F)) {
+        if (isa<AllocaInst>(I) &&
+            (I.getName() == "fla.state" || I.getName() == "fla.multi.key" ||
+             I.getName() == "fla.multi.salt")) ++Words;
+        if (isa<ICmpInst>(I) && I.getName().starts_with("fla.multi.match"))
+          ++Comparisons;
+      }
+      if (Words) StateCoverage.push_back(json::Object{
+          {"function", F.getName().str()}, {"words", Words},
+          {"remaining_named_comparisons", Comparisons}});
+    }
     std::error_code EC;
     raw_fd_ostream OS(NativeReport, EC, sys::fs::OF_Text);
     if (EC) report_fatal_error(Twine("native report: ") + EC.message());
@@ -335,8 +362,11 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"features", json::Object{{"diversity", NativeDiversity.getValue()},
                             {"data", NativeData.getValue()}, {"helpers", NativeHelpers.getValue()},
                             {"strings", NativeStrings.getValue()}, {"merge", NativeMerge.getValue()},
+                            {"multistate", NativeMultiState.getValue()},
+                            {"state_family", NativeStateFamily.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
+                        {"flattening_state", std::move(StateCoverage)},
                         {"encodings", obf::nativeEncodingInventory(M)},
                         {"data", std::move(DataCoverage)},
                         {"helpers", std::move(HelperCoverage)},

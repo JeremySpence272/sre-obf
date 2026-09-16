@@ -75,6 +75,9 @@ def main(args: list[str] | None = None) -> int:
     plugin = Path(os.environ.get("SRE_OBF_PLUGIN", ROOT / "build/Obfuscator.so")).resolve()
     profile = os.environ.get("SRE_OBF_PROFILE", "max")
     seed = int(os.environ.get("SRE_OBF_SEED", "1"))
+    multistate = os.environ.get("SRE_OBF_MULTISTATE", "1")
+    if multistate not in ("0", "1"):
+        raise ValueError("SRE_OBF_MULTISTATE must be 0 or 1")
     if profile not in ("max", "smoke", "none") or not 0 <= seed < 2**64:
         raise ValueError("invalid SRE_OBF_PROFILE or SRE_OBF_SEED")
     if args == ["--version"]:
@@ -116,6 +119,7 @@ def main(args: list[str] | None = None) -> int:
     else:
         runner.run(opt_command(plugin) + [
             "-passes=native-obfuscation", f"-native-level={profile}",
+            f"-native-multistate={multistate}",
             f"-obf-seed={seed}", "-obf-deterministic", "-obf-verify",
             "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
             f"-obf-report-json={work / 'passes.json'}",
@@ -125,6 +129,7 @@ def main(args: list[str] | None = None) -> int:
                 "-c", str(protected), "-o", str(output)])
     dump(Path(str(output) + ".sre.json"), {
         "schema": "sre-native-object-v1", "profile": profile, "seed": seed,
+        "multistate": multistate == "1" if profile != "none" else False,
         "toolchain_image": image_identity(image),
         "adapter_sha256": digest(Path(__file__)),
         "plugin_sha256": digest(plugin) if profile != "none" else None,

@@ -43,7 +43,7 @@ Decompiler errors are inconclusive, never successful protection.
 Each fixture starts with shared `clang -O2` IR. Clean and obfuscated arms use
 the same backend and PIE link settings, with no second `-O2`. Both execute 81
 edge pairs plus 128 deterministic random pairs by default; complete output and
-the expected output count must match. Arithmetic requires flattening to have
+the expected output count must match. Arithmetic and recursion/state require flattening to have
 actually changed the function. One-block fixtures explicitly lack that
 requirement. All runtime execution belongs to trusted correctness testing.
 
@@ -57,10 +57,35 @@ Module string encoding and function merging are enabled by default; use
 `--no-strings` and `--no-merge` for their ablations. The merging fixture requires
 actual flattening of each merged group, not just of an unrelated function.
 
+Relational flattening is enabled in the native preset. `--no-multistate` restores
+the old scalar-state mode, and `--state-family 0/1/2` forces a state family (`3`
+is seeded). The `state` fixture exercises non-tail recursion, multiple callers
+of one protected callee, loops and joins. `--threads` uses four concurrent
+callers with ordered full-output comparison (at most 4096 vectors). This is
+trusted conformance execution, not dynamic analysis available to the attacker.
+
+`--post-o2-attack` adds an explicitly separate normalization arm: stock LLVM
+`default<O2>` runs on protected IR, then that arm is compiled, differentially
+checked and optionally decompiled too. It never changes the production build
+order. Retain this as a cheap simplification attack, not a substitute for
+Ghidra/symbolic recovery. All requested arms must preserve output.
+
+The state-model unit tests include modular inverse recovery for all three
+families. That control is expected to succeed: keys are available software
+state, not unavailable secrets. Ghidra exports operation counts and variable-
+operand multiplication counts as retention diagnostics, not resistance scores.
+Inside the toolchain image, `python3 -m conformance.flattening_flags --out
+out/conformance/flags-001` additionally tests the annotated flattening pass in
+isolation: legacy/new state, all three state families, and `hybrid=0/1`, with
+unrelated protections disabled and full-output comparison.
+
 `--probe-helpers 2` additionally decompiles up to two distinct generated-helper
 roles at known entry addresses. It uses private symbols from an unstripped
 intermediate, but Ghidra still receives the stripped final binary. A missing or
 failed requested helper probe cannot count as successful normalization survival.
+Private local-label retention can change the GNU linker build ID even when
+assembly is identical. Compare exact final artifacts from the same diagnostic
+configuration; do not silently treat those different hashes as identical.
 
 Assembly, relocations, stripped ELF, Ghidra C and high-pcode counts are saved.
 The literal positive control must be recovered by Ghidra; the deliberately
@@ -84,7 +109,8 @@ assembly and timing reads are prohibited by the native entry point.
 
 Use `python3 /absolute/path/sre-obf/conformance/cc.py` as the existing harness's
 `--cc` command. Set `SRE_OBF_TOOLCHAIN_IMAGE=sre-obf-dev:llvm22`,
-`SRE_OBF_PROFILE=max`, and `SRE_OBF_SEED=1`. Profile `none` produces the matched
+`SRE_OBF_PROFILE=max`, and `SRE_OBF_SEED=1`. Set `SRE_OBF_MULTISTATE=0` for the old
+state representation with the other native settings unchanged. Profile `none` produces the matched
 unobfuscated IR/backend control. The adapter supports separate C compile/link
 commands, refuses LTO and non-O2 frontend settings, and never silently falls
 back to an unobfuscated build. Sidecars and intermediate work stay beside

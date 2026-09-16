@@ -3,6 +3,9 @@
 Status: native entry point, conformance foundation and initial F1–F3 mechanisms
 implemented; research acceptance and agent-hardness validation are not complete.
 See [implementation status](NATIVE_IR_STATUS.md) for the tested subset and limits.
+The expanded IR-only scope and source audit are tracked in
+[IR_HARDENING_AUDIT.md](IR_HARDENING_AUDIT.md), including the first relational
+flattening milestone. MC and post-link remain deferred.
 Written 2026-09-16 against fork revision
 `c6da83bac36efb9e216cc752b12060159acf4a62`.
 
@@ -505,5 +508,7 @@ Do not implement the full research features merely to build this scaffolding.
 - R1-R6 remain separately tracked IR work; machine/post-link ideas remain
   documented but unimplemented until a measured reason justifies that scope.
 
-This document creates the plan only. The preset, compiler changes, harness
-contract revision, and evaluation work above still require implementation.
+This is the roadmap, not an assertion that every acceptance item is complete.
+F1-F3 and the first state-hardening milestone have implementations; consult the
+linked status and audit for exact evidence. General R1-R6 and agent solve/repair
+measurements still require work.
