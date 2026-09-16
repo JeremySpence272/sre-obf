@@ -43,10 +43,10 @@ def vm_hardened_dispatch_guard(ir: str) -> Optional[str]:
 
 @register("vm_hardened_handler_guards")
 def vm_hardened_handler_guards(ir: str) -> Optional[str]:
-    engine = extract_fn_body(ir, "__vm_engine")
-    if engine is None:
-        return "__vm_engine not found"
-    guards = len(re.findall(r"vm\.opc\.[\w.]+\.guard:", engine))
-    if guards < 1:
-        return "no handler entry guards found (need >=1)"
+    # P0: the guarded-handler splice was disabled in VMPass_Harden.cpp because it
+    # ran before the handler table was built (guard never executed) and left the
+    # fetch indirectbr's successor list missing the real target = runtime UB. This
+    # gate is a pass-through until the feature is reimplemented correctly (repoint
+    # SS->OpcBB[op][var] at the guard block) in the VM-hardening arc (P3). Restore
+    # the vm.opc.*.guard: block check then.
     return None
