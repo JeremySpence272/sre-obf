@@ -190,12 +190,17 @@ ObfuscationConfig AnnotationParser::parseAnnotationString(
 	// Annotation syntax: obf: budget=40, budgetMax=50000, mba(...), bcf(...)
 	// Budget params can appear as standalone tokens in the annotation.
 	for (const auto& pc : config.passes) {
-		if (pc.params.count("budget"))
-			config.budgetMultiplier = (unsigned)std::stoul(pc.params.at("budget"));
-		if (pc.params.count("budgetMax"))
-			config.budgetHardCap = (unsigned)std::stoul(pc.params.at("budgetMax"));
-		if (pc.params.count("budgetMultiplier"))
-			config.budgetMultiplier = (unsigned)std::stoul(pc.params.at("budgetMultiplier"));
+		try {
+			if (pc.params.count("budget"))
+				config.budgetMultiplier = (unsigned)std::stoul(pc.params.at("budget"));
+			if (pc.params.count("budgetMax"))
+				config.budgetHardCap = (unsigned)std::stoul(pc.params.at("budgetMax"));
+			if (pc.params.count("budgetMultiplier"))
+				config.budgetMultiplier = (unsigned)std::stoul(pc.params.at("budgetMultiplier"));
+		}
+		catch (const std::exception& e) {
+			errs() << "Error parsing budget parameters: " << e.what() << "\n";
+		}
 	}
 
 	return config;
@@ -778,12 +783,18 @@ bool MBAConfig::validate() const {
 SemanticDiffusionConfig SemanticDiffusionConfig::fromPassConfig(const PassConfig& pc) {
 	SemanticDiffusionConfig cfg;
 	cfg.enable = pc.enabled;
-	auto it = pc.params.find("prob");
-	if (it != pc.params.end()) cfg.prob = std::stoi(it->second);
-	it = pc.params.find("slots");
-	if (it != pc.params.end()) cfg.slots = std::stoi(it->second);
-	it = pc.params.find("maxSites");
-	if (it != pc.params.end()) cfg.maxSites = std::stoi(it->second);
+	try {
+		auto it = pc.params.find("prob");
+		if (it != pc.params.end()) cfg.prob = std::stoi(it->second);
+		it = pc.params.find("slots");
+		if (it != pc.params.end()) cfg.slots = std::stoi(it->second);
+		it = pc.params.find("maxSites");
+		if (it != pc.params.end()) cfg.maxSites = std::stoi(it->second);
+	}
+	catch (const std::exception& e) {
+		errs() << "Error parsing SemanticDiffusion parameters: " << e.what() << "\n";
+		cfg.enable = false;
+	}
 	return cfg;
 
 }
@@ -1183,16 +1194,22 @@ ShieldConfig ShieldConfig::fromPassConfig(const PassConfig& pc) {
 	ShieldConfig cfg;
 	cfg.enable = pc.enabled;
 	auto& P = pc.params;
-	if (P.count("maxSites"))
-		cfg.maxSites = std::stoul(P.at("maxSites"));
-	if (P.count("volatile"))
-		cfg.volatileBarriers = (P.at("volatile") != "0");
-	if (P.count("identity"))
-		cfg.opaqueIdentities = (P.at("identity") != "0");
-	if (P.count("dse"))
-		cfg.deadStoreProtect = (P.at("dse") != "0");
-	if (P.count("cfg"))
-		cfg.cfgGuards = (P.at("cfg") != "0");
+	try {
+		if (P.count("maxSites"))
+			cfg.maxSites = std::stoul(P.at("maxSites"));
+		if (P.count("volatile"))
+			cfg.volatileBarriers = (P.at("volatile") != "0");
+		if (P.count("identity"))
+			cfg.opaqueIdentities = (P.at("identity") != "0");
+		if (P.count("dse"))
+			cfg.deadStoreProtect = (P.at("dse") != "0");
+		if (P.count("cfg"))
+			cfg.cfgGuards = (P.at("cfg") != "0");
+	}
+	catch (const std::exception& e) {
+		errs() << "Error parsing Shield parameters: " << e.what() << "\n";
+		cfg.enable = false;
+	}
 	return cfg;
 
 }
