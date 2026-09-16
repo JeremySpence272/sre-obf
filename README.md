@@ -218,6 +218,8 @@ Seeds cascade `base → module → function → pass`:
 
 | Document | Purpose |
 |---|---|
+| [STATIC_NATIVE_PLAN.md](docs/STATIC_NATIVE_PLAN.md) | Fork work plan: static-only native flattening, initial IR features, evaluation gates, and follow-on relational/fusion research. |
+| [FUTURE_MACHINE_BINARY_IDEAS.md](docs/FUTURE_MACHINE_BINARY_IDEAS.md) | Deferred machine-code and post-link ideas; not part of the initial IR implementation. |
 | [BUILD.md](docs/BUILD.md) | Full compilation guide — static-extension toolchain (Linux/Windows), `.so` plugin, prerequisites, troubleshooting. |
 | [USER.md](docs/USER.md) | Annotation grammar, pass reference, global options, reports, troubleshooting. |
 | [DEV.md](docs/DEV.md) | Architecture: registration, annotation cache, pipeline ordering, reporting, adding passes. |
