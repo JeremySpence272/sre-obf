@@ -317,6 +317,23 @@ namespace llvm {
 				InitialInsts, Cfg.budgetMultiplier, Cfg.budgetHardCap);
 
 			auto Entries = ObfuscationPipeline::getPassEntries(Cfg);
+			if (F.hasFnAttribute("sre.native.original") ||
+			    F.hasFnAttribute("sre.native.helper")) {
+				// Native protection prioritizes its structural backbone. Otherwise
+				// early recursive expression expansion can exhaust the budget and
+				// silently ship a supposedly flattened function without flattening.
+				auto Rank = [](StringRef Name) {
+					static const StringRef Order[] = {"flattening", "vcall",
+						"constenc", "mba", "substitution", "split", "sdiff", "bcf",
+						"shield", "adec"};
+					for (unsigned I = 0; I < std::size(Order); ++I)
+						if (Order[I] == Name) return I;
+					return static_cast<unsigned>(std::size(Order));
+				};
+				llvm::stable_sort(Entries, [&](const auto &A, const auto &B) {
+					return Rank(A.Name) < Rank(B.Name);
+				});
+			}
 			if (Entries.empty())
 				return PreservedAnalyses::all();
 
@@ -376,14 +393,12 @@ namespace llvm {
 				Budget.recordPassStart(Entry.Name, CurrentInsts, PassSeed);
 
 				// --- Transactional snapshot ---
-				// Only taken when a hard cap is actually configured for this
-				// function (per-annotation `budgetMax=`/`budgetMultiplier=`
-				// override -> Cfg.budgetHardCap > 0). With no hard cap, Snap
-				// stays null and nothing below this point changes behavior:
-				// byte-identical output for every default (no-budget-knobs)
-				// run is preserved.
+				// Honor both per-function and global hard caps. This restores
+				// the function body, not module-level side effects of a pass.
 				Function* Snap = nullptr;
-				if (Budget.isEnabled() && Cfg.budgetHardCap > 0)
+				unsigned EffectiveHardCap = Cfg.budgetHardCap
+					? Cfg.budgetHardCap : static_cast<unsigned>(ObfIRBudgetMax);
+				if (Budget.isEnabled() && EffectiveHardCap > 0)
 					Snap = snapshotFunction(F);
 
 				// --- Run the pass ---
@@ -398,7 +413,7 @@ namespace llvm {
 				// --- Transactional rollback: pass blew past the hard cap ---
 				if (Snap) {
 					unsigned PostRunInsts = llvm::obf::countInstructions(F);
-					if (PostRunInsts > Cfg.budgetHardCap) {
+					if (PostRunInsts > EffectiveHardCap) {
 						restoreFunctionSnapshot(F, Snap);
 						Snap->eraseFromParent();
 						Snap = nullptr;
@@ -408,7 +423,7 @@ namespace llvm {
 
 						if (ObfVerbose)
 							errs() << "[budget] " << F.getName() << ": ROLLBACK '" << Entry.Name
-								<< "' (" << PostRunInsts << " > cap " << Cfg.budgetHardCap
+								<< "' (" << PostRunInsts << " > cap " << EffectiveHardCap
 								<< "), skipping its changes\n";
 
 						if (llvm::ObfNoSkips) {

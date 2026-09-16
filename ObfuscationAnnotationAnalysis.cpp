@@ -48,7 +48,10 @@ ObfuscationAnnotationAnalysis::run(Module& M, ModuleAnalysisManager& MAM) {
 		if (F.isDeclaration())
 			continue;
 
-		ObfuscationConfig Cfg = AnnotationParser::parseAnnotations(&F);
+		ObfuscationConfig Cfg = F.hasFnAttribute("sre.native.spec")
+			? AnnotationParser::parseAnnotationString(
+				F.getFnAttribute("sre.native.spec").getValueAsString().str())
+			: AnnotationParser::parseAnnotations(&F);
 		if (!Cfg.passes.empty())
 			Out.PerFunction[&F] = std::move(Cfg);
 	}

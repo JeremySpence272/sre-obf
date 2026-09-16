@@ -33,6 +33,7 @@
 #include "llvm/Support/CommandLine.h"
 
 #include "llvm/Transforms/Obfuscator.h"
+#include "llvm/Transforms/Obfuscator/NativeObfuscation.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfDebug.h" // ObfDumpConfigPass (not in umbrella)
 

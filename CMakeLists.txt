@@ -35,7 +35,8 @@ if(NOT DEFINED LLVM_MAIN_SRC_DIR)
   include(AddLLVM)
   include(HandleLLVMOptions)
   include_directories(SYSTEM ${LLVM_INCLUDE_DIRS})
-  add_definitions(${LLVM_DEFINITIONS})
+  separate_arguments(_OBF_LLVM_DEFINITIONS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
+  add_definitions(${_OBF_LLVM_DEFINITIONS})
 endif()
 
 
@@ -72,6 +73,7 @@ add_subdirectory(aes_stub)
 # Sources
 # ---------------------------------------------------------------------------
 set(OBF_SOURCES
+  NativeObfuscation.cpp
   Utils.cpp
   OpaqueUtils.cpp
   ObfDebug.cpp

@@ -138,6 +138,7 @@ namespace llvm::obf {
 		void recordPassStart(StringRef PassName, unsigned CurrentInsts, uint64_t PassSeed = 0) {
 			PassBudgetRecord R;
 			R.PassName = PassName.str();
+			R.PassSeed = PassSeed;
 			R.InstsBefore = CurrentInsts;
 			R.InstsAfter = CurrentInsts; // updated by recordPassEnd
 			Records.push_back(std::move(R));
