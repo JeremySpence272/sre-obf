@@ -18,6 +18,10 @@ struct NativeConnectedOptions {
   // as closed objects, after a precise use walk. Off, only the narrow scalar
   // and flat-array rule applies, exactly as before.
   bool Aggregates = false;
+  // Couple two genuinely used encoded lanes into joint outputs U = X + Y and
+  // V = X + 2Y, pinned, and recover X = 2U - V, Y = V - U. Lane arithmetic
+  // only: no decoded scalar is ever created.
+  bool JointOutputs = false;
   unsigned GrowthBudget = 0;
 };
 json::Array encodeNativeConnected(Module &, uint64_t, const NativeConnectedOptions &);

@@ -9,7 +9,8 @@ import json
 import time
 from pathlib import Path
 from conformance.connected_model import (operations, add, compare,
-                                         xor_to_additive, additive_to_xor)
+                                         xor_to_additive, additive_to_xor,
+                                         joint_mix, joint_unmix)
 
 
 def main():
@@ -39,6 +40,18 @@ def main():
         cases.append(("xor-to-additive", affine, x, "additive"))
         cases.append(("additive-to-xor", additive_to_xor(affine, r, s, width, z3.LShR), x, "xor"))
         cases.append(("affine-mul", (ae * be - (ae * s + be * r) + r * s + mask, mask), x * y, "additive"))
+        # Bounded joint outputs U = X + Y and V = X + 2Y on encoded lanes, with
+        # the exact inverse X = 2U - V, Y = V - U, in both families.
+        for is_affine in (True, False):
+            family = "additive" if is_affine else "xor"
+            px = (ae, r) if is_affine else a
+            py = (be, s) if is_affine else b
+            u, v = joint_mix(px, py, width, is_affine, z3.LShR)
+            rx, ry = joint_unmix(u, v, width, is_affine, z3.LShR)
+            cases.append((f"joint-mix-u-{family}", u, x + y, family))
+            cases.append((f"joint-mix-v-{family}", v, x + y + y, family))
+            cases.append((f"joint-unmix-x-{family}", rx, x, family))
+            cases.append((f"joint-unmix-y-{family}", ry, y, family))
         for name, pair, expected, representation in cases:
             solver = z3.SolverFor("QF_BV")
             solver.set(timeout=args.milliseconds)

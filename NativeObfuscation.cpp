@@ -64,6 +64,8 @@ cl::opt<bool> NativeConnectedShards("native-connected-shards",
     cl::desc("Partition an oversized connected component into bounded shards under the same cost limit"), cl::init(false));
 cl::opt<bool> NativeConnectedAggregates("native-connected-aggregates",
     cl::desc("Admit bounded constant-index integer leaves of structs and nested arrays as closed connected memory"), cl::init(false));
+cl::opt<bool> NativeJointOutputs("native-joint-outputs",
+    cl::desc("Couple two genuinely used encoded lanes into pinned joint outputs U=X+Y and V=X+2Y"), cl::init(false));
 cl::opt<bool> NativeMemorySSA("native-memory-ssa", cl::desc("Connected memory and SSA lanes without per-load decoding"), cl::init(false));
 cl::opt<bool> NativePredicateRegions("native-predicate-regions", cl::desc("Connected bit-vector comparisons and Boolean uses"), cl::init(false));
 cl::opt<bool> NativeRegionalFamilies("native-regional-families", cl::desc("Seeded XOR/additive families for whole supported components"), cl::init(false));
@@ -197,7 +199,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
     report_fatal_error("connected regions require native-values and native-values-wide");
   if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions ||
-       NativeConnectedShards || NativeConnectedAggregates) && NativeRegionPlan != "connected")
+       NativeConnectedShards || NativeConnectedAggregates || NativeJointOutputs) &&
+      NativeRegionPlan != "connected")
     report_fatal_error("connected subfeatures require native-region-plan=connected");
   if (NativeMemorySSA && !NativeMemory) report_fatal_error("native-memory-ssa requires native-memory");
   if (NativeConnectedAggregates && !NativeMemorySSA)
@@ -310,6 +313,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.Families = NativeRegionalFamilies;
     Options.Shards = NativeConnectedShards;
     Options.Aggregates = NativeConnectedAggregates;
+    Options.JointOutputs = NativeJointOutputs;
     Options.CoupleState = NativeCoupledState;
     Options.Invariant = NativeInvariant;
     if (NativeScaleBudget) {
@@ -561,6 +565,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},
                             {"connected_shards", NativeConnectedShards.getValue()},
                             {"connected_aggregates", NativeConnectedAggregates.getValue()},
+                            {"joint_outputs", NativeJointOutputs.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
                         {"fused_calls", std::move(FusionCoverage)}, {"memory", std::move(MemoryCoverage)},

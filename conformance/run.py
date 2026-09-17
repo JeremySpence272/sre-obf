@@ -70,7 +70,8 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             f"-native-connected-nodes={getattr(args, 'connected_nodes', 128)}",
             *(f"-native-{name.replace('_', '-')}={int(getattr(args, name, False))}"
               for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions", "scale_budget",
-                           "scale_structure", "connected_shards", "connected_aggregates")),
+                           "scale_structure", "connected_shards", "connected_aggregates",
+                           "joint_outputs")),
             f"-native-family={args.family}"]
 
 
@@ -341,7 +342,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--region-plan", choices=("legacy", "connected"), default="legacy")
     p.add_argument("--connected-nodes", type=int, default=128)
     for name in ("memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget",
-                 "scale-structure", "connected-shards", "connected-aggregates"):
+                 "scale-structure", "connected-shards", "connected-aggregates",
+                 "joint-outputs"):
         p.add_argument("--" + name, action="store_true")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--probe-helpers", type=int, default=0,
@@ -377,7 +379,8 @@ def main(argv=None) -> int:
         raise SystemExit("--connected-nodes must be 2..512")
     if args.region_plan == "connected" and not (args.values and args.values_wide):
         raise SystemExit("connected regions require --values --values-wide")
-    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions, args.scale_budget)) and args.region_plan != "connected":
+    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
+            args.scale_budget, args.joint_outputs)) and args.region_plan != "connected":
         raise SystemExit("connected subfeatures require --region-plan connected")
     if args.memory_ssa and not args.memory:
         raise SystemExit("--memory-ssa requires --memory")
