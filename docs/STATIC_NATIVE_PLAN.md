@@ -1,9 +1,10 @@
 # Static-only native obfuscation plan
 
-Next planned iteration: [v02](NATIVE_V02_PLAN.md), grounded in the completed v01
-agent solve. It prioritizes connected memory/value/predicate regions, reusable
-helper-summary resistance and cross-program recovery evaluation. v02 is not yet
-implemented; the historical roadmap below remains the broader design context.
+Next implementation plan: [v04](NATIVE_V04_PLAN.md), grounded in the successful
+v03 semantic-extraction attack. It develops persistent joint representations,
+memory/loop/call continuity and verified normalization/transfer tests. Consult
+[v03 status](NATIVE_V03_STATUS.md) for current implementation evidence; the
+historical roadmap below remains the broader design context.
 
 Status: native entry point, conformance foundation and initial F1–F3 mechanisms
 implemented; research acceptance and agent-hardness validation are not complete.
