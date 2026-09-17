@@ -1,6 +1,7 @@
 #include "llvm/Transforms/Obfuscator/NativeObfuscation.h"
 #include "llvm/Transforms/Obfuscator/NativeEncoding.h"
 #include "llvm/Transforms/Obfuscator/NativeRegions.h"
+#include "llvm/Transforms/Obfuscator/NativeConnected.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InlineAsm.h"
@@ -56,6 +57,22 @@ cl::opt<bool> NativeFusion("native-fusion", cl::desc("Bounded private cross-func
 cl::opt<bool> NativeMemory("native-memory", cl::desc("Encode closed local integer objects across stores and loads"), cl::init(false));
 cl::opt<bool> NativeWide("native-values-wide", cl::desc("XOR-share regions including bitwise, shifts and casts"), cl::init(false));
 cl::opt<bool> NativeInvariant("native-invariant", cl::desc("Reachable witness invariant shared by data and control"), cl::init(false));
+cl::opt<std::string> NativeRegionPlan("native-region-plan", cl::desc("Value planner: legacy or connected"), cl::init("legacy"));
+cl::opt<unsigned> NativeConnectedNodes("native-connected-nodes", cl::desc("Connected node cap per function (2..512)"), cl::init(128));
+cl::opt<bool> NativeMemorySSA("native-memory-ssa", cl::desc("Connected memory and SSA lanes without per-load decoding"), cl::init(false));
+cl::opt<bool> NativePredicateRegions("native-predicate-regions", cl::desc("Connected bit-vector comparisons and Boolean uses"), cl::init(false));
+cl::opt<bool> NativeRegionalFamilies("native-regional-families", cl::desc("Seeded XOR/additive families for whole supported components"), cl::init(false));
+cl::opt<bool> NativeSupportRegions("native-support-regions", cl::desc("Absorb bounded generated data decoders before region planning"), cl::init(false));
+cl::opt<std::string> NativeStageDir("native-stage-dir", cl::desc("Private directory for pre-driver and post-driver IR snapshots"), cl::init(""));
+
+void saveNativeStage(const Module &M, StringRef Stage) {
+  if (NativeStageDir.empty()) return;
+  if (std::error_code EC = sys::fs::create_directories(NativeStageDir)) report_fatal_error(Twine("native stage directory: ") + EC.message());
+  SmallString<256> Path(NativeStageDir.getValue()); sys::path::append(Path, Stage);
+  std::error_code EC; raw_fd_ostream OS(Path, EC, sys::fs::OF_Text);
+  if (EC) report_fatal_error(Twine("native stage snapshot: ") + EC.message());
+  M.print(OS, nullptr);
+}
 
 void enableFamilies(Function &F) {
   if (NativeDiversity) F.addFnAttr("sre.native.families");
@@ -143,6 +160,15 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-state-family must be 0..3");
   if (NativeValueNodes < 2 || NativeValueNodes > 64)
     report_fatal_error("native-value-nodes must be 2..64");
+  if (NativeRegionPlan != "legacy" && NativeRegionPlan != "connected")
+    report_fatal_error("native-region-plan must be legacy or connected");
+  if (NativeConnectedNodes < 2 || NativeConnectedNodes > 512)
+    report_fatal_error("native-connected-nodes must be 2..512");
+  if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
+    report_fatal_error("connected regions require native-values and native-values-wide");
+  if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions) && NativeRegionPlan != "connected")
+    report_fatal_error("connected subfeatures require native-region-plan=connected");
+  if (NativeMemorySSA && !NativeMemory) report_fatal_error("native-memory-ssa requires native-memory");
   if (NativeWide && !NativeValues) report_fatal_error("native-values-wide requires native-values");
   if (NativeInvariant && !NativeCoupledState) report_fatal_error("native-invariant requires native-coupled-state");
   if (NativeCoupledState && (!NativeValues || !NativeMultiState))
@@ -234,12 +260,24 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   json::Array DataCoverage;
   if (NativeData)
     DataCoverage = obf::encodeNativeData(M, PreparedCache.ModuleSeed);
-  json::Array OutlineCoverage, ValueCoverage, MemoryCoverage;
+  json::Array OutlineCoverage, ValueCoverage, MemoryCoverage, ConnectedCoverage, SupportCoverage;
+  if (NativeSupportRegions) SupportCoverage = obf::absorbNativeSupport(M);
   if (NativeOutline)
     OutlineCoverage = obf::outlineNativeRegions(M, PreparedCache.ModuleSeed);
-  if (NativeValues)
+  if (NativeRegionPlan == "connected") {
+    obf::NativeConnectedOptions Options;
+    Options.Nodes = NativeConnectedNodes;
+    Options.Memory = NativeMemorySSA;
+    Options.Predicates = NativePredicateRegions;
+    Options.Families = NativeRegionalFamilies;
+    Options.CoupleState = NativeCoupledState;
+    Options.Invariant = NativeInvariant;
+    ConnectedCoverage = obf::encodeNativeConnected(M, PreparedCache.ModuleSeed, Options);
+  } else if (NativeValues)
     ValueCoverage = obf::encodeNativeValues(M, PreparedCache.ModuleSeed, NativeValueNodes, NativeCoupledState, NativeWide, NativeInvariant);
-  if (NativeMemory) MemoryCoverage = obf::encodeNativeMemory(M, PreparedCache.ModuleSeed);
+  if (NativeMemory && !NativeMemorySSA) MemoryCoverage = obf::encodeNativeMemory(M, PreparedCache.ModuleSeed);
+  saveNativeStage(M, "regions.ll");
+  auto RegionInventory = obf::nativeBoundaryInventory(M, "after-regions-before-function-driver");
   if (NativeOutline || NativeValues || NativeMemory) {
     auto &ChangedFAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
     for (Function &F : M)
@@ -261,6 +299,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   ModulePassManager Applications;
   Applications.addPass(createModuleToFunctionPassAdaptor(ObfuscationFunctionDriverPass()));
   Applications.run(M, AM);
+  saveNativeStage(M, "applications.ll");
   checkModuleBudget(M);
 
   // Closed, generation-one worklist. New helpers are captured by identity,
@@ -419,17 +458,22 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"fusion", NativeFusion.getValue()}, {"memory", NativeMemory.getValue()},
                             {"values_wide", NativeWide.getValue()}, {"invariant", NativeInvariant.getValue()},
                             {"value_nodes", NativeValueNodes.getValue()},
+                            {"region_plan", NativeRegionPlan.getValue()}, {"connected_nodes", NativeConnectedNodes.getValue()},
+                            {"memory_ssa", NativeMemorySSA.getValue()}, {"predicate_regions", NativePredicateRegions.getValue()},
+                            {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
                         {"fused_calls", std::move(FusionCoverage)}, {"memory", std::move(MemoryCoverage)},
                         {"flattening_state", std::move(StateCoverage)},
                         {"values", std::move(ValueCoverage)}, {"outlined_regions", std::move(OutlineCoverage)},
+                        {"connected_regions", std::move(ConnectedCoverage)}, {"support_regions", std::move(SupportCoverage)},
                         {"encodings", obf::nativeEncodingInventory(M)},
                         {"data", std::move(DataCoverage)},
                         {"helpers", std::move(HelperCoverage)},
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
     Result["input_inventory"] = std::move(InputInventory);
+    Result["region_inventory"] = std::move(RegionInventory);
     Result["final_inventory"] = obf::nativeBoundaryInventory(M, "final-ir");
     OS << formatv("{0:2}\n", json::Value(std::move(Result)));
   }

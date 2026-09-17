@@ -86,7 +86,18 @@ def main(args: list[str] | None = None) -> int:
     outline = os.environ.get("SRE_OBF_OUTLINE", "0")
     coupled = os.environ.get("SRE_OBF_COUPLED_STATE", "0")
     extras = {name: os.environ.get("SRE_OBF_" + name.upper(), "0")
-              for name in ("fusion", "memory", "values_wide", "invariant")}
+              for name in ("fusion", "memory", "values_wide", "invariant", "memory_ssa",
+                           "predicate_regions", "regional_families", "support_regions")}
+    region_plan = os.environ.get("SRE_OBF_REGION_PLAN", "legacy")
+    connected_nodes = int(os.environ.get("SRE_OBF_CONNECTED_NODES", "128"))
+    if region_plan not in ("legacy", "connected") or not 2 <= connected_nodes <= 512:
+        raise ValueError("invalid connected region planner/budget")
+    if region_plan == "connected" and not (values == "1" and extras["values_wide"] == "1"):
+        raise ValueError("connected regions require values and values_wide")
+    if any(extras[k] == "1" for k in ("memory_ssa", "predicate_regions", "regional_families", "support_regions")) and region_plan != "connected":
+        raise ValueError("connected subfeatures require the connected planner")
+    if extras["memory_ssa"] == "1" and extras["memory"] != "1":
+        raise ValueError("memory_ssa requires memory")
     if any(value not in ("0", "1") for value in extras.values()):
         raise ValueError("experimental SRE_OBF flags must be 0 or 1")
     if values not in ("0", "1") or outline not in ("0", "1"):
@@ -137,6 +148,7 @@ def main(args: list[str] | None = None) -> int:
             f"-native-multistate={multistate}",
             f"-native-values={values}", f"-native-outline={outline}",
             f"-native-coupled-state={coupled}",
+            f"-native-region-plan={region_plan}", f"-native-connected-nodes={connected_nodes}",
             *(f"-native-{name.replace('_', '-')}={value}" for name, value in extras.items()),
             f"-obf-seed={seed}", "-obf-deterministic", "-obf-verify",
             "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
@@ -155,6 +167,7 @@ def main(args: list[str] | None = None) -> int:
         "outline": outline == "1" if profile != "none" else False,
         "coupled_state": coupled == "1" if profile != "none" else False,
         "experiments": {name: value == "1" if profile != "none" else False for name, value in extras.items()},
+        "region_plan": region_plan if profile != "none" else "none", "connected_nodes": connected_nodes,
         "toolchain_image": image_identity(image),
         "adapter_sha256": digest(Path(__file__)),
         "plugin_sha256": digest(plugin) if profile != "none" else None,

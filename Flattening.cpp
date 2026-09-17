@@ -32,6 +32,22 @@ STATISTIC(Flattened, "Functions flattened");
 
 namespace {
 
+  // A tagged XOR-share predicate can select an encoded successor without
+  // materializing its decoded Boolean. This remains ordinary bit-vector
+  // semantics; an analyst may still split or simplify the resulting paths.
+  Value *nativeSuccessor(IRBuilder<> &B, Value *Cond, Value *T, Value *F) {
+    auto *P = dyn_cast<BinaryOperator>(Cond);
+    if (!P || !P->getMetadata("sre.native.predicate") || P->getOpcode() != Instruction::Xor ||
+        !P->getType()->isIntegerTy(1)) return B.CreateSelect(Cond, T, F, "fla.next.enc");
+    Value *D = B.CreateXor(T, F);
+    Value *E = B.CreateSExt(P->getOperand(0), T->getType());
+    Value *R = B.CreateSExt(P->getOperand(1), T->getType());
+    Value *Next = B.CreateXor(B.CreateXor(F, B.CreateAnd(D, E)), B.CreateAnd(D, R), "fla.next.shared");
+    if (auto *I = dyn_cast<Instruction>(Next))
+      I->setMetadata("sre.native.predicate.handoff", MDNode::get(B.getContext(), {}));
+    return Next;
+  }
+
 
 	struct FlaCtx;
 
@@ -1546,7 +1562,7 @@ namespace {
 			Value* VT = PCtx.Opaque.opaqueI32Const(B, EncT);
 			Value* VF = PCtx.Opaque.opaqueI32Const(B, EncF);
 
-			Value* Next = B.CreateSelect(Cond, VT, VF, "fla.next.enc");
+			Value* Next = nativeSuccessor(B, Cond, VT, VF);
 			Next = applyFakeTransition(B, PCtx, Ctx, Next, { EncT, EncF });
 
 			storeState(B, PCtx, Ctx, Next);
@@ -1554,6 +1570,8 @@ namespace {
 
 		B.CreateBr(Ctx.Router);
 		TI->eraseFromParent();
+		for (Instruction &I : llvm::make_early_inc_range(*B.GetInsertBlock()))
+			if (I.getMetadata("sre.native.predicate") && isInstructionTriviallyDead(&I)) I.eraseFromParent();
 	}
 
 	void FlaImpl::rewriteFlattenedBlocksRouter(Function& F, FunctionObfContext& Ctx, FlaCtx& PCtx) {
@@ -1629,7 +1647,7 @@ namespace {
 				Value* VT = PCtx.Opaque.opaqueI32Const(B, EncT);
 				Value* VF = PCtx.Opaque.opaqueI32Const(B, EncF);
 
-				Value* Next = B.CreateSelect(Cond, VT, VF, "fla.next.enc");
+				Value* Next = nativeSuccessor(B, Cond, VT, VF);
 				Next = applyFakeTransition(B, PCtx, Ctx, Next, { EncT, EncF });
 
 				storeState(B, PCtx, Ctx, Next);
@@ -1638,6 +1656,8 @@ namespace {
 
 			}
 			TI->eraseFromParent();
+			for (Instruction &I : llvm::make_early_inc_range(*BB))
+				if (I.getMetadata("sre.native.predicate") && isInstructionTriviallyDead(&I)) I.eraseFromParent();
 		}
 		
 	}

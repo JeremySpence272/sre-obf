@@ -79,6 +79,7 @@ set(OBF_SOURCES
   NativeFusion.cpp
   NativeMemory.cpp
   NativeInventory.cpp
+  NativeConnected.cpp
   Utils.cpp
   OpaqueUtils.cpp
   ObfDebug.cpp

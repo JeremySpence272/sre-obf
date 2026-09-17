@@ -66,6 +66,10 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             f"-native-memory={int(getattr(args, 'memory', False))}",
             f"-native-values-wide={int(getattr(args, 'values_wide', False))}",
             f"-native-invariant={int(getattr(args, 'invariant', False))}",
+            f"-native-region-plan={getattr(args, 'region_plan', 'legacy')}",
+            f"-native-connected-nodes={getattr(args, 'connected_nodes', 128)}",
+            *(f"-native-{name.replace('_', '-')}={int(getattr(args, name, False))}"
+              for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions")),
             f"-native-family={args.family}"]
 
 
@@ -333,6 +337,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--memory", action="store_true")
     p.add_argument("--values-wide", action="store_true")
     p.add_argument("--invariant", action="store_true")
+    p.add_argument("--region-plan", choices=("legacy", "connected"), default="legacy")
+    p.add_argument("--connected-nodes", type=int, default=128)
+    for name in ("memory-ssa", "predicate-regions", "regional-families", "support-regions"):
+        p.add_argument("--" + name, action="store_true")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--probe-helpers", type=int, default=0,
                    help="Informed-entry probes for up to N distinct helper roles")
@@ -363,6 +371,14 @@ def main(argv=None) -> int:
         raise SystemExit("--threads supports at most 4096 total vectors")
     if not 2 <= args.value_nodes <= 64:
         raise SystemExit("--value-nodes must be 2..64")
+    if not 2 <= args.connected_nodes <= 512:
+        raise SystemExit("--connected-nodes must be 2..512")
+    if args.region_plan == "connected" and not (args.values and args.values_wide):
+        raise SystemExit("connected regions require --values --values-wide")
+    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions)) and args.region_plan != "connected":
+        raise SystemExit("connected subfeatures require --region-plan connected")
+    if args.memory_ssa and not args.memory:
+        raise SystemExit("--memory-ssa requires --memory")
     if args.coupled_state and (not args.values or args.no_multistate):
         raise SystemExit("--coupled-state requires --values and multi-state flattening")
     if not 0 <= args.probe_helpers <= 8:

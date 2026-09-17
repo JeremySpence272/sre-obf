@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/NativeRegions.h"
+#include "llvm/Transforms/Obfuscator/NativeConnected.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/InstIterator.h"
@@ -94,6 +95,39 @@ json::Array fuseNativeFunctions(Module &M, uint64_t Seed, ArrayRef<std::string> 
     for (Function &F : make_early_inc_range(M))
       if (F.hasLocalLinkage() && F.use_empty()) { F.eraseFromParent(); Removed = true; }
   } while (Removed);
+  return Report;
+}
+
+json::Array absorbNativeSupport(Module &M) {
+  json::Array Report;
+  unsigned Total = 0;
+  SmallVector<Function *, 16> Helpers;
+  for (Function &F : M)
+    if (F.getFnAttribute("sre.native.helper").getValueAsString() == "data-decoder") Helpers.push_back(&F);
+  for (Function &F : M) {
+    if (!F.hasFnAttribute("sre.native.original")) continue;
+    SmallVector<CallInst *, 16> Calls;
+    for (Instruction &I : instructions(F)) if (auto *C = dyn_cast<CallInst>(&I))
+      if (llvm::is_contained(Helpers, C->getCalledFunction())) Calls.push_back(C);
+    unsigned Count = 0;
+    for (CallInst *C : Calls) {
+      Function *H = C->getCalledFunction();
+      std::string Reason;
+      if (!H->hasLocalLinkage() || H->hasAddressTaken() || unsafe(*H) || C->isMustTailCall() || C->hasOperandBundles())
+        Reason = "unsupported-helper-interface";
+      else if (Count >= 16 || Total >= 128 || H->getInstructionCount() > 80 || F.getInstructionCount() + H->getInstructionCount() > 4000)
+        Reason = "support-region-budget";
+      std::string Name = H->getName().str();
+      if (Reason.empty()) {
+        InlineFunctionInfo IFI; auto Result = InlineFunction(*C, IFI);
+        if (!Result.isSuccess()) Reason = Result.getFailureReason();
+        else { ++Count; ++Total; }
+      }
+      Report.push_back(json::Object{{"caller", F.getName().str()}, {"helper", Name},
+          {"status", Reason.empty() ? "absorbed" : "skipped"}, {"reason", Reason}});
+    }
+  }
+  for (Function *H : Helpers) if (H->use_empty()) H->eraseFromParent();
   return Report;
 }
 }

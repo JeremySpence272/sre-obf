@@ -14,7 +14,7 @@ json::Object nativeBoundaryInventory(const Module &M, StringRef Stage) {
     const bool Helper = F.hasFnAttribute("sre.native.helper");
     const bool Protect = F.hasFnAttribute("sre.native.original");
     uint64_t Loads = 0, Stores = 0, Comparisons = 0, Selects = 0, Indirect = 0;
-    uint64_t NamedBoundaries = 0, TaggedBoundaries = 0, Objects = 0;
+    uint64_t NamedBoundaries = 0, TaggedBoundaries = 0, Objects = 0, Handoffs = 0;
     json::Array Calls;
     for (const Instruction &I : instructions(F)) {
       Loads += isa<LoadInst>(I); Stores += isa<StoreInst>(I);
@@ -24,6 +24,7 @@ json::Object nativeBoundaryInventory(const Module &M, StringRef Stage) {
       NamedBoundaries += I.getName().starts_with("sre.value.output") ||
                          I.getName().starts_with("sre.memory.output");
       TaggedBoundaries += I.getMetadata("sre.native.boundary") != nullptr;
+      Handoffs += I.getMetadata("sre.native.predicate.handoff") != nullptr;
       if (const auto *C = dyn_cast<CallBase>(&I)) {
         const Function *Target = C->getCalledFunction();
         if (!Target) ++Indirect;
@@ -44,6 +45,7 @@ json::Object nativeBoundaryInventory(const Module &M, StringRef Stage) {
         {"indirect_calls", Indirect}, {"direct_helper_calls", std::move(Calls)},
         {"legacy_named_decode_boundaries", NamedBoundaries},
         {"surviving_tagged_boundaries", TaggedBoundaries}});
+    Functions.back().getAsObject()->insert({"surviving_predicate_handoffs", Handoffs});
   }
   return json::Object{{"schema", "sre-boundary-inventory-v1"}, {"stage", Stage.str()},
       {"definitions", Definitions}, {"instructions", Instructions},
