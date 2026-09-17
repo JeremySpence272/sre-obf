@@ -14,7 +14,7 @@ from conformance.whole import parser as whole_parser
 def call_row(**overrides):
     row = {"function": "helper", "status": "encoded", "reason": "", "parameters": 2,
            "encoded_parameters": 2, "returns_pair": True, "widths": [8, 32], "callers": 2,
-           "call_sites_rewritten": 3, "wrapper_retained": False,
+           "call_sites_rewritten": 3, "result_rebuilds": 1, "wrapper_retained": False,
            "representation": "xor-pair-v1", "activation_allocas": 1,
            "absorbed_arguments": 0, "absorbed_results": 0}
     row.update(overrides)
@@ -23,7 +23,8 @@ def call_row(**overrides):
 
 def skip_row(reason, **overrides):
     empty = {"status": "skipped", "reason": reason, "encoded_parameters": 0,
-             "returns_pair": False, "call_sites_rewritten": 0, "activation_allocas": 0}
+             "returns_pair": False, "result_rebuilds": 0, "call_sites_rewritten": 0,
+             "activation_allocas": 0}
     empty.update(overrides)
     return call_row(**empty)
 
@@ -71,7 +72,17 @@ class ReportVocabularyTests(unittest.TestCase):
 
     def test_an_interface_without_pairs_is_not_encoded_coverage(self):
         self.assertTrue(call_violations(report(call_row(parameters=0, encoded_parameters=0,
-                                                        returns_pair=False))))
+                                                        returns_pair=False, result_rebuilds=0))))
+
+    def test_absorbed_supplies_cannot_exceed_the_pairs_supplied(self):
+        # Three sites of a two-parameter interface supply six argument pairs,
+        # and its single return supplies one more.
+        self.assertEqual(call_violations(report(call_row(absorbed_results=7))), [])
+        self.assertTrue(call_violations(report(call_row(absorbed_results=8))))
+
+    def test_a_pair_result_must_be_rebuilt(self):
+        self.assertTrue(call_violations(report(call_row(result_rebuilds=0))))
+        self.assertTrue(call_violations(report(call_row(returns_pair=False))))
 
     def test_a_retained_plaintext_wrapper_fails(self):
         self.assertTrue(call_violations(report(call_row(wrapper_retained=True))))
@@ -115,16 +126,22 @@ class CoverageAccountingTests(unittest.TestCase):
         self.assertEqual(measured["absorbed_arguments"], 0)
         self.assertEqual(measured["absorbed_results"], 0)
         self.assertEqual(measured["skips"], {"varargs": 1})
+        # absorbed_arguments counts reconstructions, one per parameter, not one
+        # per call site: its denominator must not be the moved-pair count.
+        self.assertEqual(measured["parameter_reconstructions"], 2)
+        self.assertEqual(measured["pair_supplies"], 7)
 
     def test_a_void_interface_moves_arguments_only(self):
-        measured = call_coverage(report(call_row(returns_pair=False, parameters=1,
-                                                 encoded_parameters=1, call_sites_rewritten=2)))
+        measured = call_coverage(report(call_row(returns_pair=False, result_rebuilds=0,
+                                                 parameters=1, encoded_parameters=1,
+                                                 call_sites_rewritten=2)))
         self.assertEqual(measured["argument_pairs_moved"], 2)
         self.assertEqual(measured["result_pairs_moved"], 0)
 
     def test_a_report_without_the_array_has_unknown_denominators(self):
         measured = call_coverage({"schema": "sre-native-v2"})
-        for field in ("encoded_interfaces", "argument_pairs_moved", "absorbed_arguments", "skips"):
+        for field in ("encoded_interfaces", "argument_pairs_moved", "absorbed_arguments",
+                      "parameter_reconstructions", "pair_supplies", "skips"):
             self.assertIsNone(measured[field])
 
     def test_coverage_requires_a_pair_that_actually_crosses(self):

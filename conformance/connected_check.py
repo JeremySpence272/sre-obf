@@ -43,12 +43,18 @@ def call_violations(report):
                 violations.append(f"{where}: unexpected representation {row['representation']!r}")
             if row["absorbed_arguments"] > row["encoded_parameters"]:
                 violations.append(f"{where}: more absorbed argument pairs than parameters")
+            supplies = row["encoded_parameters"] * row["call_sites_rewritten"] + row["result_rebuilds"]
+            if row["absorbed_results"] > supplies:
+                violations.append(f"{where}: {row['absorbed_results']} absorbed supplies "
+                                  f"but only {supplies} pairs are supplied")
+            if row["returns_pair"] != bool(row["result_rebuilds"]):
+                violations.append(f"{where}: a pair result must be rebuilt at least once")
         else:
             if row["reason"] not in CALL_SKIPS:
                 violations.append(f"{where}: skip reason {row['reason']!r} is outside the vocabulary")
             if any(row[field] for field in ("encoded_parameters", "call_sites_rewritten",
                                             "activation_allocas", "absorbed_arguments",
-                                            "absorbed_results")) or row["returns_pair"]:
+                                            "absorbed_results", "result_rebuilds")) or row["returns_pair"]:
                 violations.append(f"{where}: a skipped interface reported encoded work")
     return violations
 
@@ -64,7 +70,8 @@ def call_coverage(report):
     if rows is None:
         return {key: None for key in
                 ("encoded_interfaces", "encoded_widths", "call_sites_rewritten",
-                 "argument_pairs_moved", "result_pairs_moved", "absorbed_arguments",
+                 "argument_pairs_moved", "result_pairs_moved",
+                 "parameter_reconstructions", "pair_supplies", "absorbed_arguments",
                  "absorbed_results", "activation_allocas", "wrappers_retained", "skips")}
     encoded = [row for row in rows if row["status"] == "encoded"]
     skips = {}
@@ -78,6 +85,14 @@ def call_coverage(report):
                                         for row in encoded),
             "result_pairs_moved": sum(row["call_sites_rewritten"] for row in encoded
                                       if row["returns_pair"]),
+            # The denominator of absorbed_arguments: one parameter reconstruction
+            # per parameter of each encoded interface, however many call sites
+            # feed it.
+            "parameter_reconstructions": sum(row["encoded_parameters"] for row in encoded),
+            # The denominator of absorbed_results: one caller split per argument
+            # per call site, plus one callee rebuild per return site.
+            "pair_supplies": sum(row["encoded_parameters"] * row["call_sites_rewritten"]
+                                 + row["result_rebuilds"] for row in encoded),
             "absorbed_arguments": sum(row["absorbed_arguments"] for row in encoded),
             "absorbed_results": sum(row["absorbed_results"] for row in encoded),
             "activation_allocas": sum(row["activation_allocas"] for row in encoded),

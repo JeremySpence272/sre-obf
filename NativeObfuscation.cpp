@@ -334,7 +334,12 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       Options.BoundedGrowth = true;
       Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
     }
-    ConnectedCoverage = obf::encodeNativeConnected(M, PreparedCache.ModuleSeed, Options);
+    StringMap<obf::NativeCallAbsorption> Absorbed;
+    ConnectedCoverage = obf::encodeNativeConnected(M, PreparedCache.ModuleSeed, Options,
+                                                   NativeEncodedCalls ? &Absorbed : nullptr);
+    // Pairs the region planner consumed without a scalar decode belong in the
+    // interface rows that carry them, not in a separate total nobody reads.
+    obf::recordNativeCallAbsorption(CallCoverage, Absorbed);
   } else if (NativeValues)
     ValueCoverage = obf::encodeNativeValues(M, PreparedCache.ModuleSeed, NativeValueNodes, NativeCoupledState, NativeWide, NativeInvariant);
   if (NativeMemory && !NativeMemorySSA) MemoryCoverage = obf::encodeNativeMemory(M, PreparedCache.ModuleSeed);

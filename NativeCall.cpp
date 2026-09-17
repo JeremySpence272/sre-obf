@@ -96,20 +96,35 @@ class Interfaces {
     BasicBlock &Entry = F.getEntryBlock();
     IRBuilder<> B(&Entry, Entry.begin());
     auto *Slot = B.CreateAlloca(B.getInt64Ty(), nullptr, "sre.call.activation");
-    Slot->setMetadata("sre.native.call.state", MDNode::get(F.getContext(), {}));
-    Value *Init = B.CreateXor(B.CreatePtrToInt(Slot, B.getInt64Ty()),
-        B.getInt64(RNG.fork("activation").fork(F.getName()).u64()));
-    B.CreateStore(Init, Slot)->setVolatile(true);
+    state(Slot);
+    Value *Address = B.CreatePtrToInt(Slot, B.getInt64Ty());
+    state(Address);
+    Value *Init = B.CreateXor(Address, B.getInt64(RNG.fork("activation").fork(F.getName()).u64()));
+    state(Init);
+    auto *Store = B.CreateStore(Init, Slot);
+    Store->setVolatile(true);
+    state(Store);
     ++Allocas;
     return Slots[&F] = Slot;
+  }
+  // Interface plumbing, not application arithmetic: a later representation
+  // pass must leave it alone, or it would encode the very coordinate that
+  // hides a pair and could no longer hand the pair on unchanged.
+  void state(Value *V) {
+    if (auto *I = dyn_cast<Instruction>(V))
+      I->setMetadata("sre.native.call.state", MDNode::get(I->getContext(), {}));
   }
   Value *mask(IRBuilder<> &B, Function &Host, Type *T, StringRef Owner,
               StringRef Role, unsigned Site, unsigned Index) {
     auto *Read = B.CreateLoad(B.getInt64Ty(), slot(Host), "sre.call.activation.read");
     Read->setVolatile(true);
+    state(Read);
     Value *Mask = B.CreateXor(Read, B.getInt64(RNG.fork(Owner).fork(Role)
         .fork(Host.getName()).fork(Site).fork(Index).u64()));
-    return B.CreateIntCast(Mask, T, false, "sre.call.mask");
+    state(Mask);
+    Value *Out = B.CreateIntCast(Mask, T, false, "sre.call.mask");
+    state(Out);
+    return Out;
   }
   // Symbol order, then instruction order inside each caller. Use-list order
   // never reaches a seeded stream.
@@ -208,6 +223,10 @@ class Interfaces {
     }
     Row["encoded_parameters"] = F.arg_size();
     Row["returns_pair"] = !Ret->isVoidTy();
+    // The denominator absorbed_results is measured against, together with the
+    // argument pairs: one rebuild per return site, plus one split per argument
+    // per call site.
+    Row["result_rebuilds"] = Returns;
     Row["call_sites_rewritten"] = Site;
     Row["activation_allocas"] = Allocas;
     if (!F.use_empty()) report_fatal_error("native encoded call left a plaintext use");
@@ -271,7 +290,7 @@ public:
       json::Object Row{{"function", F->getName().str()},
           {"status", Reason.empty() ? "encoded" : "skipped"}, {"reason", Reason},
           {"parameters", F->arg_size()}, {"encoded_parameters", 0},
-          {"returns_pair", false}, {"widths", std::move(Widths)},
+          {"returns_pair", false}, {"result_rebuilds", 0}, {"widths", std::move(Widths)},
           {"callers", Callers.size()}, {"call_sites_rewritten", 0},
           {"wrapper_retained", false}, {"representation", "xor-pair-v1"},
           {"activation_allocas", 0}, {"absorbed_arguments", 0}, {"absorbed_results", 0}};
