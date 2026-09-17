@@ -840,6 +840,89 @@ reaches it as `structure-or-size` — carries none. Such a row is now skipped
 like the rollback row it resembles. No fixture in the tree had previously put a
 varargs definition through a connected build.
 
+## Wave integration, schema v4, and what it cost
+
+Six parallel efforts were merged onto `49d9b0e` and the report schema was
+bumped once, here, to `sre-native-v4`. Every feature in the wave is
+independently defaults-off. The integrated plugin
+`53ba0c1694304edc5d5db1839972eec948e29494e70cf084b7d11938b21d0b33` was gated
+as a whole, not only branch by branch.
+
+- **Flag-off control.** With every new flag off, the integrated compiler emits
+  a protected module byte-identical to the sealed
+  `0e378f373e7e506737e1d1372b9c39ef361e3c7d1a4d3039e5f3b61232fdd055`. Six sets
+  of changes to one encoder, and the default path is unchanged to the byte.
+- **All six on together**, O0 seed 3: 593 vectors agree across clean, native
+  and stock-post-O2, zero planner violations, four joint-output groups, two
+  lane-keyed dispatcher reads and encoded memory in one build.
+- **Per-feature fixtures** pass their own coverage gates on the integrated
+  compiler: the encoded-call fixture absorbs 11 argument reconstructions and
+  35 supplied pairs, and the aggregate fixture encodes three aggregate objects.
+- 116 unit tests pass.
+
+### Two defects the large-application validation found in the shard commit
+
+Both were in `698212c`, and neither was caught by the fixture evidence.
+
+1. `connected_check.invariants()` raised `KeyError` on every real-application
+   report. A function rejected before planning publishes no accounting fields
+   at all, and only the growth-rollback case was handled. It crashed rather
+   than failing, so no large run could be gated. It now skips exactly the two
+   row kinds that never claimed the identity and reports any other missing
+   field as a violation, so it can neither crash nor pass by omission. Zero
+   violations across 1,801 function rows of real SQLite, Lua and zlib reports.
+2. `scale.py` advertised `eligible = selected + skipped + shard loss` as an
+   aggregate identity. It holds per function but not in aggregate, because a
+   growth-rolled-back function publishes its eligible cost while the rest is
+   republished as `attempted_*`. The scope sentence now says so and the gap is
+   reported as `connected_rollback_estimated_cost`.
+
+### Shards on unchanged large C applications
+
+Eight `scale.py` runs, matched pairs differing only by `--connected-shards`,
+all `conformance-pass` with workloads matching their independently declared
+expected output.
+
+| application | selected nodes without shards | with shards |
+|---|---|---|
+| zlib | 1,912 | 2,088 |
+| SQLite seed 1 | 1,629 | 1,777 |
+| SQLite seed 2 | 1,607 | 1,763 |
+| Lua | 1,821 | 2,087 |
+
+Read against cost this is small. On SQLite shards move 8.63 million of
+estimated cost from skipped to shard-lost to gain 13,984 selected, taking
+coverage of the eligible pool from 2.34% to 2.55%. Shards buy a bounded
+prefix; they do not make a 14.3 million eligible pool tractable.
+
+**A real trade-off, previously unmeasured:** functions retaining control-flow
+flattening on Lua fell from 50 to 29. With `--scale-structure` off, flattening
+and connected regions share one module cap and shards spend more of it. A
+large run requiring both `--require-flattening` and `--require-shards` cannot
+be assumed to pass. Memory coverage was unchanged on every application, so
+shards did not widen memory anywhere. Compile time is **not** reported: the
+frontend compile of unmodified sources differed 26% between two arms that
+cannot depend on the flag, so the measurement is confounded.
+
+### An ordering conflict that needs a decision
+
+Bounded function merging runs before the encoded-call pass and absorbs every
+private helper of 4 to 2000 instructions into merged super-functions, which
+take `i64` arguments and are routinely mutually recursive. With merging left
+on, encoded-call coverage on its fixture is **exactly zero**, every row an
+honest skip. Its coverage runs therefore pass `--no-merge`. Two features want
+the same functions and the earlier one wins. Nothing here decides that.
+
+### What this wave did not establish
+
+No large-application run exists for aggregates, joint outputs, lane
+transitions or encoded calls. Canonical dispatcher repair still works; the
+lane experiment adds one word that a backward slice recovers in under two
+tenths of a second. Aggregate coverage is zero at O2 because frontend
+optimization promotes exactly the objects the walk admits. A pinned slot is a
+compiler barrier, not a semantic one, so surviving stock optimization shows
+only that the optimizer did not fold it. Coverage is not hardness.
+
 ## Next implementation batch
 
 The private Sol control now reproduces exact recovery in 79.511 seconds with
