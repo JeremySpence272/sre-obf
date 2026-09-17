@@ -80,6 +80,7 @@ set(OBF_SOURCES
   NativeMemory.cpp
   NativeInventory.cpp
   NativeConnected.cpp
+  NativeCall.cpp
   NativeBudget.cpp
   Utils.cpp
   OpaqueUtils.cpp

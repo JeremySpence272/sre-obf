@@ -1,6 +1,7 @@
 #pragma once
 #include "llvm/IR/Module.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Transforms/Obfuscator/NativeCall.h"
 
 namespace llvm::obf {
 struct NativeConnectedOptions {
@@ -28,6 +29,9 @@ struct NativeConnectedOptions {
   unsigned LaneTransitions = 0;
   unsigned GrowthBudget = 0;
 };
-json::Array encodeNativeConnected(Module &, uint64_t, const NativeConnectedOptions &);
+// Absorbed, when given, receives the encoded-call pairs these regions
+// consumed without a scalar decode, keyed by the interface that owns them.
+json::Array encodeNativeConnected(Module &, uint64_t, const NativeConnectedOptions &,
+                                  StringMap<NativeCallAbsorption> *Absorbed = nullptr);
 json::Array absorbNativeSupport(Module &);
 }

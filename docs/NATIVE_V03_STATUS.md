@@ -599,6 +599,246 @@ Evidence, LLVM 22.1.8, seed 3 unless stated:
 Report rows gained `widths` and `phi_pairs`; the `schema` string is untouched
 and a version bump is owed at integration. This closes a dead gate. It is not
 new protection and it is not hardness evidence.
+## Private encoded-call interfaces
+
+`--encoded-calls` / `-native-encoded-calls` is an independent defaults-off
+experiment. It requires `-native-region-plan=connected`, exactly like the other
+connected subfeatures, and runs immediately before connected allocation so the
+region planner sees pair interfaces instead of plaintext call boundaries.
+
+An eligible private function is replaced by a twin, `F.sre.encoded`, whose
+interface carries no plaintext scalar. Each integer parameter arrives as two
+integers of the same width, `(E, R)` with `x = E xor R`; an integer result
+leaves as `{iN, iN}` built the same way; a void function keeps its void result.
+This is the XOR family of `NativeConnected` (`xor-prefix-pair-v1`), reported as
+`xor-pair-v1`; the additive family is out of scope for this milestone. The twin
+keeps every `sre.native.*` attribute, so later stages still treat it as
+application code, and the original definition is **erased**. There is no
+compatibility wrapper: every encoded interface is private, direct-called and
+not address-taken, so nothing needs one, and a wrapper would be a second
+plaintext body carrying exactly the summary the pair interface is meant to
+cost. `wrapper_retained` is false in every row, and the gate fails a report
+that claims otherwise.
+
+Four empty metadata nodes mark the four rebuild points so a later pass can
+recognize a pair rather than a coincidence: `sre.native.call.split` on the
+caller's `xor` that builds `E`, `sre.native.call.arg` on the callee's `xor`
+that rebuilds a parameter, `sre.native.call.result` on the callee's `xor` that
+builds the returned `E`, and `sre.native.call.join` on the caller's `xor` that
+rebuilds the plaintext result. `R` is drawn from a per-activation entry alloca
+that seeds itself from its own address and is read back through volatile
+accesses. There are no new module globals: concurrent activations of one
+interface must not share a mask, and a constant second coordinate folds
+straight back into the plaintext it is supposed to hide.
+
+Eligibility is deliberately narrow: `sre.native.original`, local linkage, not
+address-taken, not a declaration, no varargs, no personality function or EH
+pad, non-recursive, every parameter and the result an integer of 8/16/32/64
+bits or void, at least one caller, and every call site a direct non-musttail
+`CallInst` with no operand bundles and a matching function type. An interface
+that would carry no pair at all — a void function of no arguments — is reported
+as an unsupported signature, never as encoded coverage. Recursion is computed
+once per module with Tarjan over the direct call graph, seeded from every
+function rather than from exported roots, so a recursive helper that no export
+reaches is still detected; `NativeFusion`'s per-candidate reachability walk
+would be O(module) for every definition. Skips use a fixed vocabulary:
+`not-original`, `exported-or-address-taken`, `varargs`, `eh-or-personality`,
+`recursive`, `unsupported-signature`, `unsupported-call-site`,
+`function-budget`, `no-callers`. At most 32 interfaces per module are encoded
+and the rest are `function-budget`.
+
+The native report gains a top-level `encoded_calls` array with one row per
+definition considered, and a `features.encoded_calls` flag. Each row reports
+the parameters, the encoded parameters, whether the result is a pair, the
+interface widths, the callers, the call sites rewritten, the result
+rebuilds, the activation allocas, and `absorbed_arguments` /
+`absorbed_results`. Both absorbed counters have an explicit denominator in the
+same row: `absorbed_arguments` is measured against the interface's parameters,
+one reconstruction per parameter however many call sites feed it, and
+`absorbed_results` against the pairs actually supplied, one caller split per
+argument per call site plus one callee rebuild per return site.
+`connected_check.py` gains `--require-encoded-calls` and
+`--require-encoded-widths` plus a self-consistency check: a row that claims an
+encoded interface carrying no pair, retains a wrapper, encodes only some of its
+parameters, rewrites no call site, uses a reason outside the vocabulary, or
+reports more absorbed argument pairs than the interface has, fails the gate as
+`planning_violations` instead of being read as coverage. A report without the
+array has unknown encoded-call denominators, never zero.
+
+**An unabsorbed pair interface only MOVES the decode across the call boundary.**
+It does not remove it. The callee still rebuilds each plaintext parameter from
+its pair and the caller still rebuilds the plaintext result from the returned
+pair; what changes is that the plaintext no longer exists at the call boundary
+itself, and that a callee summary is only reusable together with the caller's
+mask. `absorbed_arguments` and `absorbed_results` count pairs that
+`NativeConnected` consumed **without** a scalar decode. The transform was
+built, gated and committed in exactly that unabsorbed state first, and the runs
+under *The pair interface alone* below report `0` for both; they are retained
+as the control for the absorption measured after them. A run whose absorbed
+counters are zero is a moved decode, not a removed one, and must not be read as
+anything else.
+
+### Connected absorption
+
+`NativeConnected::input()` no longer freezes a rebuilt parameter into a fresh
+boundary pair: when the value is an instruction marked `sre.native.call.arg` it
+takes that instruction's two operands as the pair and converts the family
+directly with the existing `convertFamily`. The symmetric case runs once every
+node has been emitted: where a marked `sre.native.call.split` or
+`sre.native.call.result` xor consumes a value that **is** an encoded node, the
+region's own pair is supplied to the interface instead of being decoded for it.
+Both coordinates move together, which is safe precisely because the xor and the
+activation read it hides behind are used only by each other and by the call or
+the returned struct; the pass checks that shape and leaves anything else to
+decode. A reconstruction left with no users is erased, so an absorbed parameter
+does not survive as a dead plaintext value, and the activation read that is no
+longer hiding anything is erased with it.
+
+Three of the four interface rebuild points, and the activation reads behind
+them, are therefore no longer region candidates: encoding a pair that is
+already a pair would put it out of reach of direct absorption. The fourth, the
+caller's `join`, deliberately stays a candidate, because its result is the
+plaintext value the application itself consumes and encoding it as an ordinary
+node is exactly right.
+
+Absorption is published per function only after the connected planner keeps the
+transformed body, so a growth rollback cannot leave absorbed pairs credited to
+an interface whose regions were undone.
+
+What this does **not** do: the caller's `join` is not absorbed in the §8 sense,
+and an argument expression that is not itself a selected node still reaches its
+call site through a plaintext split. Both show up as the gap between the
+supplied and absorbed counts below, at O2 in particular.
+
+Two interactions are worth recording because they bound what this feature can
+cover today:
+
+- **Function merging competes for the same functions and runs first.**
+  `fmerge` is part of the default native profile and absorbs every private
+  helper of 4..2000 instructions into `__obf_merged__auto*` super-functions
+  before this pass sees them. Those super-functions take their arguments as
+  `i64`, which erases the per-width interface, and they are routinely mutually
+  recursive once the original call graph crosses a chunk boundary in both
+  directions, which this pass then skips as `recursive`. On the fixture below
+  with merging left on, the encoded-call coverage is exactly zero and every row
+  is an honest skip. The coverage runs therefore use `--no-merge`; this is a
+  real ordering conflict between two features, not a property of either one.
+- **Stock O2 may inline a private encoded interface and fold the pair away.**
+  The post-O2 arm is a correctness check here. Nothing in these runs measures
+  how much of the pair interface survives normalization, and nothing below
+  should be cited as if it did.
+
+### Evidence
+
+LLVM 22.1.8 in `sre-obf-dev:llvm22`, 593 vectors per arm, clean/native/
+stock-post-O2 arms that must agree, and a fresh output directory with its own
+manifest and sealed plugin copy per run. Ghidra was not configured for any of
+these runs, so no decompiler statement is made about any of them.
+
+#### The pair interface alone
+
+Plugin `a64264b14d3f19f134cdbc9057e989ae78d93af300380a76cb9cbb833f63e4de`, the
+committed transform before any absorption existed. On the coverage fixture at
+O0 it encodes six interfaces, rewrites 16 call sites, and moves 30 argument
+pairs and 14 result pairs across private call boundaries, absorbing **none** of
+them: `out/C-calls-o0-s3`, `out/C-calls-o0-s4-threads`,
+`out/C-calls-o2-s3-threads` and `out/C-calls-o2-s4` all pass their differential
+and coverage gates with `absorbed_arguments` and `absorbed_results` at zero.
+These are the moved-decode control. Their connected planner still reports 158
+boundary inputs and 102 boundary outputs for the O0 build.
+
+#### With connected absorption
+
+Plugin `f59a9fbf54ef5216f6675962630095682a75634b419716bcc56aa4608cf12bcf`.
+
+- `out/C3-flagoff-o0-s3`: the existing O0 connected command with the experiment
+  off. Its protected module hashes
+  `0e378f373e7e506737e1d1372b9c39ef361e3c7d1a4d3039e5f3b61232fdd055`, identical
+  to `out/C-baseline-o0-s3` built from `49d9b0e` before this work and to the
+  sealed `out/v03-family-transfer-o0-s3` module recorded above. Both halves of
+  this feature are a no-op when the flag is off.
+- `out/C3-kernel-o0-s3`: the standard connected fixture and the existing O0
+  command with `--encoded-calls` added. All three arms agree, there are no
+  planning violations, and the required memory and predicate coverage still
+  pass. Encoded-call coverage is **zero**: both definitions in that fixture are
+  exported, so both rows are `exported-or-address-taken`. This is a
+  no-regression run, not coverage.
+- `out/C3-kernel-o2-s4-shards`: the same fixture at frontend O2, seed 4, with
+  `--connected-shards`, which is how this ledger's own optimized evidence is
+  produced. Six shards select 124 nodes with 66 direct cross-family
+  conversions, and the required predicate, family-conversion and shard gates
+  pass with the experiment on. `out/C-kernel-o2-s4`, the same run without
+  shards, is correct in all three arms but selects no component at all: that is
+  the 212-node oversized component recorded above, not anything this pass does.
+- `conformance/fixtures/encoded_calls.c` is the coverage fixture: private
+  helpers at 8/16/32/64 bits and one void-returning helper, each reached from
+  more than one caller, plus the three negative cases. At O0
+  (`out/C3-calls-o0-s3`, and `out/C3-calls-o0-s4-threads` at a second seed) it
+  encodes **six** interfaces across widths 8, 16, 32 and 64, rewrites 16 call
+  sites through 7 per-activation allocas, retains no wrapper, and moves 30
+  argument pairs and 14 result pairs. **All 11 parameter reconstructions and
+  all 35 supplied pairs are absorbed**: every parameter of every encoded
+  interface is consumed as a pair, and every caller-side argument split and
+  callee-side result rebuild hands a region's own pair straight to the
+  interface. Boundary inputs fall from 158 to 66 and boundary outputs from 102
+  to 32 against the unabsorbed control on the same command; part of that drop
+  is absorption and part is interface plumbing no longer being selected as
+  region nodes, so the absorbed counters, not the boundary counters, are the
+  measurement. Required memory, predicate, encoded-call and encoded-width
+  coverage all pass.
+- At frontend O2 (`out/C3-calls-o2-s3-threads`, `out/C3-calls-o2-s4`) the same
+  six interfaces move 46 argument pairs and 23 result pairs across 23 call
+  sites, and absorption is **partial and reported as such**: 10 of 12 parameter
+  reconstructions and 20 of 52 supplied pairs. An argument expression that is
+  not itself a selected region node still reaches its call site as a plaintext
+  split, and O2 leaves more such expressions. The O2 runs do not require memory
+  coverage: frontend O2 promotes the fixture's local array, exactly as it does
+  for the transfer fixture above, so there is no eligible closed object.
+- Frontend O2 also changes which negatives exist, and the report says so rather
+  than smoothing it over: `climb` stops being recursive because LLVM rewrites
+  its accumulator recursion as a loop, so it becomes eligible, and `tap`
+  disappears entirely because its only effect is a relaxed store to an internal
+  atomic nothing reads. The void-return interface is therefore covered at O0
+  only. The skip reasons the fixture actually produced are
+  `exported-or-address-taken` (4 or 5, including both entry points),
+  `recursive` (1, at O0) and `varargs` (1). The remaining six vocabulary
+  entries are implemented and unit-tested but not exercised by this fixture.
+- `out/C3-calls-o0-s4-threads` and `out/C3-calls-o2-s3-threads` drive the same
+  protected module from four concurrent callers over the same 593 vectors, in
+  the pattern of `driver_threads.c`. Per-activation interface state is a stack
+  alloca, so the threaded arms must and do print exactly what the
+  single-threaded arms print.
+- Growth on the coverage fixture, under the same explicit 600,000-instruction
+  module cap: 272,852 final instructions with the experiment off, 276,405 with
+  the unabsorbed transform, and 273,787 with absorption — the absorbed build
+  costs about 0.3% over the unprotected-by-this-feature build, because the
+  boundary work it removes nearly pays for the pairs it adds. At O2 seed 4 the
+  same comparison is 259,033 unabsorbed against 220,628 absorbed. The module
+  cap is raised for this fixture only because ten private definitions each
+  saturate the ordinary 30,000-instruction per-function budget; no eligibility
+  test, coverage gate or protection limit was changed.
+- `out/C3-calls-o0-s3-repeat`: the same command on the same plugin a second
+  time produces a byte-identical protected module,
+  `ae72818a48bc8251bad620339ad533732a1849f2e86ad4651c955be370f0cee1`. Neither
+  the interface nor its absorption lets use-list or pointer order reach the
+  output: call sites are collected in caller-symbol order and then in
+  instruction order, and every mask is keyed by interface, role, host, site and
+  argument index.
+- The Python unit suite is 67 tests.
+
+The coverage runs use `--no-disassembly`: this fixture keeps ten private
+definitions alive and its per-arm disassembly exceeds the harness's 16 MiB
+tool-output limit. The differential, the coverage gates and the post-O2 attack
+are unaffected; only the ELF disassembly artifact is not retained. For the same
+reason the fixture is driven by `conformance/whole.py` rather than registered
+as a `conformance/run.py` case, whose per-arm driver always disassembles.
+
+A pre-existing harness bug surfaced here and is fixed rather than worked
+around: `connected_check.invariants()` read planning accounting from every
+connected row, but a function the planner never analyzed — a varargs helper
+reaches it as `structure-or-size` — carries none. Such a row is now skipped
+like the rollback row it resembles. No fixture in the tree had previously put a
+varargs definition through a connected build.
 
 ## Next implementation batch
 

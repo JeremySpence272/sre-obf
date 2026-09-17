@@ -37,7 +37,7 @@ def function_row(**overrides):
     return row
 
 
-def native_report(schema="sre-native-v3", **overrides):
+def native_report(schema="sre-native-v4", **overrides):
     return {"schema": schema, "connected_regions": [function_row(**overrides)],
             "flattening_state": [],
             "input_inventory": {"definitions": 1, "instructions": 10, "functions": []},

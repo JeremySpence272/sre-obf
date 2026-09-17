@@ -17,8 +17,8 @@ from conformance.run import ROOT
 
 # Reports that actually emit connected planning denominators. An older report
 # leaves them unknown, and unknown is never zero.
-MEMORY_DENOMINATORS = ("sre-native-v2", "sre-native-v3")
-SHARD_ACCOUNTING = ("sre-native-v3",)
+MEMORY_DENOMINATORS = ("sre-native-v2", "sre-native-v3", "sre-native-v4")
+SHARD_ACCOUNTING = ("sre-native-v3", "sre-native-v4")
 
 
 def coverage_passes(measured, require_flattening=False, require_memory=False, require_shards=False,

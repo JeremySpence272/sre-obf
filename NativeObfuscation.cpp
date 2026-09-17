@@ -3,6 +3,7 @@
 #include "llvm/Transforms/Obfuscator/NativeRegions.h"
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
+#include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/NativeBudget.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
@@ -70,6 +71,8 @@ cl::opt<bool> NativeJointOutputs("native-joint-outputs",
 cl::opt<bool> NativeMemorySSA("native-memory-ssa", cl::desc("Connected memory and SSA lanes without per-load decoding"), cl::init(false));
 cl::opt<bool> NativePredicateRegions("native-predicate-regions", cl::desc("Connected bit-vector comparisons and Boolean uses"), cl::init(false));
 cl::opt<bool> NativeRegionalFamilies("native-regional-families", cl::desc("Seeded XOR/additive families for whole supported components"), cl::init(false));
+cl::opt<bool> NativeEncodedCalls("native-encoded-calls",
+    cl::desc("Private encoded-call interfaces: integer arguments and results cross a private call as (E, R) pairs"), cl::init(false));
 cl::opt<bool> NativeSupportRegions("native-support-regions", cl::desc("Absorb bounded generated data decoders before region planning"), cl::init(false));
 cl::opt<std::string> NativeStageDir("native-stage-dir", cl::desc("Private directory for pre-driver and post-driver IR snapshots"), cl::init(""));
 cl::opt<unsigned> NativeModuleInsts("native-module-insts", cl::desc("Explicit module IR instruction cap (10000..5000000)"), cl::init(250000));
@@ -200,8 +203,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
     report_fatal_error("connected regions require native-values and native-values-wide");
   if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions ||
-       NativeConnectedShards || NativeConnectedAggregates || NativeJointOutputs) &&
-      NativeRegionPlan != "connected")
+       NativeConnectedShards || NativeConnectedAggregates || NativeJointOutputs ||
+       NativeEncodedCalls) && NativeRegionPlan != "connected")
     report_fatal_error("connected subfeatures require native-region-plan=connected");
   if (NativeMemorySSA && !NativeMemory) report_fatal_error("native-memory-ssa requires native-memory");
   if (NativeConnectedAggregates && !NativeMemorySSA)
@@ -301,6 +304,25 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   if (NativeSupportRegions) SupportCoverage = obf::absorbNativeSupport(M);
   if (NativeOutline)
     OutlineCoverage = obf::outlineNativeRegions(M, PreparedCache.ModuleSeed);
+  json::Array CallCoverage;
+  if (NativeEncodedCalls) {
+    obf::NativeCallOptions Options;
+    CallCoverage = obf::encodeNativeCalls(M, PreparedCache.ModuleSeed, Options);
+    // Encoding replaces a private definition with its pair-interface twin, so
+    // the parsed per-function configuration is rebuilt by identity before any
+    // later stage looks a function up. Erased originals must not leave a stale
+    // key behind for a future allocation to inherit.
+    PreparedCache.PerFunction.clear();
+    for (Function &F : M)
+      if (F.hasFnAttribute("sre.native.original"))
+        PreparedCache.PerFunction[&F] = AnnotationParser::parseAnnotationString(
+            F.getFnAttribute("sre.native.spec").getValueAsString().str());
+    AM.invalidate(M, PreservedAnalyses::none());
+    if (verifyModule(M, &errs())) report_fatal_error("native encoded calls produced invalid IR");
+    checkModuleBudget(M, "after-encoded-calls");
+  }
+  // Collected after the encoded-call twins exist: an erased original must
+  // never reach a later stage as a dangling weight.
   SmallVector<std::pair<Function *, unsigned>, 64> SourceWeights;
   for (Function &F : M)
     if (F.hasFnAttribute("sre.native.original"))
@@ -323,7 +345,12 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       Options.BoundedGrowth = true;
       Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
     }
-    ConnectedCoverage = obf::encodeNativeConnected(M, PreparedCache.ModuleSeed, Options);
+    StringMap<obf::NativeCallAbsorption> Absorbed;
+    ConnectedCoverage = obf::encodeNativeConnected(M, PreparedCache.ModuleSeed, Options,
+                                                   NativeEncodedCalls ? &Absorbed : nullptr);
+    // Pairs the region planner consumed without a scalar decode belong in the
+    // interface rows that carry them, not in a separate total nobody reads.
+    obf::recordNativeCallAbsorption(CallCoverage, Absorbed);
   } else if (NativeValues)
     ValueCoverage = obf::encodeNativeValues(M, PreparedCache.ModuleSeed, NativeValueNodes, NativeCoupledState, NativeWide, NativeInvariant);
   if (NativeMemory && !NativeMemorySSA) MemoryCoverage = obf::encodeNativeMemory(M, PreparedCache.ModuleSeed);
@@ -551,7 +578,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     std::error_code EC;
     raw_fd_ostream OS(NativeReport, EC, sys::fs::OF_Text);
     if (EC) report_fatal_error(Twine("native report: ") + EC.message());
-    json::Object Result{{"schema", "sre-native-v3"},
+    json::Object Result{{"schema", "sre-native-v4"},
                         {"profile", "native-" + NativeLevel.getValue() + "-ir"},
                         {"seed", std::to_string(static_cast<uint64_t>(ObfSeed))},
                         {"vm", false}, {"injected_assembly", false},
@@ -575,6 +602,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"connected_aggregates", NativeConnectedAggregates.getValue()},
                             {"joint_outputs", NativeJointOutputs.getValue()},
                             {"lane_transitions", obf::nativeLaneTransitions()},
+                            {"encoded_calls", NativeEncodedCalls.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
                         {"fused_calls", std::move(FusionCoverage)}, {"memory", std::move(MemoryCoverage)},
@@ -586,6 +614,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"helpers", std::move(HelperCoverage)},
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
+    Result["encoded_calls"] = std::move(CallCoverage);
     Result["input_inventory"] = std::move(InputInventory);
     Result["growth_allocations"] = std::move(GrowthCoverage);
     Result["structural_allocations"] = std::move(StructuralCoverage);

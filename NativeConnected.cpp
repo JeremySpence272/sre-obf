@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
+#include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
@@ -147,6 +148,10 @@ class Encoder {
   DenseMap<LoadInst *, unsigned> MemoryLoads;
   SmallPtrSet<StoreInst *, 32> MemoryStores;
   AllocaInst *Context = nullptr, *Witness = nullptr;
+  // Encoded-call pairs this function consumed without a scalar decode, keyed
+  // by the interface that owns them. Published only if the function survives.
+  StringMap<NativeCallAbsorption> Absorbed;
+  SmallPtrSet<Instruction *, 8> AbsorbedParameters;
   unsigned Inputs = 0, Outputs = 0, Predicates = 0, MultiplyBridges = 0;
   unsigned MemoryEdges = 0, PersistentEdges = 0, SkippedComponents = 0, Site = 0, Copies = 0, EligibleNodes = 0;
   unsigned EligibleMemoryEdges = 0, PhiPairs = 0;
@@ -293,12 +298,29 @@ class Encoder {
       return convertFamily(B, emit(I), Regions[Source].Affine,
                            Regions[RegionID].Affine);
     }
+    // A rebuilt encoded-call parameter is already a pair: consume its two
+    // operands directly instead of freezing the plaintext into a fresh
+    // boundary pair. The reconstruction itself is erased once nothing else
+    // needs the plaintext.
+    if (auto *I = dyn_cast<Instruction>(V); I && I->getMetadata("sre.native.call.arg")) {
+      if (AbsorbedParameters.insert(I).second)
+        ++Absorbed[F.getName()].Arguments;
+      return convertFamily(B, Pair{I->getOperand(0), I->getOperand(1)}, false,
+                           Regions[RegionID].Affine);
+    }
     ++Inputs;
     Value *X = B.CreateFreeze(V);
     Value *R = B.CreateXor(rotate(B, X, 3), constant(V->getType(), RNG.fork(Site++).u64()));
     return {Regions[RegionID].Affine ? B.CreateAdd(X, R) : B.CreateXor(X, R), R};
   }
   bool candidate(const Instruction &I) {
+    // Encoded-call plumbing already holds a pair, or hides one coordinate of
+    // it. Encoding it would encode an encoding and would put the pair out of
+    // reach of direct absorption. The join xor is deliberately not listed: its
+    // result is the plaintext value the application itself consumes.
+    for (StringRef Tag : {"sre.native.call.arg", "sre.native.call.split",
+                          "sre.native.call.result", "sre.native.call.state"})
+      if (I.getMetadata(Tag)) return false;
     if (auto *L = dyn_cast<LoadInst>(&I)) return MemoryLoads.count(const_cast<LoadInst *>(L));
     if (auto *C = dyn_cast<ICmpInst>(&I))
       return O.Predicates && width(C->getOperand(0)->getType(), true);
@@ -840,6 +862,15 @@ class Encoder {
   }
 
 public:
+  // Absorption is published only once the caller keeps the transformed body:
+  // a rolled-back function absorbed nothing.
+  void publish(StringMap<NativeCallAbsorption> &Out) const {
+    for (const auto &Entry : Absorbed) {
+      auto &Total = Out[Entry.first()];
+      Total.Arguments += Entry.second.Arguments;
+      Total.Results += Entry.second.Results;
+    }
+  }
   Encoder(Function &F, uint64_t Seed, NativeConnectedOptions O)
       : F(F), O(O), RNG(Rng(Seed).fork("native-connected-v1").fork(F.getName())) { plan(); }
   // Exact planning accounting: eligible = selected + skipped + shard loss.
@@ -942,6 +973,55 @@ public:
         E->setAlignment(S->getAlign()); R->setAlignment(S->getAlign()); E->setVolatile(true); R->setVolatile(true);
       }
     }
+    // Supply an encoded pair straight to an encoded-call interface instead of
+    // decoding it at the boundary. The split/result xor and the activation
+    // mask it hides behind are used only by each other and by the call or the
+    // returned struct, so replacing both coordinates leaves the interface
+    // reading this region's own pair. Collect first: this erases users.
+    SmallVector<Instruction *, 8> Supplied;
+    SmallPtrSet<Instruction *, 8> Listed;
+    for (Instruction *I : Nodes)
+      for (User *U : I->users())
+        if (auto *X = dyn_cast<Instruction>(U);
+            X && X->getOpcode() == Instruction::Xor && X->getOperand(0) == I &&
+            (X->getMetadata("sre.native.call.split") || X->getMetadata("sre.native.call.result")))
+          if (Listed.insert(X).second) Supplied.push_back(X);
+    for (Instruction *X : Supplied) {
+      auto *I = cast<Instruction>(X->getOperand(0));
+      auto *Mask = dyn_cast<Instruction>(X->getOperand(1));
+      // The interface this pair belongs to: a result stays in its own callee,
+      // a split names the callee of the site it feeds. Anything else is not
+      // the structure NativeCall builds, and is left to decode.
+      StringRef Owner = F.getName();
+      if (X->getMetadata("sre.native.call.split")) {
+        Owner = StringRef();
+        for (User *Consumer : X->users())
+          if (auto *C = dyn_cast<CallInst>(Consumer))
+            if (Function *G = C->getCalledFunction()) Owner = G->getName();
+      }
+      // Both coordinates have to move together, so the mask must be the
+      // private activation read this pair hides behind and nothing else: one
+      // use here and one in the call or the returned struct.
+      if (!Mask || Owner.empty() || RegionOf.count(Mask) || !Mask->hasNUses(2)) continue;
+      IRBuilder<> B(X);
+      Pair P = convertFamily(B, Encoded.lookup(I), Regions[RegionOf.lookup(I)].Affine, false);
+      X->replaceAllUsesWith(P.E);
+      X->eraseFromParent();
+      Mask->replaceAllUsesWith(P.R);
+      // The activation read existed only to hide the coordinate this region
+      // just supplied; a reconstruction with no users must not survive.
+      SmallVector<Instruction *, 4> Dead{Mask};
+      SmallPtrSet<Instruction *, 4> Gone;
+      while (!Dead.empty()) {
+        Instruction *D = Dead.pop_back_val();
+        if (Gone.count(D) || !D->use_empty() || D->isTerminator() || RegionOf.count(D)) continue;
+        for (Value *Op : D->operands())
+          if (auto *Prior = dyn_cast<Instruction>(Op)) Dead.push_back(Prior);
+        Gone.insert(D);
+        D->eraseFromParent();
+      }
+      ++Absorbed[Owner].Results;
+    }
     // Capture AFTER emitting memory GEPs: their new scalar index uses must
     // also receive an explicit address boundary before originals are erased.
     SmallVector<Use *, 64> Exits;
@@ -992,6 +1072,10 @@ public:
     for (StoreInst *S : MemoryStores) S->eraseFromParent();
     for (Instruction *I : Nodes) I->dropAllReferences();
     for (Instruction *I : Nodes) I->eraseFromParent();
+    // Absorbed parameters are never region nodes, so they outlive the erase
+    // above. One whose every consumer was absorbed is a plaintext parameter
+    // kept alive for nothing.
+    for (Instruction *I : AbsorbedParameters) if (I->use_empty()) I->eraseFromParent();
     for (Object &Obj : Objects) if (!Obj.EP.empty()) {
       for (Instruction *I : Obj.Lifetimes) I->eraseFromParent();
       for (auto *G : llvm::reverse(Obj.GEPs)) if (G->use_empty()) G->eraseFromParent();
@@ -1015,7 +1099,8 @@ public:
 };
 }
 
-json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnectedOptions &O) {
+json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnectedOptions &O,
+                                  StringMap<NativeCallAbsorption> *Absorbed) {
   json::Array Report;
   SmallVector<Function *, 64> Work;
   uint64_t Weight = 0;
@@ -1033,7 +1118,8 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
     unsigned Before = F->getInstructionCount();
     std::unique_ptr<FunctionSnapshot> Snapshot;
     if (O.BoundedGrowth) Snapshot = std::make_unique<FunctionSnapshot>(*F);
-    auto Item = Encoder(*F, Seed, Local).run();
+    Encoder Encode(*F, Seed, Local);
+    auto Item = Encode.run();
     unsigned After = F->getInstructionCount();
     if (Snapshot && After > uint64_t(Before) + Local.GrowthBudget) {
       // Connected encoding creates only local instructions/allocas, no module
@@ -1060,7 +1146,8 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
       if (auto *Value = Item.get("selected_estimated_cost"))
         Rolled["attempted_estimated_cost"] = std::move(*Value);
       Item = std::move(Rolled);
-    }
+    } else if (Absorbed)
+      Encode.publish(*Absorbed);
     Snapshot.reset();
     Item["instructions_before"] = Before;
     Item["instructions_after"] = F->getInstructionCount();

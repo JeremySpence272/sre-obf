@@ -125,7 +125,7 @@ class ArmReportTests(unittest.TestCase):
 
 class LaneCoverageTests(unittest.TestCase):
     def report(self, rows, lane=1):
-        return {"schema": "sre-native-v3", "features": {"lane_transitions": lane},
+        return {"schema": "sre-native-v4", "features": {"lane_transitions": lane},
                 "flattening_state": rows}
 
     def test_denominator_counts_only_couplable_functions(self):

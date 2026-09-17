@@ -15,6 +15,9 @@ from .process import Runner, ToolFailure, digest, dump
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "conformance" / "fixtures"
+# encoded_calls is deliberately not a case here: its fixture keeps ten private
+# definitions alive, and this driver always disassembles every arm, which
+# exceeds the 16 MiB tool-output limit. conformance/whole.py drives it instead.
 CASES = ("arithmetic", "data", "widths", "constructors", "merging", "strings",
          "literal", "foldable", "state", "values", "wide")
 
@@ -106,7 +109,7 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             *(f"-native-{name.replace('_', '-')}={int(getattr(args, name, False))}"
               for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions", "scale_budget",
                            "scale_structure", "connected_shards", "connected_aggregates",
-                           "joint_outputs")),
+                           "joint_outputs", "encoded_calls")),
             f"-native-lane-transitions={LANE_TRANSITIONS[getattr(args, 'lane_transitions', 'off')]}",
             f"-native-family={args.family}"]
 
@@ -375,7 +378,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--connected-nodes", type=int, default=128)
     for name in ("memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget",
                  "scale-structure", "connected-shards", "connected-aggregates",
-                 "joint-outputs"):
+                 "joint-outputs", "encoded-calls"):
         p.add_argument("--" + name, action="store_true")
     p.add_argument("--lane-transitions", choices=tuple(LANE_TRANSITIONS), default="off",
                    help="P6: key dispatcher transitions on the live encoded-data word")
@@ -414,8 +417,8 @@ def main(argv=None) -> int:
     if args.region_plan == "connected" and not (args.values and args.values_wide):
         raise SystemExit("connected regions require --values --values-wide")
     if (any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
-             args.scale_budget, args.connected_shards, args.connected_aggregates, args.joint_outputs))
-            or args.lane_transitions != "off") and args.region_plan != "connected":
+             args.scale_budget, args.connected_shards, args.connected_aggregates, args.joint_outputs,
+             args.encoded_calls)) or args.lane_transitions != "off") and args.region_plan != "connected":
         raise SystemExit("connected subfeatures require --region-plan connected")
     if args.memory_ssa and not args.memory:
         raise SystemExit("--memory-ssa requires --memory")
