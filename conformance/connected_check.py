@@ -6,6 +6,91 @@ from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, test_inputs
 
 SHARD_ACCOUNTING = ("sre-native-v3",)
+# The fixed skip vocabulary of the encoded-call interface pass. A row with any
+# other reason is a reporting bug, not coverage.
+CALL_SKIPS = ("not-original", "exported-or-address-taken", "varargs", "eh-or-personality",
+              "recursive", "unsupported-signature", "unsupported-call-site", "function-budget",
+              "no-callers")
+
+
+def call_violations(report):
+    """Encoded-call rows checked against themselves, as explicit strings.
+
+    A row that claims an encoded interface carrying no pair, keeps a plaintext
+    wrapper, uses a reason outside the fixed vocabulary, or reports more
+    absorbed pairs than its interface has, fails the gate instead of being read
+    as protection.
+    """
+    rows = report.get("encoded_calls")
+    if rows is None:
+        return []
+    violations = []
+    for row in rows:
+        where = row["function"]
+        if row["status"] == "encoded":
+            if row["reason"]:
+                violations.append(f"{where}: encoded row carries the skip reason {row['reason']!r}")
+            if row["encoded_parameters"] + int(row["returns_pair"]) == 0:
+                violations.append(f"{where}: encoded interface carries no pair")
+            if row["encoded_parameters"] != row["parameters"]:
+                violations.append(f"{where}: {row['parameters']} parameters but "
+                                  f"{row['encoded_parameters']} encoded")
+            if not row["call_sites_rewritten"]:
+                violations.append(f"{where}: encoded interface rewrote no call site")
+            if row["wrapper_retained"]:
+                violations.append(f"{where}: a duplicate plaintext wrapper was retained")
+            if row["representation"] != "xor-pair-v1":
+                violations.append(f"{where}: unexpected representation {row['representation']!r}")
+            if row["absorbed_arguments"] > row["encoded_parameters"]:
+                violations.append(f"{where}: more absorbed argument pairs than parameters")
+        else:
+            if row["reason"] not in CALL_SKIPS:
+                violations.append(f"{where}: skip reason {row['reason']!r} is outside the vocabulary")
+            if any(row[field] for field in ("encoded_parameters", "call_sites_rewritten",
+                                            "activation_allocas", "absorbed_arguments",
+                                            "absorbed_results")) or row["returns_pair"]:
+                violations.append(f"{where}: a skipped interface reported encoded work")
+    return violations
+
+
+def call_coverage(report):
+    """Pairs that actually cross a private call boundary, and what became of them.
+
+    A report without the array has an unknown denominator, never zero. Moved
+    pairs are pairs the interface carries; absorbed pairs are the subset a
+    later pass consumed without a scalar decode.
+    """
+    rows = report.get("encoded_calls")
+    if rows is None:
+        return {key: None for key in
+                ("encoded_interfaces", "encoded_widths", "call_sites_rewritten",
+                 "argument_pairs_moved", "result_pairs_moved", "absorbed_arguments",
+                 "absorbed_results", "activation_allocas", "wrappers_retained", "skips")}
+    encoded = [row for row in rows if row["status"] == "encoded"]
+    skips = {}
+    for row in rows:
+        if row["status"] != "encoded":
+            skips[row["reason"]] = skips.get(row["reason"], 0) + 1
+    return {"encoded_interfaces": len(encoded),
+            "encoded_widths": sorted({w for row in encoded for w in row["widths"]}),
+            "call_sites_rewritten": sum(row["call_sites_rewritten"] for row in encoded),
+            "argument_pairs_moved": sum(row["encoded_parameters"] * row["call_sites_rewritten"]
+                                        for row in encoded),
+            "result_pairs_moved": sum(row["call_sites_rewritten"] for row in encoded
+                                      if row["returns_pair"]),
+            "absorbed_arguments": sum(row["absorbed_arguments"] for row in encoded),
+            "absorbed_results": sum(row["absorbed_results"] for row in encoded),
+            "activation_allocas": sum(row["activation_allocas"] for row in encoded),
+            "wrappers_retained": sum(int(row["wrapper_retained"]) for row in rows),
+            "skips": skips}
+
+
+def call_coverage_passes(coverage, require_widths=False):
+    if not coverage["encoded_interfaces"]:
+        return False
+    if not coverage["argument_pairs_moved"] and not coverage["result_pairs_moved"]:
+        return False
+    return not require_widths or {8, 16, 32, 64}.issubset(set(coverage["encoded_widths"]))
 
 
 def invariants(report):
@@ -20,7 +105,11 @@ def invariants(report):
     violations = []
     for row in report["connected_regions"]:
         where = row["function"]
-        if row["status"] != "encoded" and row.get("reason") == "connected-growth-rollback":
+        # A function the planner rolled back, or never analyzed at all, carries
+        # no planning accounting to check against itself. Both are reported
+        # skips; neither is unchecked coverage.
+        if row["status"] != "encoded" and row.get("reason") in (
+                "connected-growth-rollback", "structure-or-size"):
             continue
         eligible = row["eligible_estimated_cost"]
         parts = row["selected_estimated_cost"] + row["skipped_estimated_cost"] + row["shard_lost_estimated_cost"]
@@ -58,6 +147,10 @@ def main():
     p.add_argument("--require-family-conversions", action="store_true")
     p.add_argument("--require-shards", action="store_true",
                    help="require at least one oversized component actually partitioned into selected shards")
+    p.add_argument("--require-encoded-calls", action="store_true",
+                   help="require at least one private interface whose arguments or results genuinely cross as pairs")
+    p.add_argument("--require-encoded-widths", action="store_true",
+                   help="require encoded private interfaces at all of 8, 16, 32 and 64 bits")
     args = p.parse_args()
     out = args.build.resolve()
     manifest = json.loads((out / "manifest.json").read_text())
@@ -87,12 +180,16 @@ def main():
                 "selected_estimated_cost": sum(row.get("selected_estimated_cost", 0) for row in planned),
                 "skipped_estimated_cost": sum(row.get("skipped_estimated_cost", 0) for row in planned),
                 "shard_lost_estimated_cost": sum(row.get("shard_lost_estimated_cost", 0) for row in planned)}
-    violations = invariants(report)
+    calls = call_coverage(report)
+    coverage["encoded_calls"] = calls
+    violations = invariants(report) + call_violations(report)
     correct = len(values["clean"].splitlines()) == 593 and all(value == values["clean"] for value in values.values())
     passed = (correct and not violations and coverage["regions"] and (not args.require_memory or coverage["memory"])
               and (not args.require_predicates or coverage["predicates"])
               and (not args.require_family_conversions or coverage["family_conversions"] > 0)
-              and (not args.require_shards or coverage["shards"] > 0))
+              and (not args.require_shards or coverage["shards"] > 0)
+              and (not (args.require_encoded_calls or args.require_encoded_widths)
+                   or call_coverage_passes(calls, args.require_encoded_widths)))
     result = {"passed": passed, "correctness": correct, "vectors": 593, "coverage": coverage,
               "planning_violations": violations, "report_schema": report["schema"],
               "manifest_sha256": digest(out / "manifest.json"), "commands": runner.records}

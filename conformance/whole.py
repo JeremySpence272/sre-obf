@@ -12,7 +12,7 @@ from conformance.run import ROOT, image_identity, opt_command
 
 EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "invariant", "outline",
                "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure",
-               "connected-shards")
+               "connected-shards", "encoded-calls")
 
 
 def parser():
@@ -31,6 +31,9 @@ def parser():
     p.add_argument("--link-flag", action="append", default=[])
     for name in EXPERIMENTS:
         p.add_argument("--" + name, action="store_true")
+    p.add_argument("--no-merge", action="store_true",
+                   help="disable bounded internal function merging; it runs first and absorbs the private "
+                        "helpers a private-interface experiment targets")
     p.add_argument("--value-nodes", type=int, default=24)
     p.add_argument("--region-plan", choices=("legacy", "connected"), default="legacy")
     p.add_argument("--connected-nodes", type=int, default=128)
@@ -59,7 +62,7 @@ def build(args):
     if args.region_plan == "connected" and not (args.values and args.values_wide):
         raise ValueError("connected regions require --values --values-wide")
     if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
-            args.scale_budget, args.connected_shards)) and args.region_plan != "connected":
+            args.scale_budget, args.connected_shards, args.encoded_calls)) and args.region_plan != "connected":
         raise ValueError("connected subfeatures require --region-plan connected")
     if args.memory_ssa and not args.memory:
         raise ValueError("--memory-ssa requires --memory")
@@ -110,7 +113,8 @@ def build(args):
                     "-S", str(linked), "-o", str(prepared)])
     protected = out / "protected.ll"
     feature_flags = [f"-native-{name}={int(getattr(args, name.replace('-', '_')))}" for name in EXPERIMENTS]
-    feature_flags += [f"-native-region-plan={args.region_plan}", f"-native-connected-nodes={args.connected_nodes}"]
+    feature_flags += [f"-native-region-plan={args.region_plan}", f"-native-connected-nodes={args.connected_nodes}",
+                      f"-native-merge={int(not args.no_merge)}"]
     if not args.control_only:
         runner.run(opt_command(plugin) + ["-passes=native-obfuscation", f"-native-level={args.profile}",
                 *feature_flags, f"-native-value-nodes={args.value_nodes}",
