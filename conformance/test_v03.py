@@ -2,6 +2,8 @@
 import unittest
 
 from conformance.connected_check import invariants
+from conformance.process import ToolFailure
+from conformance.run import check_value_coverage
 from conformance.scale import coverage, coverage_passes
 from conformance.whole import parser
 
@@ -27,6 +29,91 @@ def native_report(schema="sre-native-v3", **overrides):
             "flattening_state": [],
             "input_inventory": {"definitions": 1, "instructions": 10, "functions": []},
             "final_inventory": {"instructions": 10, "helper_instructions": 0}}
+
+
+def value_report(plan, rows):
+    """A native report carrying persistent-value evidence for one planner.
+
+    Rows are written only under the planner named by `plan`; the other array is
+    empty, exactly as the compiler leaves it.
+    """
+    arrays = {"values": [], "connected_regions": []}
+    arrays["connected_regions" if plan == "connected" else "values"] = rows
+    return {"features": {"region_plan": plan}, **arrays}
+
+
+def value_row(widths=(8, 16, 32, 64), phi_pairs=2, persistent_edges=7, **extra):
+    row = {"function": "obf_target", "status": "encoded", "widths": list(widths),
+           "phi_pairs": phi_pairs, "persistent_edges": persistent_edges}
+    row.update(extra)
+    return row
+
+
+class ValueWidthGateTests(unittest.TestCase):
+    """The values gate must read the planner that ran, and must still fail."""
+
+    def test_legacy_evidence_passes_with_all_four_widths(self):
+        check_value_coverage(value_report("legacy", [value_row()]))
+
+    def test_connected_evidence_passes_without_any_legacy_rows(self):
+        # The bug: under --region-plan connected the legacy "values" array is
+        # always empty, so the gate could never pass for any reason.
+        report = value_report("connected", [value_row(widths=(1, 8, 16, 32, 64))])
+        self.assertEqual(report["values"], [])
+        check_value_coverage(report)
+
+    def test_widths_split_across_functions_are_pooled(self):
+        rows = [value_row(widths=(8, 16), phi_pairs=0, persistent_edges=3),
+                value_row(widths=(32, 64))]
+        check_value_coverage(value_report("connected", rows))
+
+    def test_incomplete_width_coverage_still_fails(self):
+        for plan in ("legacy", "connected"):
+            for widths in ((8, 16, 32), (8,), (1, 8, 64), ()):
+                with self.subTest(plan=plan, widths=widths):
+                    with self.assertRaises(ToolFailure) as caught:
+                        check_value_coverage(value_report(plan, [value_row(widths=widths)]))
+                    self.assertIn("width coverage is incomplete", str(caught.exception))
+
+    def test_predicate_only_connected_coverage_fails(self):
+        # A tiny node cap can leave only i1 predicates encoded. That is real
+        # coverage, but it is not the required scalar width set.
+        with self.assertRaises(ToolFailure):
+            check_value_coverage(value_report("connected", [value_row(widths=(1,))]))
+
+    def test_the_other_planner_rows_are_not_borrowed(self):
+        rows = [value_row()]
+        borrowed = {"features": {"region_plan": "legacy"},
+                    "values": [], "connected_regions": rows}
+        with self.assertRaises(ToolFailure):
+            check_value_coverage(borrowed)
+
+    def test_skipped_and_rolled_back_rows_are_not_coverage(self):
+        rows = [{"function": "f", "status": "skipped", "reason": "connected-growth-rollback",
+                 "attempted_nodes": 40}]
+        with self.assertRaises(ToolFailure) as caught:
+            check_value_coverage(value_report("connected", rows))
+        self.assertIn("encoded no persistent values", str(caught.exception))
+
+    def test_a_planner_that_reports_no_widths_is_not_a_pass(self):
+        row = value_row()
+        del row["widths"]
+        with self.assertRaises(ToolFailure) as caught:
+            check_value_coverage(value_report("connected", [row]))
+        self.assertIn("did not report encoded widths", str(caught.exception))
+
+    def test_loop_join_coverage_is_required_of_both_planners(self):
+        for plan in ("legacy", "connected"):
+            with self.subTest(plan=plan):
+                with self.assertRaises(ToolFailure) as caught:
+                    check_value_coverage(value_report(plan, [value_row(phi_pairs=0)]))
+                self.assertIn("loop/join coverage is missing", str(caught.exception))
+                with self.assertRaises(ToolFailure):
+                    check_value_coverage(value_report(plan, [value_row(persistent_edges=0)]))
+
+    def test_an_unknown_region_plan_is_not_a_pass(self):
+        with self.assertRaises(ToolFailure):
+            check_value_coverage(value_report("someday", [value_row()]))
 
 
 class ShardOptInTests(unittest.TestCase):

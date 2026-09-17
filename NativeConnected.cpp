@@ -75,7 +75,7 @@ class Encoder {
   AllocaInst *Context = nullptr, *Witness = nullptr;
   unsigned Inputs = 0, Outputs = 0, Predicates = 0, MultiplyBridges = 0;
   unsigned MemoryEdges = 0, PersistentEdges = 0, SkippedComponents = 0, Site = 0, Copies = 0, EligibleNodes = 0;
-  unsigned EligibleMemoryEdges = 0;
+  unsigned EligibleMemoryEdges = 0, PhiPairs = 0;
   unsigned FamilyConversions = 0, MixedComponents = 0;
   unsigned OversizedComponents = 0, ShardedComponents = 0, SelectedShards = 0, ShardLostNodes = 0;
   unsigned EligibleCost = 0, SelectedCost = 0, SkippedCost = 0, ShardLostCost = 0;
@@ -564,9 +564,11 @@ public:
     prepareMemory();
     for (Instruction *I : Nodes) {
       for (Value *V : I->operands()) if (auto *P = dyn_cast<Instruction>(V); P && RegionOf.count(P)) ++PersistentEdges;
-      if (auto *P = dyn_cast<PHINode>(I))
+      if (auto *P = dyn_cast<PHINode>(I)) {
+        ++PhiPairs;
         Encoded[I] = {PHINode::Create(I->getType(), P->getNumIncomingValues(), "sre.connected.phi.e", I->getIterator()),
                       PHINode::Create(I->getType(), P->getNumIncomingValues(), "sre.connected.phi.r", I->getIterator())};
+      }
     }
     for (Instruction *I : Nodes) emit(I);
     for (Instruction *I : Nodes) if (auto *P = dyn_cast<PHINode>(I)) {
@@ -621,6 +623,18 @@ public:
     for (const Region &R : Regions) RegionReport.push_back(json::Object{{"id", R.ID}, {"component", R.Component},
         {"shard", R.Shard}, {"sharded", R.Sharded}, {"nodes", R.Nodes.size()},
         {"estimated_cost", R.Cost}, {"representation", R.Affine ? "additive-pair-v1" : "xor-prefix-pair-v1"}});
+    // Distinct integer widths this function actually encoded, ascending, read
+    // before the node instructions are erased. Connected regions also encode
+    // i1 branch predicates, so this set is not confined to the four scalar
+    // widths the legacy planner supports.
+    SmallVector<unsigned, 5> Widths;
+    for (Instruction *I : Nodes) {
+      unsigned W = I->getType()->getIntegerBitWidth();
+      if (!llvm::is_contained(Widths, W)) Widths.push_back(W);
+    }
+    llvm::sort(Widths);
+    json::Array WidthReport;
+    for (unsigned W : Widths) WidthReport.push_back(W);
     for (StoreInst *S : MemoryStores) S->eraseFromParent();
     for (Instruction *I : Nodes) I->dropAllReferences();
     for (Instruction *I : Nodes) I->eraseFromParent();
@@ -631,7 +645,8 @@ public:
     }
     F.setMemoryEffects(MemoryEffects::unknown()); F.removeFnAttr(Attribute::Speculatable);
     json::Object Item{{"function", F.getName().str()}, {"status", "encoded"}, {"nodes", Nodes.size()},
-        {"regions", std::move(RegionReport)},
+        {"regions", std::move(RegionReport)}, {"widths", std::move(WidthReport)},
+        {"phi_pairs", PhiPairs},
         {"persistent_edges", PersistentEdges}, {"memory_edges", MemoryEdges}, {"predicates", Predicates},
         {"family_conversions", FamilyConversions}, {"mixed_family_components", MixedComponents},
         {"boundary_inputs", Inputs}, {"boundary_outputs", Outputs}, {"multiply_decode_bridges", MultiplyBridges},
