@@ -4,7 +4,7 @@ import tempfile
 import unittest
 
 from conformance.connected_check import (CALL_SKIPS, call_coverage, call_coverage_passes,
-                                         call_violations, invariants)
+                                         call_violations, invariants, report_violations)
 from conformance.run import CASES, feature_flags
 from conformance.run import parser as case_parser
 from conformance.whole import EXPERIMENTS, build
@@ -155,6 +155,41 @@ class CoverageAccountingTests(unittest.TestCase):
         self.assertFalse(call_coverage_passes(narrow, require_widths=True))
         wide = call_coverage(report(call_row(widths=[8, 16]), call_row(widths=[32, 64])))
         self.assertTrue(call_coverage_passes(wide, require_widths=True))
+
+
+class ReviewInterfaceTests(unittest.TestCase):
+    def current(self, **overrides):
+        row = call_row(encoded_function="helper.sre.encoded.1", partially_absorbed_arguments=0)
+        row.update(overrides)
+        return {"schema": "sre-native-v5", "connected_regions": [], "encoded_calls": [row]}
+
+    def test_partial_and_complete_absorption_have_separate_counts(self):
+        report = self.current(absorbed_arguments=1, partially_absorbed_arguments=1)
+        self.assertEqual(report_violations(report), [])
+        measured = call_coverage(report)
+        self.assertEqual(measured["absorbed_arguments"], 1)
+        self.assertEqual(measured["partially_absorbed_arguments"], 1)
+
+    def test_partial_parameters_cannot_be_counted_again_as_complete(self):
+        self.assertTrue(report_violations(self.current(absorbed_arguments=2, partially_absorbed_arguments=1)))
+
+    def test_missing_actual_symbol_or_counts_is_a_report_failure(self):
+        for field in ("encoded_function", "partially_absorbed_arguments", "call_sites_rewritten"):
+            report = self.current()
+            del report["encoded_calls"][0][field]
+            self.assertTrue(report_violations(report))
+        self.assertTrue(report_violations(self.current(encoded_function="")))
+
+    def test_negative_counts_and_unknown_status_cannot_pass(self):
+        self.assertTrue(report_violations(self.current(absorbed_arguments=-1)))
+        self.assertTrue(report_violations(self.current(status="unknown")))
+
+    def test_feature_on_without_report_is_a_failure(self):
+        self.assertTrue(report_violations({"schema": "sre-native-v5", "connected_regions": [],
+                                          "features": {"encoded_calls": True}}))
+
+    def test_old_reports_leave_partial_absorption_unknown(self):
+        self.assertIsNone(call_coverage(report(call_row()))["partially_absorbed_arguments"])
 
 
 if __name__ == "__main__":

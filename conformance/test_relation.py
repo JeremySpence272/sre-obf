@@ -3,6 +3,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from conformance import state_model
 from conformance.connected_check import lane_coverage
@@ -71,6 +72,18 @@ class RelationSliceTests(unittest.TestCase):
     def test_module_splits_into_function_bodies(self):
         self.assertEqual([name for name, _ in functions(MODULE)], ["plain", "coupled"])
 
+    def test_select_and_phi_pointer_roots_include_every_alternative(self):
+        for expression in ("select i1 %c, ptr %a, ptr %b", "phi ptr [ %a, %left ], [ %b, %right ]"):
+            body = Body(["%a = alloca i32", "%b = alloca i32", "%p = " + expression,
+                         "%v = load i32, ptr %p"])
+            sliced = body.slice(["v"])
+            self.assertEqual(sliced["words"], {"a", "b"})
+            self.assertFalse(sliced["unresolved_pointers"])
+
+    def test_unknown_pointer_provenance_is_not_a_complete_slice(self):
+        body = Body(["%p = call ptr @unknown()", "%v = load i32, ptr %p"])
+        self.assertTrue(body.slice(["v"])["unresolved_pointers"])
+
     def test_data_tagged_stores_identify_the_encoded_data_word(self):
         self.assertEqual(data_context_words(MODULE), {"sre.value.context"})
 
@@ -96,6 +109,36 @@ class ArmReportTests(unittest.TestCase):
     def test_all_three_arms_are_reported(self):
         arms = self.report()["arms"]
         self.assertEqual(set(arms), {"supplied_relation", "inferred_relation", "canonical_repair"})
+
+    def test_truncated_slice_is_unknown_and_fails_the_measurement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            module, out = Path(directory) / "input.ll", Path(directory) / "result.json"
+            module.write_text(MODULE)
+            with patch.object(Body, "slice", return_value={"words": set(), "visited": 20001, "truncated": True}):
+                self.assertEqual(main([str(module), "--out", str(out), "--trials", "1"]), 1)
+            report = json.loads(out.read_text())
+            self.assertEqual(report["status"], "inconclusive")
+            self.assertIsNone(report["arms"]["canonical_repair"]["repairable"])
+            self.assertTrue(all(row["frozen_v02_relation_transfers"] is None for row in report["functions"]))
+
+    def test_data_names_are_scoped_to_each_function(self):
+        # The first function reads the same SSA name, but only the second
+        # function marks its own word as encoded-data state.
+        first, second = MODULE.split("define dso_local i32 @coupled", 1)
+        first = first.replace("%fla.multi.salt.load = load volatile i32, ptr %fla.multi.salt",
+                              "%fla.multi.salt.load = load volatile i32, ptr %sre.value.context")
+        first = "\n".join(line for line in first.splitlines() if "sre.native.context.update" not in line)
+        with tempfile.TemporaryDirectory() as directory:
+            module, out = Path(directory) / "input.ll", Path(directory) / "result.json"
+            module.write_text(first + "\ndefine dso_local i32 @coupled" + second)
+            self.assertEqual(main([str(module), "--out", str(out), "--trials", "1"]), 0)
+            rows = json.loads(out.read_text())["functions"]
+            self.assertEqual(rows[0]["encoded_data_words"], [])
+            self.assertEqual(rows[1]["encoded_data_words"], ["sre.value.context"])
+
+    def test_numeric_suffix_is_part_of_the_real_word_name(self):
+        text = MODULE.replace("sre.value.context", "sre.value.context12")
+        self.assertEqual(data_context_words(text), {"sre.value.context12"})
 
     def test_the_frozen_relation_transfers_only_where_no_data_word_is_read(self):
         report = self.report()

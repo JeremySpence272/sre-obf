@@ -925,6 +925,11 @@ only that the optimizer did not fold it. Coverage is not hardness.
 
 ## Next implementation batch
 
+The post-integration review repaired private-call eligibility and shard bounds.
+Native schema v5 distinguishes partial argument absorption and actual encoded
+symbol names; scale and fixture runs share the same report gate, and incomplete
+recovery slices are inconclusive.
+
 The private Sol control now reproduces exact recovery in 79.511 seconds with
 angr 10 on the retained compatible image. Solver and binary hashes are checked;
 only those two files enter its read-only container. The answer comes from the
@@ -936,18 +941,19 @@ informed positive control, not new-version discovery or original-run compliance.
    cap; retain uniform allocation as an ablation. Add eligible/selected memory
    and structural denominators, cost and source-weighted coverage, with explicit
    failure when a requested gate has no surviving transformation. Bounded
-   shards are implemented as described above; the remaining scale question is
-   whether they hold on unchanged large applications, which has not been run.
+   shards have now been tested on unchanged large applications as recorded
+   above; broader coverage and the trade-off with retained flattening remain.
 2. Sol recovery regressions: freeze the successful v02 scripts privately;
    separate informed entry/state assumptions from binary-only discovery. Test
    dispatcher inversion, canonical-state rebasing and XOR/additive projection;
    distinguish unchanged transfer, repair, and unsupported/inconclusive tools.
-3. P4 direct cross-family transfer is implemented as described above. Bounded
-   genuine joint-output coupling remains a separate ablation with an inverse
-   control, not an assumed hardness benefit.
-4. P5: bounded private encoded-call interfaces integrated with representations;
-   preserve exported ABI, recursion/reentry, threads, and effect exclusions.
-   Ordinary scalar helper wrappers are not encoded-ABI coverage.
+3. P4 direct cross-family transfer and bounded joint-output coupling are
+   implemented as separate ablations. Their inverse controls remain relevant;
+   measure transfer cost before any hardness promotion.
+4. P5 private encoded-call interfaces and connected absorption are implemented
+   for the documented narrow signatures. Resolve the merging-order policy,
+   broaden eligible effects only with tests, and retain explicit recursion
+   exclusions until recursive interfaces are supported.
 5. Dispatch/activation experiments: regional dispatch relations and useful
    data/control representation dependencies. Canonical control resets must be
    tested with real live lanes, not only a known-zero witness. Keep inference

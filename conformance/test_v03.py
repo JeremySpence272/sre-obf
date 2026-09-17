@@ -2,7 +2,8 @@
 import random
 import unittest
 
-from conformance.connected_check import invariants, joint_coverage, joint_invariants
+from conformance.connected_check import (invariants, joint_coverage, joint_invariants,
+                                         report_violations, cost_accounting)
 from conformance.connected_model import decode, joint_mix, joint_unmix
 from conformance.process import ToolFailure
 from conformance.run import check_value_coverage
@@ -168,6 +169,45 @@ class PlanningInvariantTests(unittest.TestCase):
     def test_consistent_report_has_no_violations(self):
         self.assertEqual(invariants(native_report()), [])
 
+    def test_missing_memory_fields_fail_without_crashing(self):
+        report = native_report()
+        del report["connected_regions"][0]["eligible_memory_objects"]
+        self.assertTrue(report_violations(report))
+
+    def test_negative_costs_cannot_cancel_in_the_accounting_identity(self):
+        self.assertTrue(report_violations(native_report(skipped_estimated_cost=-100,
+                                                       shard_lost_estimated_cost=400)))
+
+    def test_encoded_row_cannot_bypass_accounting_with_a_skip_reason(self):
+        self.assertTrue(report_violations(native_report(reason="structure-or-size",
+                                                       selected_estimated_cost=100000)))
+
+    def test_atomic_shard_ceiling_and_region_totals_are_checked(self):
+        report = native_report(schema="sre-native-v5")
+        row = report["connected_regions"][0]
+        for region in row["regions"]:
+            region["estimated_cost"] = 350
+        self.assertEqual(report_violations(report), [])
+        row["shard_estimated_cost_limit"] = 300
+        self.assertTrue(report_violations(report))
+        row["shard_estimated_cost_limit"] = 5000
+        row["regions"][0]["estimated_cost"] = 349
+        self.assertTrue(report_violations(report))
+
+    def test_both_gates_account_for_rolled_back_cost(self):
+        report = native_report()
+        report["connected_regions"].append({"function": "rolled", "status": "skipped",
+            "reason": "connected-growth-rollback", "eligible_estimated_cost": 900,
+            "attempted_estimated_cost": 300, "eligible_nodes": 6})
+        costs = cost_accounting(report)
+        self.assertEqual(costs["rollback_estimated_cost"], 900)
+        self.assertEqual(costs["eligible_estimated_cost"], sum(costs[key] for key in
+            ("selected_estimated_cost", "skipped_estimated_cost", "shard_lost_estimated_cost",
+             "rollback_estimated_cost")))
+        measured = coverage(report)
+        for key, value in costs.items():
+            self.assertEqual(measured["connected_" + key], value)
+
     def test_cost_must_account_for_every_eligible_node(self):
         self.assertTrue(invariants(native_report(shard_lost_estimated_cost=0)))
 
@@ -257,6 +297,11 @@ class JointOutputLawTests(unittest.TestCase):
 class JointOutputAccountingTests(unittest.TestCase):
     def test_consistent_joint_row_has_no_violations(self):
         self.assertEqual(joint_invariants(joint_row(), "f"), [])
+
+    def test_partial_joint_report_cannot_pass_by_omission(self):
+        row = joint_row()
+        del row["joint_output_groups"]
+        self.assertTrue(joint_invariants(row, "f"))
 
     def test_groups_cannot_exceed_half_the_candidates(self):
         self.assertTrue(joint_invariants(joint_row(joint_output_candidates=1), "f"))

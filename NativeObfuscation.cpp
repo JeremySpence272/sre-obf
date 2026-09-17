@@ -194,6 +194,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-region-plan must be legacy or connected");
   if (NativeConnectedNodes < 2 || NativeConnectedNodes > 512)
     report_fatal_error("native-connected-nodes must be 2..512");
+  if (obf::nativeLaneTransitions() > 2)
+    report_fatal_error("native-lane-transitions must be 0..2");
+  if (obf::nativeLaneTransitions() && !NativeCoupledState)
+    report_fatal_error("native-lane-transitions requires native-coupled-state");
   if (NativeModuleInsts < 10000 || NativeModuleInsts > 5000000)
     report_fatal_error("native-module-insts must be 10000..5000000");
   if (NativeScaleBudget && NativeRegionPlan != "connected")
@@ -578,7 +582,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     std::error_code EC;
     raw_fd_ostream OS(NativeReport, EC, sys::fs::OF_Text);
     if (EC) report_fatal_error(Twine("native report: ") + EC.message());
-    json::Object Result{{"schema", "sre-native-v4"},
+    json::Object Result{{"schema", "sre-native-v5"},
                         {"profile", "native-" + NativeLevel.getValue() + "-ir"},
                         {"seed", std::to_string(static_cast<uint64_t>(ObfSeed))},
                         {"vm", false}, {"injected_assembly", false},

@@ -5,12 +5,36 @@ from pathlib import Path
 from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, test_inputs
 
-SHARD_ACCOUNTING = ("sre-native-v3", "sre-native-v4")
+SHARD_ACCOUNTING = ("sre-native-v3", "sre-native-v4", "sre-native-v5")
 # The fixed skip vocabulary of the encoded-call interface pass. A row with any
 # other reason is a reporting bug, not coverage.
 CALL_SKIPS = ("not-original", "exported-or-address-taken", "varargs", "eh-or-personality",
               "recursive", "unsupported-signature", "unsupported-call-site", "function-budget",
-              "no-callers")
+              "no-callers", "musttail-body", "returns-twice", "no-return")
+
+
+def cost_accounting(report):
+    """One cost identity shared by the fixture and whole-application gates."""
+    fields = ("eligible_estimated_cost", "selected_estimated_cost",
+              "skipped_estimated_cost", "shard_lost_estimated_cost")
+    if report["schema"] not in SHARD_ACCOUNTING:
+        return dict.fromkeys((*fields, "rollback_estimated_cost"))
+    rows = report.get("connected_regions", [])
+    costs = {field: sum(row.get(field, 0) for row in rows) for field in fields}
+    costs["rollback_estimated_cost"] = sum(row.get("eligible_estimated_cost", 0) for row in rows
+                                           if row.get("reason") == "connected-growth-rollback")
+    return costs
+
+
+def report_violations(report):
+    """Validate before computing coverage; malformed reports fail explicitly."""
+    violations = []
+    for check in (invariants, call_violations):
+        try:
+            violations.extend(check(report))
+        except (KeyError, TypeError, ValueError) as exc:
+            violations.append(f"{check.__name__}: malformed report: {exc}")
+    return violations
 
 
 def call_violations(report):
@@ -23,10 +47,23 @@ def call_violations(report):
     """
     rows = report.get("encoded_calls")
     if rows is None:
-        return []
+        return (["encoded-call feature has no interface report"]
+                if report.get("features", {}).get("encoded_calls") else [])
     violations = []
     for row in rows:
         where = row["function"]
+        if row["status"] not in ("encoded", "skipped"):
+            violations.append(f"{where}: unknown interface status {row['status']!r}")
+            continue
+        counters = ("parameters", "encoded_parameters", "callers", "call_sites_rewritten",
+                    "result_rebuilds", "activation_allocas", "absorbed_arguments", "absorbed_results")
+        if report["schema"] == "sre-native-v5":
+            counters += ("partially_absorbed_arguments",)
+            if (row["status"] == "encoded") != bool(row["encoded_function"]):
+                violations.append(f"{where}: encoded symbol does not match interface status")
+        if any(type(row[key]) is not int or row[key] < 0 for key in counters):
+            violations.append(f"{where}: interface counts must be nonnegative integers")
+            continue
         if row["status"] == "encoded":
             if row["reason"]:
                 violations.append(f"{where}: encoded row carries the skip reason {row['reason']!r}")
@@ -41,7 +78,7 @@ def call_violations(report):
                 violations.append(f"{where}: a duplicate plaintext wrapper was retained")
             if row["representation"] != "xor-pair-v1":
                 violations.append(f"{where}: unexpected representation {row['representation']!r}")
-            if row["absorbed_arguments"] > row["encoded_parameters"]:
+            if row["absorbed_arguments"] + row.get("partially_absorbed_arguments", 0) > row["encoded_parameters"]:
                 violations.append(f"{where}: more absorbed argument pairs than parameters")
             supplies = row["encoded_parameters"] * row["call_sites_rewritten"] + row["result_rebuilds"]
             if row["absorbed_results"] > supplies:
@@ -54,7 +91,7 @@ def call_violations(report):
                 violations.append(f"{where}: skip reason {row['reason']!r} is outside the vocabulary")
             if any(row[field] for field in ("encoded_parameters", "call_sites_rewritten",
                                             "activation_allocas", "absorbed_arguments",
-                                            "absorbed_results", "result_rebuilds")) or row["returns_pair"]:
+                                            "absorbed_results", "result_rebuilds")) or row["returns_pair"] or row.get("partially_absorbed_arguments", 0):
                 violations.append(f"{where}: a skipped interface reported encoded work")
     return violations
 
@@ -71,7 +108,7 @@ def call_coverage(report):
         return {key: None for key in
                 ("encoded_interfaces", "encoded_widths", "call_sites_rewritten",
                  "argument_pairs_moved", "result_pairs_moved",
-                 "parameter_reconstructions", "pair_supplies", "absorbed_arguments",
+                 "parameter_reconstructions", "pair_supplies", "absorbed_arguments", "partially_absorbed_arguments",
                  "absorbed_results", "activation_allocas", "wrappers_retained", "skips")}
     encoded = [row for row in rows if row["status"] == "encoded"]
     skips = {}
@@ -94,6 +131,8 @@ def call_coverage(report):
             "pair_supplies": sum(row["encoded_parameters"] * row["call_sites_rewritten"]
                                  + row["result_rebuilds"] for row in encoded),
             "absorbed_arguments": sum(row["absorbed_arguments"] for row in encoded),
+            "partially_absorbed_arguments": (sum(row["partially_absorbed_arguments"] for row in encoded)
+                                             if report["schema"] == "sre-native-v5" else None),
             "absorbed_results": sum(row["absorbed_results"] for row in encoded),
             "activation_allocas": sum(row["activation_allocas"] for row in encoded),
             "wrappers_retained": sum(int(row["wrapper_retained"]) for row in rows),
@@ -120,19 +159,30 @@ def invariants(report):
     violations = []
     for row in report["connected_regions"]:
         where = row["function"]
+        if row["status"] not in ("encoded", "skipped"):
+            violations.append(f"{where}: unknown connected status {row['status']!r}")
+            continue
         # A function rejected before planning publishes no accounting at all,
         # and a rolled-back one republishes its counts as attempted_*. Neither
         # ever claimed the identity below. Any OTHER row missing the fields is
         # itself a violation: never crash, and never pass by omission.
-        if row.get("reason") in ("structure-or-size", "connected-growth-rollback"):
+        if row["status"] == "skipped" and row.get("reason") in ("structure-or-size", "connected-growth-rollback"):
             continue
         missing = [key for key in ("eligible_estimated_cost", "selected_estimated_cost",
                                    "skipped_estimated_cost", "shard_lost_estimated_cost",
                                    "component_estimated_cost_limit", "shard_policy", "shards",
-                                   "sharded_components", "oversized_components", "eligible_nodes")
+                                   "sharded_components", "oversized_components", "eligible_nodes",
+                                   "eligible_memory_objects", "eligible_memory_edges")
                    if key not in row]
         if missing:
             violations.append(f"{where}: planning accounting missing {', '.join(missing)}")
+            continue
+        counts = ("eligible_estimated_cost", "selected_estimated_cost", "skipped_estimated_cost",
+                  "shard_lost_estimated_cost", "component_estimated_cost_limit", "shards",
+                  "sharded_components", "oversized_components", "eligible_nodes",
+                  "eligible_memory_objects", "eligible_memory_edges")
+        if any(type(row[key]) is not int or row[key] < 0 for key in counts):
+            violations.append(f"{where}: planning counts must be nonnegative integers")
             continue
         eligible = row["eligible_estimated_cost"]
         parts = row["selected_estimated_cost"] + row["skipped_estimated_cost"] + row["shard_lost_estimated_cost"]
@@ -143,6 +193,23 @@ def invariants(report):
         if row["shard_policy"] == "whole-component-only" and (row["shards"] or row["sharded_components"]):
             violations.append(f"{where}: shards reported without the shard policy")
         regions = row.get("regions", [])
+        if row["status"] == "encoded":
+            missing = [key for key in ("nodes", "regions", "objects", "memory_edges", "predicates") if key not in row]
+            if missing:
+                violations.append(f"{where}: encoded accounting missing {', '.join(missing)}")
+                continue
+        if report["schema"] == "sre-native-v5":
+            # Region estimates now sum actual node costs, including both
+            # representation parts of a shard; no proportional rounding loss.
+            costs = {}
+            for region in regions:
+                key = (region["component"], region["shard"])
+                if region["sharded"]:
+                    costs[key] = costs.get(key, 0) + region["estimated_cost"]
+            if sum(region["estimated_cost"] for region in regions) != row["selected_estimated_cost"]:
+                violations.append(f"{where}: region costs do not sum to selected cost")
+            if any(cost > row["shard_estimated_cost_limit"] for cost in costs.values()):
+                violations.append(f"{where}: an atomic shard exceeds the reported shard limit")
         if row["status"] == "encoded" and sum(r["nodes"] for r in regions) != row["nodes"]:
             violations.append(f"{where}: region nodes do not sum to selected nodes")
         if row.get("nodes", 0) > row["eligible_nodes"]:
@@ -185,8 +252,12 @@ def joint_invariants(row, where):
     A report written before this experiment existed carries no joint fields at
     all; that is unknown, not a violation and not zero coverage.
     """
-    if "joint_policy" not in row or "joint_output_groups" not in row:
+    if "joint_policy" not in row:
         return []
+    missing = [key for key in ("joint_output_groups", "joint_output_candidates", "joint_lane_uses_rewritten")
+               if key not in row]
+    if missing:
+        return [f"{where}: joint accounting missing {', '.join(missing)}"]
     violations = []
     groups = row["joint_output_groups"]
     if row["joint_policy"] == "disabled" and groups:
@@ -256,6 +327,15 @@ def main():
             raise ToolFailure("binary hash changed")
         values[arm] = runner.run([str(binary)], stdin=test_inputs(512))
     report = json.loads((out / "native.json").read_text())
+    violations = report_violations(report)
+    correct = (set(values) >= {"clean", "native"} and len(values["clean"].splitlines()) == 593
+               and all(value == values["clean"] for value in values.values()))
+    if violations:
+        dump(out / "connected-correctness.json", {
+            "passed": False, "correctness": correct, "vectors": 593, "coverage": None,
+            "planning_violations": violations, "report_schema": report.get("schema"),
+            "manifest_sha256": digest(out / "manifest.json"), "commands": runner.records})
+        return 1
     regions = [row for row in report["connected_regions"] if row["status"] == "encoded"]
     encoded_objects = [obj for row in regions for obj in row["objects"] if obj["status"] == "encoded"]
     planned = report["connected_regions"]
@@ -279,12 +359,7 @@ def main():
                 "oversized_components": sum(row.get("oversized_components", 0) for row in planned),
                 "eligible_nodes": sum(row.get("eligible_nodes", 0) for row in planned),
                 "selected_nodes": sum(row["nodes"] for row in regions),
-                # Planner estimates, not measured instructions. Eligible cost
-                # equals selected plus skipped plus shard loss, exactly.
-                "eligible_estimated_cost": sum(row.get("eligible_estimated_cost", 0) for row in planned),
-                "selected_estimated_cost": sum(row.get("selected_estimated_cost", 0) for row in planned),
-                "skipped_estimated_cost": sum(row.get("skipped_estimated_cost", 0) for row in planned),
-                "shard_lost_estimated_cost": sum(row.get("shard_lost_estimated_cost", 0) for row in planned)}
+                **cost_accounting(report)}
     groups, candidates, rewritten = joint_coverage(regions)
     # None means the compiler that wrote this report predates the experiment.
     coverage["joint_output_groups"] = groups
@@ -293,8 +368,6 @@ def main():
     coverage.update(lane_coverage(report))
     calls = call_coverage(report)
     coverage["encoded_calls"] = calls
-    violations = invariants(report) + call_violations(report)
-    correct = len(values["clean"].splitlines()) == 593 and all(value == values["clean"] for value in values.values())
     passed = (correct and not violations and coverage["regions"] and (not args.require_memory or coverage["memory"])
               and (not args.require_predicates or coverage["predicates"])
               and (not args.require_family_conversions or coverage["family_conversions"] > 0)

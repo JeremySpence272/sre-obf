@@ -21,6 +21,21 @@ bool unwinds(const Function &F) {
     if (I.isEHPad() || isa<InvokeInst, CallBrInst>(&I)) return true;
   return false;
 }
+StringRef bodyBlocker(const Function &F) {
+  if (F.hasFnAttribute(Attribute::ReturnsTwice)) return "returns-twice";
+  bool Returns = false;
+  for (const Instruction &I : instructions(F)) {
+    Returns |= isa<ReturnInst>(I);
+    if (const auto *C = dyn_cast<CallBase>(&I)) {
+      if (const auto *CI = dyn_cast<CallInst>(C); CI && CI->isMustTailCall())
+        return "musttail-body";
+      if (C->hasFnAttr(Attribute::ReturnsTwice)) return "returns-twice";
+    }
+  }
+  // There is no result pair to measure in a non-returning integer function.
+  if (!F.getReturnType()->isVoidTy() && !Returns) return "no-return";
+  return "";
+}
 // Every direct-call cycle in the module, in one pass. NativeFusion answers the
 // same question with a per-candidate reachability walk; that is O(module) per
 // query, and this pass asks it for every definition. Tarjan over the direct
@@ -158,6 +173,9 @@ class Interfaces {
     Type *Out = Ret->isVoidTy() ? Ret : cast<Type>(StructType::get(Ctx, {Ret, Ret}));
     auto *NF = Function::Create(FunctionType::get(Out, Params, false),
         GlobalValue::InternalLinkage, F.getName() + NativeEncodedCallSuffix, &M);
+    // LLVM can uniquify this name when an input symbol already uses the
+    // suffix. Keep the actual name for downstream absorption accounting.
+    Row["encoded_function"] = NF->getName().str();
     NF->setCallingConv(F.getCallingConv());
     // Function attributes carry the sre.native.* stage, spec and family
     // markers, so the twin stays application code for every later stage.
@@ -278,6 +296,7 @@ public:
       else if (!F->hasLocalLinkage() || F->hasAddressTaken()) Reason = "exported-or-address-taken";
       else if (F->isVarArg()) Reason = "varargs";
       else if (unwinds(*F)) Reason = "eh-or-personality";
+      else if (StringRef Blocker = bodyBlocker(*F); !Blocker.empty()) Reason = Blocker.str();
       else if (Cyclic.count(F)) Reason = "recursive";
       else if (!Signature) Reason = "unsupported-signature";
       else if (!Direct) Reason = "unsupported-call-site";
@@ -293,7 +312,8 @@ public:
           {"returns_pair", false}, {"result_rebuilds", 0}, {"widths", std::move(Widths)},
           {"callers", Callers.size()}, {"call_sites_rewritten", 0},
           {"wrapper_retained", false}, {"representation", "xor-pair-v1"},
-          {"activation_allocas", 0}, {"absorbed_arguments", 0}, {"absorbed_results", 0}};
+          {"encoded_function", ""}, {"activation_allocas", 0},
+          {"absorbed_arguments", 0}, {"partially_absorbed_arguments", 0}, {"absorbed_results", 0}};
       if (Reason.empty()) { Allocas = 0; encode(*F, Row); }
       Report.push_back(std::move(Row));
     }
@@ -313,9 +333,12 @@ void recordNativeCallAbsorption(json::Array &Rows,
     if (!Row) continue;
     auto Name = Row->getString("function"), Status = Row->getString("status");
     if (!Name || !Status || *Status != "encoded") continue;
-    auto Found = Absorbed.find((*Name + NativeEncodedCallSuffix).str());
+    auto EncodedName = Row->getString("encoded_function");
+    if (!EncodedName) continue;
+    auto Found = Absorbed.find(*EncodedName);
     if (Found == Absorbed.end()) continue;
     (*Row)["absorbed_arguments"] = Found->second.Arguments;
+    (*Row)["partially_absorbed_arguments"] = Found->second.PartialArguments;
     (*Row)["absorbed_results"] = Found->second.Results;
   }
 }

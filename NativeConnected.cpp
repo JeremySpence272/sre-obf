@@ -303,8 +303,7 @@ class Encoder {
     // boundary pair. The reconstruction itself is erased once nothing else
     // needs the plaintext.
     if (auto *I = dyn_cast<Instruction>(V); I && I->getMetadata("sre.native.call.arg")) {
-      if (AbsorbedParameters.insert(I).second)
-        ++Absorbed[F.getName()].Arguments;
+      AbsorbedParameters.insert(I);
       return convertFamily(B, Pair{I->getOperand(0), I->getOperand(1)}, false,
                            Regions[RegionID].Affine);
     }
@@ -571,9 +570,8 @@ class Encoder {
         if (Part->Affine) SawAffine = true; else SawXor = true;
         Part->ID = Regions.size(); Part->Component = Origin;
         Part->Shard = Shard; Part->Sharded = Sharded;
-        Part->Cost = PartCost * Part->Nodes.size() / Selected.size();
-        Part->Score = PartScore * Part->Nodes.size() / Selected.size();
         for (Instruction *I : Part->Nodes) {
+          Part->Cost += nodeCost(I); Part->Score += nodeScore(I);
           RegionOf[I] = Part->ID; Nodes.push_back(I);
         }
         Regions.push_back(std::move(*Part));
@@ -636,6 +634,11 @@ class Encoder {
         Target = extent(Shard);
       };
       for (const Unit &U : Units) {
+        if (U.Cost > ShardCostLimit) {
+          // A memory unit is indivisible. It must not silently exceed the
+          // reported shard ceiling after flushing a smaller prefix.
+          ShardLostNodes += U.Nodes.size(); ShardLostCost += U.Cost; continue;
+        }
         if (Nodes.size() + Current.size() + U.Nodes.size() > O.Nodes ||
             Cost + ShardCost + U.Cost > CostLimit || ShardCost + U.Cost > Target) {
           flush();
@@ -868,6 +871,7 @@ public:
     for (const auto &Entry : Absorbed) {
       auto &Total = Out[Entry.first()];
       Total.Arguments += Entry.second.Arguments;
+      Total.PartialArguments += Entry.second.PartialArguments;
       Total.Results += Entry.second.Results;
     }
   }
@@ -1075,7 +1079,16 @@ public:
     // Absorbed parameters are never region nodes, so they outlive the erase
     // above. One whose every consumer was absorbed is a plaintext parameter
     // kept alive for nothing.
-    for (Instruction *I : AbsorbedParameters) if (I->use_empty()) I->eraseFromParent();
+    for (Instruction *I : AbsorbedParameters) {
+      if (I->use_empty()) {
+        ++Absorbed[F.getName()].Arguments;
+        I->eraseFromParent();
+      } else {
+        // At least one encoded consumer used the pair, but an unsupported
+        // consumer still needs the scalar reconstruction. Report it separately.
+        ++Absorbed[F.getName()].PartialArguments;
+      }
+    }
     for (Object &Obj : Objects) if (!Obj.EP.empty()) {
       for (Instruction *I : Obj.Lifetimes) I->eraseFromParent();
       for (auto *G : llvm::reverse(Obj.GEPs)) if (G->use_empty()) G->eraseFromParent();

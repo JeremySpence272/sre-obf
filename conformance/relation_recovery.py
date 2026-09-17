@@ -60,25 +60,28 @@ def functions(text):
     return out
 
 
-def data_context_words(text):
-    """Allocas that the encoded-data pass updates, from its own metadata tags.
-
-    A store tagged "data" is written by a pinned lane, so the word it writes is
-    only produced by actually evaluating the encoded region.
-    """
+def metadata_roles(text):
+    """Parse module metadata once, outside the per-function scan."""
     roles = {}
     for line in text.splitlines():
         found = METADATA.match(line)
         if found and '"' in found.group(2):
             roles[found.group(1)] = found.group(2).split('"')[1]
+    return roles
+
+
+def data_context_words(text, lines=None, roles=None):
+    """Function-local allocas written by a store tagged as encoded data."""
+    if roles is None:
+        roles = metadata_roles(text)
     words = set()
-    for line in text.splitlines():
+    for line in text.splitlines() if lines is None else lines:
         if "sre.native.context.update" not in line or "store" not in line:
             continue
         tag = re.search(r"sre\.native\.context\.update !(\d+)", line)
         pointer = re.search(r"store\s+volatile\s+i32\s+[^,]+,\s*ptr\s+%([\w.]+)", line)
         if tag and pointer and roles.get(tag.group(1)) == "data":
-            words.add(re.sub(r"\d+$", "", pointer.group(1)))
+            words.add(pointer.group(1))
     return words
 
 
@@ -96,28 +99,38 @@ class Body:
             if ALLOCA.match(rest):
                 self.allocas.add(name)
 
-    def root(self, pointer, depth=0):
-        """Resolve a pointer operand to the alloca or global it addresses."""
-        if depth > 16 or not pointer:
-            return pointer
-        if pointer.startswith("@"):
-            return pointer
-        name = pointer.lstrip("%")
-        if name in self.allocas:
-            return name
-        rest = self.defs.get(name)
-        if not rest:
-            return name
-        if rest.split()[0] in ("getelementptr", "bitcast", "addrspacecast", "select", "phi"):
-            for operand in OPERAND.findall(rest):
-                resolved = self.root("%" + operand, depth + 1)
-                if resolved in self.allocas or str(resolved).startswith("@"):
-                    return resolved
-        return name
+    def roots(self, pointer):
+        """Resolve every supported pointer alternative, with a bounded walk."""
+        work, seen, roots = [pointer], set(), set()
+        complete = True
+        while work:
+            pointer = work.pop()
+            if pointer in seen:
+                continue
+            if len(seen) >= 64:
+                return roots, False
+            seen.add(pointer)
+            name = pointer.lstrip("%")
+            if pointer.startswith("@") or name in self.allocas:
+                roots.add(name)
+                continue
+            rest = self.defs.get(name, "")
+            op = rest.split()[0] if rest else ""
+            if op == "phi":
+                alternatives = re.findall(r"\[\s*([%@][\w.$]+)\s*,", rest)
+            elif op in ("getelementptr", "bitcast", "addrspacecast", "select"):
+                alternatives = re.findall(r"\bptr(?:\s+addrspace\(\d+\))?\s+([%@][\w.$]+)", rest)
+            else:
+                alternatives = []
+            if not alternatives:
+                complete = False
+            work.extend(alternatives)
+        return roots, complete and bool(roots)
 
     def slice(self, seeds, limit=20000):
         """Backward slice: visited instruction count and the words it reads."""
         seen, work, words = set(), list(seeds), set()
+        pointers_complete = True
         while work and len(seen) <= limit:
             name = work.pop()
             if name in seen:
@@ -128,11 +141,14 @@ class Body:
                 continue
             found = LOAD.match(rest)
             if found:
-                words.add(str(self.root(found.group(1))))
+                roots, complete = self.roots(found.group(1))
+                words.update(roots)
+                pointers_complete &= complete
                 # A load ends the value slice; its pointer is resolved above.
                 continue
             work.extend(OPERAND.findall(rest))
-        return {"visited": len(seen), "words": words, "truncated": len(seen) > limit}
+        return {"visited": len(seen), "words": words, "truncated": len(seen) > limit,
+                "unresolved_pointers": not pointers_complete}
 
 
 def supplied_arm(words, trials, seed):
@@ -167,11 +183,14 @@ def main(argv=None):
         p.error("positive trials and a fresh output path are required")
     args.out.parent.mkdir(parents=True, exist_ok=True)
     text = args.module.read_text()
-    data_words = data_context_words(text)
+    roles = metadata_roles(text)
     rows, every_word, coupled = [], set(), 0
     start = time.monotonic()
     for name, lines in functions(text):
         body = Body(lines)
+        # SSA names are local to a function; a same-named alloca elsewhere is
+        # not evidence that this function's dispatcher reads encoded data.
+        data_words = data_context_words(text, lines, roles)
         dispatchers = []
         for line in lines:
             found = MATCH.match(line)
@@ -185,6 +204,8 @@ def main(argv=None):
         words = sorted(set().union(*(d["words"] for d in dispatchers)))
         control = [w for w in words if w in FROZEN_V02_WORDS or w in data_words]
         reads_data = sorted(w for w in words if w in data_words)
+        truncated = any(d["truncated"] for d in dispatchers)
+        unresolved = any(d.get("unresolved_pointers", False) for d in dispatchers)
         coupled += bool(reads_data)
         every_word.update(control)
         rows.append({"function": name, "comparisons": len(dispatchers),
@@ -192,14 +213,17 @@ def main(argv=None):
                      "encoded_data_words": reads_data,
                      "slice_instructions_max": max(d["visited"] for d in dispatchers),
                      "slice_instructions_total": sum(d["visited"] for d in dispatchers),
-                     "slice_truncated": any(d["truncated"] for d in dispatchers),
+                     "slice_truncated": truncated,
+                     "unresolved_pointers": unresolved,
                      # The frozen script assumed the token is a function of the
                      # three flattening words alone. It transfers only if that
                      # is still true of every comparison in this function.
-                     "frozen_v02_relation_transfers": not reads_data})
+                     "frozen_v02_relation_transfers": None if truncated or unresolved else not reads_data})
     inferred_seconds = round(time.monotonic() - start, 4)
+    complete = bool(rows) and not any(row["frozen_v02_relation_transfers"] is None for row in rows)
     result = {
-        "schema": "sre-relation-recovery-v1",
+        "schema": "sre-relation-recovery-v2",
+        "status": "complete" if complete else "inconclusive",
         "module": str(args.module), "module_sha256": digest(args.module),
         "adapter_sha256": digest(Path(__file__)),
         "functions_with_dispatchers": len(rows),
@@ -216,10 +240,11 @@ def main(argv=None):
                 "arm": "canonical-repair",
                 "frozen_words": list(FROZEN_V02_WORDS),
                 "functions_where_frozen_relation_transfers":
-                    sum(1 for r in rows if r["frozen_v02_relation_transfers"]),
+                    sum(1 for r in rows if r["frozen_v02_relation_transfers"] is True),
                 "functions_where_frozen_relation_fails":
-                    sum(1 for r in rows if not r["frozen_v02_relation_transfers"]),
-                "repairable": True,
+                    sum(1 for r in rows if r["frozen_v02_relation_transfers"] is False),
+                "functions_with_inconclusive_relation": sum(r["frozen_v02_relation_transfers"] is None for r in rows),
+                "repairable": True if complete else None,
                 "repair_cost": "read one further per-activation word; all words are software state in the binary",
             },
         },
@@ -227,6 +252,9 @@ def main(argv=None):
         "interpretation": "relative joint recovery cost, not secrecy and not a hardness claim",
     }
     dump(args.out, result)
+    if not complete:
+        print("sre-relation-recovery: no complete dispatcher measurement", file=sys.stderr)
+        return 1
     if args.require_lane_coupling and not coupled:
         print("sre-relation-recovery: no dispatcher reads an encoded-data word", file=sys.stderr)
         return 1

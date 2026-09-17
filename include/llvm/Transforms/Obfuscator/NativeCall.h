@@ -13,10 +13,11 @@ struct NativeCallOptions { unsigned Functions = 32; };
 
 // Pairs a later pass consumed without materializing a scalar, keyed by the
 // encoded callee's symbol name. Zero everywhere until absorption runs.
-struct NativeCallAbsorption { unsigned Arguments = 0, Results = 0; };
+struct NativeCallAbsorption {
+  unsigned Arguments = 0, PartialArguments = 0, Results = 0;
+};
 
-// The encoded twin of F is always named F + this suffix, so a report row and
-// the function it describes can be matched without a side table.
+// Preferred suffix; the report records the actual LLVM-uniquified symbol.
 constexpr StringLiteral NativeEncodedCallSuffix = ".sre.encoded";
 
 json::Array encodeNativeCalls(Module &, uint64_t Seed, const NativeCallOptions &);
