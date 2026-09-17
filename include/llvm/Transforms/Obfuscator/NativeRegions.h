@@ -8,4 +8,5 @@ json::Array encodeNativeValues(Module &M, uint64_t Seed, unsigned MaxNodes, bool
                                bool Wide = false, bool Invariant = false);
 json::Array fuseNativeFunctions(Module &M, uint64_t Seed, ArrayRef<std::string> Selected);
 json::Array encodeNativeMemory(Module &M, uint64_t Seed);
+json::Object nativeBoundaryInventory(const Module &M, StringRef Stage);
 }

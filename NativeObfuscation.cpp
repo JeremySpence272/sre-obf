@@ -167,6 +167,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
 
   // Output-directory names must not change RNG streams or encoded data.
   M.setModuleIdentifier(sys::path::filename(M.getSourceFileName()));
+  auto InputInventory = obf::nativeBoundaryInventory(M, "input-before-fusion");
   json::Array FusionCoverage;
   if (NativeFusion) {
     FusionCoverage = obf::fuseNativeFunctions(M, static_cast<uint64_t>(ObfSeed), NativeFunctions);
@@ -428,6 +429,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"helpers", std::move(HelperCoverage)},
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
+    Result["input_inventory"] = std::move(InputInventory);
+    Result["final_inventory"] = obf::nativeBoundaryInventory(M, "final-ir");
     OS << formatv("{0:2}\n", json::Value(std::move(Result)));
   }
   return PreservedAnalyses::none();

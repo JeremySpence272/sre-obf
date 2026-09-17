@@ -1,6 +1,7 @@
 # v02 plan: reduce reusable recovery shortcuts
 
-Status: **planned, not implemented**. Written 2026-09-17 against v01 fork
+Status: **implementation in progress**; see [the ledger](NATIVE_V02_STATUS.md)
+for completed subsets and evidence. Written 2026-09-17 against v01 fork
 `19300a007afd45a90c61ebd08036e9544a90f47e` (IR implementation `87eccf0`).
 This is the next bounded implementation plan, not a claim of stronger protection.
 It refines the [native roadmap](STATIC_NATIVE_PLAN.md) using the completed v01
