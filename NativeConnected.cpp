@@ -40,9 +40,48 @@ struct Object {
   SmallVector<Instruction *, 8> Lifetimes;
   DenseMap<Value *, Value *> EP, RP;
   std::string ID;
+  // Set when the object was admitted by the constant-offset leaf walk rather
+  // than by the narrow scalar/flat-array rule. Element is then null, because
+  // the leaves do not share one width.
+  bool Aggregate = false;
+  uint64_t Leaves = 0;
   Object(AllocaInst *A, Type *Element, uint64_t Elements, std::string ID)
       : A(A), Element(Element), Elements(Elements), ID(std::move(ID)) {}
 };
+// One supported integer field at a constant byte offset in an object.
+struct Leaf { uint64_t Offset = 0; Type *Ty = nullptr; };
+// The same 64-slot ceiling the narrow flat-array rule already used. Neither
+// this nor the eight-object budget is raised by the aggregate experiment.
+constexpr unsigned MaxLeaves = 64, MaxLeafDepth = 8;
+// Enumerate an object type as nothing but supported integer leaves. Any
+// float, pointer, vector, i1, odd-width integer, opaque or scalable part
+// fails the whole object: a leaf set that does not describe every byte we
+// might touch is not a proof of anything.
+bool enumerateLeaves(Type *T, uint64_t Base, const DataLayout &DL,
+                     SmallVectorImpl<Leaf> &Out, unsigned Depth) {
+  if (Depth > MaxLeafDepth || Out.size() >= MaxLeaves) return false;
+  if (T->isIntegerTy()) {
+    if (!width(T)) return false;
+    Out.push_back(Leaf{Base, T});
+    return true;
+  }
+  if (auto *AT = dyn_cast<ArrayType>(T)) {
+    if (AT->getNumElements() > MaxLeaves) return false;
+    TypeSize Stride = DL.getTypeAllocSize(AT->getElementType());
+    if (Stride.isScalable()) return false;
+    for (uint64_t N = 0; N < AT->getNumElements(); ++N)
+      if (!enumerateLeaves(AT->getElementType(), Base + N * Stride.getFixedValue(), DL, Out, Depth + 1))
+        return false;
+    return true;
+  }
+  auto *ST = dyn_cast<StructType>(T);
+  if (!ST || ST->isOpaque() || ST->isScalableTy() || ST->getNumElements() > MaxLeaves) return false;
+  const StructLayout *SL = DL.getStructLayout(ST);
+  for (unsigned N = 0; N < ST->getNumElements(); ++N)
+    if (!enumerateLeaves(ST->getElementType(N), Base + SL->getElementOffset(N), DL, Out, Depth + 1))
+      return false;
+  return true;
+}
 struct Region {
   SmallVector<Instruction *, 32> Nodes;
   unsigned ID = 0, Component = 0, Shard = 0, Cost = 0, Score = 0;
@@ -76,6 +115,8 @@ class Encoder {
   unsigned Inputs = 0, Outputs = 0, Predicates = 0, MultiplyBridges = 0;
   unsigned MemoryEdges = 0, PersistentEdges = 0, SkippedComponents = 0, Site = 0, Copies = 0, EligibleNodes = 0;
   unsigned EligibleMemoryEdges = 0;
+  unsigned EligibleAggregateObjects = 0, EligibleMemoryLeaves = 0;
+  unsigned AggregateObjects = 0, AggregateMemoryEdges = 0;
   unsigned FamilyConversions = 0, MixedComponents = 0;
   unsigned OversizedComponents = 0, ShardedComponents = 0, SelectedShards = 0, ShardLostNodes = 0;
   unsigned EligibleCost = 0, SelectedCost = 0, SkippedCost = 0, ShardLostCost = 0;
@@ -220,6 +261,13 @@ class Encoder {
   }
   void findObjects() {
     if (!O.Memory) return;
+    // The bounded byte-copy normalization below is deliberately NOT extended
+    // to aggregate layouts: LocalBytes() still matches only an i8 alloca or a
+    // flat i8 array, so a memcpy that touches a struct or nested array is
+    // rejected as "memory-intrinsic" rather than rewritten. A copy that one
+    // of its i8 ends does get normalized may land on an aggregate; the leaf
+    // walk then admits it only if every resulting byte access covers an i8
+    // leaf exactly, and rejects it as a partial access otherwise.
     SmallVector<MemCpyInst *, 8> CopiesToNormalize;
     for (Instruction &I : instructions(F)) if (auto *C = dyn_cast<MemCpyInst>(&I)) {
       auto *Length = dyn_cast<ConstantInt>(C->getLength());
@@ -257,29 +305,125 @@ class Encoder {
       auto Skip = [&](StringRef Reason) {
         ObjectReport.push_back(json::Object{{"object", A->getName().str()}, {"origin", ID}, {"status", "skipped"}, {"reason", Reason.str()}});
       };
-      if (!width(E) || !N || N > 64) { Skip("unsupported-layout"); continue; }
+      bool Narrow = width(E) && N && N <= 64;
+      if (!Narrow && !O.Aggregates) { Skip("unsupported-layout"); continue; }
       if (Objects.size() >= 8) { Skip("object-budget"); continue; }
-      Object Obj{A, E, N, ID};
-      SmallVector<Value *, 16> Work{A}; SmallPtrSet<Value *, 32> Seen;
-      bool Safe = true;
-      for (unsigned J = 0; J < Work.size() && Safe; ++J) {
-        Value *P = Work[J];
-        if (!Seen.insert(P).second) continue;
-        for (User *U : P->users()) {
-          if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
-            if (!G->isInBounds() || (G->getSourceElementType() != T && G->getSourceElementType() != E) ||
-                (G->getResultElementType() != T && G->getResultElementType() != E)) { Safe = false; break; }
-            Obj.GEPs.push_back(G); Work.push_back(G);
-          } else if (auto *L = dyn_cast<LoadInst>(U); L && L->isSimple() && L->getType() == E) Obj.Loads.push_back(L);
-          else if (auto *S = dyn_cast<StoreInst>(U); S && S->isSimple() && S->getPointerOperand() == P && S->getValueOperand()->getType() == E) Obj.Stores.push_back(S);
-          else if (auto *II = dyn_cast<IntrinsicInst>(U); II && II->isLifetimeStartOrEnd()) Obj.Lifetimes.push_back(II);
-          else { Safe = false; break; }
+      if (Narrow) {
+        Object Obj{A, E, N, ID};
+        Obj.Leaves = N;
+        SmallVector<Value *, 16> Work{A}; SmallPtrSet<Value *, 32> Seen;
+        bool Safe = true;
+        for (unsigned J = 0; J < Work.size() && Safe; ++J) {
+          Value *P = Work[J];
+          if (!Seen.insert(P).second) continue;
+          for (User *U : P->users()) {
+            if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+              if (!G->isInBounds() || (G->getSourceElementType() != T && G->getSourceElementType() != E) ||
+                  (G->getResultElementType() != T && G->getResultElementType() != E)) { Safe = false; break; }
+              Obj.GEPs.push_back(G); Work.push_back(G);
+            } else if (auto *L = dyn_cast<LoadInst>(U); L && L->isSimple() && L->getType() == E) Obj.Loads.push_back(L);
+            else if (auto *S = dyn_cast<StoreInst>(U); S && S->isSimple() && S->getPointerOperand() == P && S->getValueOperand()->getType() == E) Obj.Stores.push_back(S);
+            else if (auto *II = dyn_cast<IntrinsicInst>(U); II && II->isLifetimeStartOrEnd()) Obj.Lifetimes.push_back(II);
+            else { Safe = false; break; }
+          }
         }
+        if (Safe && !Obj.Loads.empty() && !Obj.Stores.empty()) {
+          EligibleMemoryLeaves += Obj.Leaves;
+          for (LoadInst *L : Obj.Loads) MemoryLoads[L] = Objects.size();
+          Objects.push_back(std::move(Obj));
+          continue;
+        }
+        // The narrow rule's uniform element type also permits a runtime
+        // index. The leaf walk below does not, so it is a retry, not a
+        // replacement: with the experiment off, this is the only answer.
+        if (!O.Aggregates) { Skip("escape-or-unsupported-access"); continue; }
       }
-      if (!Safe || Obj.Loads.empty() || Obj.Stores.empty()) { Skip("escape-or-unsupported-access"); continue; }
-      for (LoadInst *L : Obj.Loads) MemoryLoads[L] = Objects.size();
-      Objects.push_back(std::move(Obj));
+      if (StringRef Reason = admitLeafObject(A, T, ID); !Reason.empty()) Skip(Reason);
     }
+  }
+  // Admit one object whose accesses are all constant-offset leaves. Returns an
+  // empty reason on success, else exactly why the object was rejected.
+  //
+  // Precision comes first here. Every pointer derived from the alloca is
+  // resolved to a constant byte offset; every load and store must cover one
+  // enumerated leaf exactly, at that leaf's own type. Nothing else is
+  // tolerated: a use this walk does not understand rejects the object rather
+  // than being assumed harmless, because a wrong answer silently miscompiles.
+  // Proving that no derived pointer escapes is also what proves nothing else
+  // in the function can alias the object.
+  StringRef admitLeafObject(AllocaInst *A, Type *T, const std::string &ID) {
+    const DataLayout &DL = F.getParent()->getDataLayout();
+    SmallVector<Leaf, 32> Leaves;
+    if (!enumerateLeaves(T, 0, DL, Leaves, 0) || Leaves.empty()) return "leaf-layout-unsupported";
+    // Disjointness is checked against the layout, not assumed from the type.
+    DenseMap<uint64_t, unsigned> LeafAt;
+    uint64_t End = 0;
+    for (unsigned J = 0; J < Leaves.size(); ++J) {
+      if (Leaves[J].Offset < End) return "overlapping-leaf";
+      End = Leaves[J].Offset + DL.getTypeStoreSize(Leaves[J].Ty).getFixedValue();
+      LeafAt[Leaves[J].Offset] = J;
+    }
+    uint64_t Size = DL.getTypeAllocSize(T).getFixedValue();
+    auto leafAt = [&](uint64_t Offset, Type *Ty) -> int {
+      auto It = LeafAt.find(Offset);
+      return It == LeafAt.end() || Leaves[It->second].Ty != Ty ? -1 : int(It->second);
+    };
+    Object Obj{A, nullptr, Leaves.size(), ID};
+    Obj.Aggregate = true; Obj.Leaves = Leaves.size();
+    SmallVector<std::pair<Value *, uint64_t>, 16> Work{{A, 0}};
+    SmallPtrSet<Value *, 32> Seen;
+    SmallVector<bool, 64> Loaded(Leaves.size(), false), Stored(Leaves.size(), false);
+    StringRef Reason;
+    for (unsigned J = 0; J < Work.size() && Reason.empty(); ++J) {
+      Value *P = Work[J].first;
+      uint64_t Offset = Work[J].second;
+      if (!Seen.insert(P).second) continue;
+      for (User *U : P->users()) {
+        if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+          // Derive only ordinary scalar pointers from the base pointer, and
+          // only as the base: anything else is not an offset we can mirror.
+          if (G->getPointerOperand() != P || !G->getType()->isPointerTy()) {
+            Reason = "address-escape-other"; break;
+          }
+          APInt Delta(DL.getIndexTypeSizeInBits(G->getType()), 0);
+          if (!G->accumulateConstantOffset(DL, Delta)) { Reason = "dynamic-index"; break; }
+          int64_t Next = int64_t(Offset) + Delta.getSExtValue();
+          // A one-past-the-end pointer may be formed but never accessed.
+          if (Next < 0 || uint64_t(Next) > Size) { Reason = "offset-out-of-range"; break; }
+          Obj.GEPs.push_back(G); Work.push_back({G, uint64_t(Next)});
+        } else if (auto *L = dyn_cast<LoadInst>(U)) {
+          if (!L->isSimple()) { Reason = "unsupported-access"; break; }
+          int K = leafAt(Offset, L->getType());
+          if (K < 0) { Reason = "partial-leaf-access"; break; }
+          Loaded[K] = true; Obj.Loads.push_back(L);
+        } else if (auto *S = dyn_cast<StoreInst>(U)) {
+          if (S->getPointerOperand() != P) { Reason = "address-escape-store"; break; }
+          if (!S->isSimple()) { Reason = "unsupported-access"; break; }
+          int K = leafAt(Offset, S->getValueOperand()->getType());
+          if (K < 0) { Reason = "partial-leaf-access"; break; }
+          Stored[K] = true; Obj.Stores.push_back(S);
+        } else if (auto *II = dyn_cast<IntrinsicInst>(U); II && II->isLifetimeStartOrEnd()) {
+          // A lifetime marker on a derived pointer would scope part of the
+          // object independently; only a marker on the object is understood.
+          if (P != A) { Reason = "unsupported-access"; break; }
+          Obj.Lifetimes.push_back(II);
+        } else if (isa<MemIntrinsic>(U)) { Reason = "memory-intrinsic"; break; }
+        else if (isa<ICmpInst>(U)) { Reason = "pointer-compare"; break; }
+        else if (isa<CallBase>(U)) { Reason = "address-escape-call"; break; }
+        else { Reason = "address-escape-other"; break; }
+      }
+    }
+    if (Reason.empty() && (Obj.Loads.empty() || Obj.Stores.empty())) Reason = "no-load-or-store";
+    // Full coverage: a leaf that is read but never written through a tracked
+    // store would read a share pair this pass never established.
+    for (unsigned K = 0; Reason.empty() && K < Leaves.size(); ++K)
+      if (Loaded[K] && !Stored[K]) Reason = "uncovered-leaf";
+    if (!Reason.empty()) return Reason;
+    EligibleMemoryLeaves += Obj.Leaves;
+    ++EligibleAggregateObjects;
+    for (LoadInst *L : Obj.Loads) MemoryLoads[L] = Objects.size();
+    Objects.push_back(std::move(Obj));
+    return "";
   }
   void plan() {
     findObjects();
@@ -378,7 +522,10 @@ class Encoder {
       // Bounded shards in stable instruction order. A unit is one node, except
       // that all loads of one encoded object form a single atomic unit:
       // prepareMemory() redirects every store of an encoded object, so a load
-      // left unselected would read an abandoned allocation.
+      // left unselected would read an abandoned allocation. An aggregate
+      // object is one object, so its leaf loads enlarge that atomic unit
+      // rather than splitting it; a unit that cannot fit the remaining budget
+      // is dropped whole and its object stays unencoded.
       struct Unit { SmallVector<Instruction *, 8> Nodes; unsigned Cost = 0, Score = 0; };
       SmallVector<Unit, 32> Units;
       DenseMap<unsigned, unsigned> ObjectUnit;
@@ -451,9 +598,17 @@ class Encoder {
       }
       for (auto *S : Obj.Stores) MemoryStores.insert(S);
       MemoryEdges += Obj.Loads.size() + Obj.Stores.size();
+      if (Obj.Aggregate) {
+        ++AggregateObjects;
+        AggregateMemoryEdges += Obj.Loads.size() + Obj.Stores.size();
+      }
+      // An aggregate's leaves do not share one width, so the single-width
+      // field is unknown for it, never zero.
       ObjectReport.push_back(json::Object{{"object", Obj.A->getName().str()}, {"status", "encoded"},
           {"origin", Obj.ID},
-          {"elements", Obj.Elements}, {"width", Obj.Element->getIntegerBitWidth()},
+          {"layout", Obj.Aggregate ? "aggregate-leaves" : Obj.Elements > 1 ? "flat-array" : "scalar"},
+          {"elements", Obj.Elements}, {"leaves", Obj.Leaves},
+          {"width", Obj.Element ? json::Value(Obj.Element->getIntegerBitWidth()) : json::Value(nullptr)},
           {"loads", Obj.Loads.size()}, {"stores", Obj.Stores.size()}, {"implicit_load_decodes", 0}});
     }
   }
@@ -526,6 +681,11 @@ public:
     Item["eligible_nodes"] = EligibleNodes;
     Item["eligible_memory_edges"] = EligibleMemoryEdges;
     Item["eligible_memory_objects"] = Objects.size();
+    // The aggregate experiment only ever adds objects to this denominator.
+    Item["eligible_aggregate_memory_objects"] = EligibleAggregateObjects;
+    Item["eligible_memory_leaves"] = EligibleMemoryLeaves;
+    Item["memory_layout_policy"] = O.Aggregates ? "constant-index-aggregate-leaves"
+                                                : "scalar-and-flat-array-only";
     Item["skipped_components"] = SkippedComponents;
     Item["oversized_components"] = OversizedComponents;
     Item["sharded_components"] = ShardedComponents;
@@ -633,6 +793,7 @@ public:
     json::Object Item{{"function", F.getName().str()}, {"status", "encoded"}, {"nodes", Nodes.size()},
         {"regions", std::move(RegionReport)},
         {"persistent_edges", PersistentEdges}, {"memory_edges", MemoryEdges}, {"predicates", Predicates},
+        {"aggregate_memory_objects", AggregateObjects}, {"aggregate_memory_edges", AggregateMemoryEdges},
         {"family_conversions", FamilyConversions}, {"mixed_family_components", MixedComponents},
         {"boundary_inputs", Inputs}, {"boundary_outputs", Outputs}, {"multiply_decode_bridges", MultiplyBridges},
         {"reachable_invariant", Witness != nullptr}};
@@ -671,6 +832,8 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
           {"reason", "connected-growth-rollback"}, {"attempted_instructions", After}};
       // Planning denominators describe eligibility, so they survive a rollback.
       for (StringRef Key : {"eligible_nodes", "eligible_memory_edges", "eligible_memory_objects",
+                            "eligible_aggregate_memory_objects", "eligible_memory_leaves",
+                            "memory_layout_policy",
                             "eligible_estimated_cost", "oversized_components",
                             "component_estimated_cost_limit", "shard_estimated_cost_limit",
                             "shard_policy"})

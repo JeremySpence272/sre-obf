@@ -46,6 +46,23 @@ def invariants(report):
                 violations.append(f"{where}: component {component} shard ids are not contiguous from zero")
         if row["sharded_components"] > row["oversized_components"]:
             violations.append(f"{where}: more components sharded than were oversized")
+        # The memory denominator may only ever grow. An encoded object that no
+        # eligible object accounts for, or memory edges beyond the eligible
+        # ones, would be a coverage ratio inflated by a shrunken denominator.
+        objects = row.get("objects", [])
+        encoded = [o for o in objects if o["status"] == "encoded"]
+        if len(encoded) > row["eligible_memory_objects"]:
+            violations.append(f"{where}: {len(encoded)} memory objects encoded, {row['eligible_memory_objects']} eligible")
+        if row.get("memory_edges", 0) > row["eligible_memory_edges"]:
+            violations.append(f"{where}: memory edges exceed the eligible memory denominator")
+        aggregates = [o for o in encoded if o.get("layout") == "aggregate-leaves"]
+        if row.get("memory_layout_policy") == "scalar-and-flat-array-only" and aggregates:
+            violations.append(f"{where}: aggregate objects encoded without the aggregate layout policy")
+        if row["status"] == "encoded" and len(aggregates) != row.get("aggregate_memory_objects", 0):
+            violations.append(f"{where}: {row.get('aggregate_memory_objects', 0)} aggregate objects reported, "
+                              f"{len(aggregates)} in the object rows")
+        if row.get("eligible_aggregate_memory_objects", 0) > row["eligible_memory_objects"]:
+            violations.append(f"{where}: more aggregate objects eligible than objects")
     return violations
 
 
@@ -58,6 +75,8 @@ def main():
     p.add_argument("--require-family-conversions", action="store_true")
     p.add_argument("--require-shards", action="store_true",
                    help="require at least one oversized component actually partitioned into selected shards")
+    p.add_argument("--require-aggregates", action="store_true",
+                   help="require at least one closed constant-index aggregate object actually encoded")
     args = p.parse_args()
     out = args.build.resolve()
     manifest = json.loads((out / "manifest.json").read_text())
@@ -77,6 +96,17 @@ def main():
                 "family_conversions": sum(row.get("family_conversions", 0) for row in regions),
                 "mixed_family_components": sum(row.get("mixed_family_components", 0) for row in regions),
                 "shards": sum(row.get("shards", 0) for row in regions),
+                # Memory coverage next to its own denominator, so a widened
+                # eligibility is visible rather than hidden in a ratio.
+                "memory_edges": sum(row["memory_edges"] for row in regions),
+                "aggregate_memory_objects": sum(row.get("aggregate_memory_objects", 0) for row in regions),
+                "aggregate_memory_edges": sum(row.get("aggregate_memory_edges", 0) for row in regions),
+                "encoded_memory_objects": len(encoded_objects),
+                "eligible_memory_objects": sum(row.get("eligible_memory_objects", 0) for row in planned),
+                "eligible_aggregate_memory_objects": sum(row.get("eligible_aggregate_memory_objects", 0) for row in planned),
+                "eligible_memory_edges": sum(row.get("eligible_memory_edges", 0) for row in planned),
+                "memory_object_skip_reasons": sorted({o["reason"] for row in planned
+                                                      for o in row.get("objects", []) if o["status"] == "skipped"}),
                 "sharded_components": sum(row.get("sharded_components", 0) for row in regions),
                 "oversized_components": sum(row.get("oversized_components", 0) for row in planned),
                 "eligible_nodes": sum(row.get("eligible_nodes", 0) for row in planned),
@@ -92,7 +122,8 @@ def main():
     passed = (correct and not violations and coverage["regions"] and (not args.require_memory or coverage["memory"])
               and (not args.require_predicates or coverage["predicates"])
               and (not args.require_family_conversions or coverage["family_conversions"] > 0)
-              and (not args.require_shards or coverage["shards"] > 0))
+              and (not args.require_shards or coverage["shards"] > 0)
+              and (not args.require_aggregates or coverage["aggregate_memory_objects"] > 0))
     result = {"passed": passed, "correctness": correct, "vectors": 593, "coverage": coverage,
               "planning_violations": violations, "report_schema": report["schema"],
               "manifest_sha256": digest(out / "manifest.json"), "commands": runner.records}

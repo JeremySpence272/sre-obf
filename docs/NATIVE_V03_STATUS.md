@@ -227,6 +227,115 @@ Known remaining limits are unchanged by this work: boundary decodes at region
 exits, the narrow closed-object eligibility of `findObjects()`, the absent
 encoded call ABI, and software-invertible dispatch. Coverage is not hardness.
 
+## Closed aggregate memory objects
+
+The narrow rule remains the default. `--connected-aggregates` /
+`-native-connected-aggregates` is an independent defaults-off experiment that
+admits one further object shape: a closed entry allocation whose type is
+nothing but bounded integer leaves at constant offsets, so a struct of integer
+fields, a nested fixed array and a struct containing an array become eligible
+alongside the scalar and flat array that already were. No limit is raised: the
+64-slot leaf ceiling is the old 64-element ceiling, the eight-object budget is
+unchanged, and nesting is bounded at eight.
+
+Admission is a proof, not a pattern match. `enumerateLeaves()` must account for
+the whole type as supported integer leaves — any float, pointer, vector, `i1`,
+odd-width integer, opaque or scalable part rejects the object — and their byte
+ranges are then checked to be disjoint rather than assumed from the type.
+`admitLeafObject()` walks every pointer derived from the allocation, resolves
+each to a constant byte offset, and requires every load and store to cover one
+leaf exactly at that leaf's own type. A runtime index, a partial or punned
+access, a volatile or atomic access, a pointer comparison, a memory intrinsic,
+a stored or called address, or any user the walk does not model rejects the
+whole object with its own reason. Proving no derived pointer escapes is also
+what proves nothing else in the function aliases the object.
+
+The reason vocabulary is `leaf-layout-unsupported`, `overlapping-leaf`,
+`dynamic-index`, `partial-leaf-access`, `unsupported-access`,
+`memory-intrinsic`, `pointer-compare`, `address-escape-store`,
+`address-escape-call`, `address-escape-other`, `offset-out-of-range`,
+`uncovered-leaf` and `no-load-or-store`, beside the existing
+`unsupported-layout`, `object-budget`, `escape-or-unsupported-access` and
+`component-budget`. With the experiment off only the existing coarse reasons
+appear. The walk is a retry, never a replacement: a scalar or flat array that
+the narrow rule admits, including with a runtime index, is still admitted by
+the narrow rule and encoded exactly as before.
+
+The bounded byte-copy normalization in `findObjects()` is deliberately **not**
+extended. Its trigger still matches only an `i8` allocation or a flat `i8`
+array, so a `memcpy` touching a struct or nested array rejects that object as
+`memory-intrinsic` instead of being rewritten. A copy that one of its `i8` ends
+does get normalized may land on an aggregate; the leaf walk then admits it only
+if every resulting byte access covers an `i8` leaf exactly.
+
+The shard invariant is preserved rather than assumed. An aggregate is one
+object, so `MemoryLoads` registers all of its leaf loads and the planner's
+atomic unit grows to hold them; a unit that cannot fit the remaining budget is
+dropped whole and `prepareMemory()` then redirects none of that object's
+stores. The eligible denominators only grow: `eligible_memory_objects` and
+`eligible_memory_edges` count every admitted object, and the report adds
+`eligible_aggregate_memory_objects`, `eligible_memory_leaves`,
+`memory_layout_policy`, per-object `layout` and `leaves`, and the encoded
+`aggregate_memory_objects` / `aggregate_memory_edges`. `connected_check.py`
+gains `--require-aggregates` and fails a report whose encoded objects, memory
+edges or aggregate counts exceed or contradict its own eligible denominators.
+`scale.py` gains `--connected-aggregates` and `--require-aggregate-memory`.
+The schema string is untouched, so the new denominators are read as unknown —
+never zero — when a report does not carry them in every planned row.
+
+### Evidence
+
+LLVM 22.1.8 in `sre-obf-dev:llvm22`, plugin
+`4ff8d68dd25a30117bee1a661f31d5cb2fc268d73de146570f092b226f198158`, the new
+`conformance/fixtures/connected_aggregate.c` plus its second translation unit,
+and 593 vectors through clean, native and stock-post-O2 arms.
+
+- `out/E-final-agg-o0-s3` and `out/E-final-agg-o0-s7`: O0 at two seeds, all
+  three arms agree on 593 vectors, and the required memory, predicate and
+  aggregate gates pass with no planning violations. Eligible closed objects
+  grow from 17 to 20 and eligible closed edges from 112 to 142 against the
+  same fixture; all 142 are encoded, 30 of them across three aggregates — a
+  four-leaf struct, an eight-leaf nested array and a five-leaf struct holding
+  an array.
+- `out/E-final-flagoff-o0-s3` versus `out/E-baseline2-o0-s3`: with the
+  experiment off the new compiler reproduces the previous compiler's protected
+  IR exactly, `3db23a68a918441633bbf394f81a0822dc9819f60665438a2bddf91e3864c856`,
+  and every arm's binary hash. The post-O2 `.ll` text differs only in the
+  input path `opt` records as its module id; its binary is identical.
+- The three negative cases are reported, not encoded: the escaping local as
+  `address-escape-store`, the runtime-indexed array of structs as
+  `dynamic-index`, and the aggregate handed to the other translation unit as
+  `address-escape-call`.
+- `out/E-final-shards64-o0-s3`: `--connected-shards` at a 64-node cap, so the
+  84-node component is oversized while the new objects exist. Four shards
+  select 163 of 184 nodes; one aggregate stays whole inside a single shard and
+  is encoded, and the two that do not fit are dropped whole and reported as
+  `component-budget` with no store redirected. All three arms still agree. At
+  a 40-node cap the same run is correct with all three aggregates dropped, so
+  `--require-aggregates` fails there honestly.
+- `out/E-final-kernel-o0-s3` and `out/E-kernel-o0-s3-noagg`: on the existing
+  connected kernel the experiment is a no-op — eight eligible objects and 54
+  edges either way, and byte-identical protected IR. Turning it on does not
+  shrink or disturb the existing denominator.
+- `out/E-final-kernel-o2-s5` and `out/E-kernel-o2-s4`: O2 at two seeds, six
+  shards and 124 nodes, correct in all three arms with the predicate, shard
+  and family-conversion gates passing.
+- 59 Python unit tests pass, 13 of them new.
+
+**This is eligibility, not protection, and it is narrow.** At O2 the feature
+adds nothing on this fixture: `out/E-final-agg-o2-s4` is correct in all three
+arms and passes its predicate gate, but frontend SROA promotes exactly the
+closed constant-index aggregates the walk accepts, leaving **zero** eligible
+closed-memory objects — the same zero the baseline reports. What survives O2
+there is precisely what the walk rejects. The O2 memory gate therefore fails
+on both fixtures at both flag settings and is not claimed. Real Lua and zlib
+coverage is **not** measured here; no large-program run was made for this
+milestone, so the zero connected-memory coverage recorded for them above still
+stands unrefuted. The full-coverage check is flow-insensitive: it proves every
+loaded leaf has at least one tracked store, not that a store dominates the
+load, so an originally uninitialized read stays an uninitialized read. Runtime
+indices into an aggregate remain rejected by design.
+
 ## Next implementation batch
 
 The private Sol control now reproduces exact recovery in 79.511 seconds with

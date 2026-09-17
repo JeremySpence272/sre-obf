@@ -14,6 +14,10 @@ struct NativeConnectedOptions {
   // Partition an oversized component into bounded shards under the same cost
   // limit instead of skipping it whole. The limit itself is never raised.
   bool Shards = false;
+  // Admit bounded constant-index integer leaves of structs and nested arrays
+  // as closed objects, after a precise use walk. Off, only the narrow scalar
+  // and flat-array rule applies, exactly as before.
+  bool Aggregates = false;
   unsigned GrowthBudget = 0;
 };
 json::Array encodeNativeConnected(Module &, uint64_t, const NativeConnectedOptions &);

@@ -21,10 +21,12 @@ MEMORY_DENOMINATORS = ("sre-native-v2", "sre-native-v3")
 SHARD_ACCOUNTING = ("sre-native-v3",)
 
 
-def coverage_passes(measured, require_flattening=False, require_memory=False, require_shards=False):
+def coverage_passes(measured, require_flattening=False, require_memory=False, require_shards=False,
+                    require_aggregate_memory=False):
     return ((not require_flattening or measured["functions_with_surviving_flattening"] > 0) and
             (not require_memory or measured["memory_edges"] > 0) and
-            (not require_shards or (measured.get("connected_shards") or 0) > 0))
+            (not require_shards or (measured.get("connected_shards") or 0) > 0) and
+            (not require_aggregate_memory or (measured.get("aggregate_memory_objects") or 0) > 0))
 
 
 def coverage(report):
@@ -36,6 +38,16 @@ def coverage(report):
     def estimate(field):
         return sum(r.get(field, 0) for r in planned) if shards else None
 
+    # The aggregate-leaf denominators were added inside sre-native-v3, so the
+    # schema alone cannot say whether a report carries them. A report that
+    # does not carry them in every planned row leaves them unknown, not zero.
+    accounted = [r for r in planned if "eligible_memory_objects" in r]
+
+    def memory_denominator(field):
+        if report["schema"] not in MEMORY_DENOMINATORS or not accounted:
+            return None
+        return sum(r[field] for r in accounted) if all(field in r for r in accounted) else None
+
     names = {r["function"] for r in selected}
     flattened = {r["function"] for r in report["flattening_state"]}
     source_rows = original["functions"]
@@ -46,6 +58,12 @@ def coverage(report):
             "connected_family_conversions": sum(r.get("family_conversions", 0) for r in selected),
             "connected_mixed_family_components": sum(r.get("mixed_family_components", 0) for r in selected),
             "memory_edges": sum(r["memory_edges"] for r in selected),
+            # Aggregate-leaf coverage is reported beside, never instead of,
+            # the eligible denominator it came from.
+            "aggregate_memory_objects": sum(r.get("aggregate_memory_objects", 0) for r in selected),
+            "aggregate_memory_edges": sum(r.get("aggregate_memory_edges", 0) for r in selected),
+            "eligible_closed_aggregate_memory_objects": memory_denominator("eligible_aggregate_memory_objects"),
+            "eligible_closed_memory_leaves": memory_denominator("eligible_memory_leaves"),
             "input_memory_operations": sum(r["loads"] + r["stores"] for r in source_rows),
             "eligible_closed_memory_objects": sum(r.get("eligible_memory_objects", 0) for r in planned) if report["schema"] in MEMORY_DENOMINATORS else None,
             "eligible_closed_memory_edges": sum(r.get("eligible_memory_edges", 0) for r in planned) if report["schema"] in MEMORY_DENOMINATORS else None,
@@ -89,7 +107,10 @@ def main():
                    help="Explicit bounded-shard experiment for oversized connected components; not a promotion flag")
     p.add_argument("--require-flattening", action="store_true")
     p.add_argument("--require-memory", action="store_true")
+    p.add_argument("--connected-aggregates", action="store_true",
+                   help="Explicit bounded constant-index aggregate-leaf memory experiment; not a promotion flag")
     p.add_argument("--require-shards", action="store_true")
+    p.add_argument("--require-aggregate-memory", action="store_true")
     p.add_argument("--post-o2-attack", action="store_true")
     args = p.parse_args()
     if args.scale_budget and args.variant != "v02":
@@ -98,9 +119,14 @@ def main():
         p.error("--connected-shards requires v02")
     if args.require_shards and not args.connected_shards:
         p.error("--require-shards requires --connected-shards")
+    if args.connected_aggregates and args.variant != "v02":
+        p.error("--connected-aggregates requires v02")
+    if args.require_aggregate_memory and not args.connected_aggregates:
+        p.error("--require-aggregate-memory requires --connected-aggregates")
     if args.scale_structure and not args.scale_budget:
         p.error("--scale-structure requires --scale-budget")
-    if args.variant == "control" and (args.require_flattening or args.require_memory or args.require_shards):
+    if args.variant == "control" and (args.require_flattening or args.require_memory or args.require_shards
+                                      or args.require_aggregate_memory):
         p.error("protection coverage cannot be required of a control-only build")
     if args.variant == "control" and args.post_o2_attack:
         p.error("the post-O2 attack requires a protected build")
@@ -132,9 +158,11 @@ def main():
               "scale_budget": args.scale_budget,
               "scale_structure": args.scale_structure,
               "connected_shards": args.connected_shards,
+              "connected_aggregates": args.connected_aggregates,
               "post_o2_attack": args.post_o2_attack,
               "required_coverage": {"flattening": args.require_flattening, "memory": args.require_memory,
-                                    "shards": args.require_shards},
+                                    "shards": args.require_shards,
+                                    "aggregate_memory": args.require_aggregate_memory},
               "input_hash_scope": "sources-and-headers" if "inputs" in spec else "source-files-only"}
     argv = [*map(str, sources), "--out", str(out / "build"), "--toolchain-image", args.toolchain_image,
             "--optimization", "O2", "--seed", str(args.seed), "--no-disassembly",
@@ -151,6 +179,7 @@ def main():
             if args.scale_budget: argv += ["--scale-budget"]
             if args.scale_structure: argv += ["--scale-structure"]
             if args.connected_shards: argv += ["--connected-shards"]
+            if args.connected_aggregates: argv += ["--connected-aggregates"]
     phase = "build"
     try:
         manifest = build(build_parser().parse_args(argv))
@@ -173,7 +202,8 @@ def main():
                 "output_bytes": len(outputs["clean"]), "sha256": hashlib.sha256(outputs["clean"]).hexdigest()})
         result["status"] = "conformance-pass" if result["workloads"] and all(w["differential"] and w["expected_output"] for w in result["workloads"]) else "correctness-failure"
         if result["status"] == "conformance-pass" and args.variant != "control":
-            if not coverage_passes(result["coverage"], args.require_flattening, args.require_memory, args.require_shards):
+            if not coverage_passes(result["coverage"], args.require_flattening, args.require_memory, args.require_shards,
+                                   args.require_aggregate_memory):
                 result["status"] = "coverage-failure"
         result["commands"] = runner.records
     except (OSError, ValueError, ToolFailure) as exc:
