@@ -20,7 +20,19 @@ def invariants(report):
     violations = []
     for row in report["connected_regions"]:
         where = row["function"]
-        if row["status"] != "encoded" and row.get("reason") == "connected-growth-rollback":
+        # A function rejected before planning publishes no accounting at all,
+        # and a rolled-back one republishes its counts as attempted_*. Neither
+        # ever claimed the identity below. Any OTHER row missing the fields is
+        # itself a violation: never crash, and never pass by omission.
+        if row.get("reason") in ("structure-or-size", "connected-growth-rollback"):
+            continue
+        missing = [key for key in ("eligible_estimated_cost", "selected_estimated_cost",
+                                   "skipped_estimated_cost", "shard_lost_estimated_cost",
+                                   "component_estimated_cost_limit", "shard_policy", "shards",
+                                   "sharded_components", "oversized_components", "eligible_nodes")
+                   if key not in row]
+        if missing:
+            violations.append(f"{where}: planning accounting missing {', '.join(missing)}")
             continue
         eligible = row["eligible_estimated_cost"]
         parts = row["selected_estimated_cost"] + row["skipped_estimated_cost"] + row["shard_lost_estimated_cost"]

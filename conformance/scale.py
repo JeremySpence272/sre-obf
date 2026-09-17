@@ -38,6 +38,12 @@ def coverage(report):
     def estimate(field):
         return sum(r.get(field, 0) for r in planned) if shards else None
 
+    def estimate_rolled_back():
+        if not shards:
+            return None
+        return sum(r.get("eligible_estimated_cost", 0) for r in planned
+                   if r.get("reason") == "connected-growth-rollback")
+
     # The aggregate-leaf denominators were added inside sre-native-v3, so the
     # schema alone cannot say whether a report carries them. A report that
     # does not carry them in every planned row leaves them unknown, not zero.
@@ -75,7 +81,8 @@ def coverage(report):
             "connected_selected_estimated_cost": estimate("selected_estimated_cost"),
             "connected_skipped_estimated_cost": estimate("skipped_estimated_cost"),
             "connected_shard_lost_estimated_cost": estimate("shard_lost_estimated_cost"),
-            "estimated_cost_scope": "the planner's own node cost model, not measured instructions; eligible equals selected plus skipped plus shard loss",
+            "connected_rollback_estimated_cost": estimate_rolled_back(),
+            "estimated_cost_scope": "the planner's own node cost model, not measured instructions; per function eligible equals selected plus skipped plus shard loss, EXCEPT for a growth-rolled-back function, which publishes its eligible cost while its selected cost is republished as attempted; connected_rollback_estimated_cost is exactly that aggregate gap",
             "memory_eligibility_scope": "supported closed entry allocas in analyzed functions; NOT all program memory operations",
             "memory_object_skips": dict(Counter(o["reason"] for r in planned
                                               for o in r.get("objects", []) if o["status"] == "skipped")),

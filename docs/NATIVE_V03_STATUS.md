@@ -536,6 +536,69 @@ costs one further word, which is closed-form, in the binary, and recoverable by
 a slice that runs in under a fifth of a second. **This is a small, real,
 measured transfer failure, not hardness**, and the coupling only exists where a
 function keeps both an encoded region and a surviving dispatcher.
+## The values width gate reads the planner that ran
+
+`conformance/run.py` asked for persistent-value width coverage in
+`native_report["values"]`, which only the legacy planner writes. Under
+`--region-plan connected` the connected branch of `NativeObfuscation.cpp` never
+calls `encodeNativeValues`, so that array is always empty and
+`python3 -m conformance.run --case values --region-plan connected` failed with
+"persistent-value width coverage is incomplete" at every node cap, with every
+connected subfeature off. The check predates the connected planner (`7718e7e`).
+It was a dead gate, not a finding.
+
+The connected planner now publishes per function the distinct integer widths of
+the nodes it actually encoded, ascending, and the number of PHI nodes it
+encoded as a pair — the same two facts the legacy planner already reported.
+Both are read before the node instructions are erased. `check_value_coverage()`
+selects its evidence from `features.region_plan`, the plan the compiler
+recorded as active, and requires the same four widths, 8/16/32/64, of whichever
+planner ran. Extra widths are extra coverage rather than a violation, because
+connected regions also encode i1 branch predicates; the legacy planner's
+`supportedWidth()` admits only the four, so its observed set is unchanged.
+The requirement was not weakened and no law was narrowed. A planner that
+reports no widths now fails by name instead of being read as a pass, and a
+`connected-growth-rollback` row keeps only its eligibility denominators, so an
+undone encoding still contributes no widths.
+
+Evidence, LLVM 22.1.8, seed 3 unless stated:
+
+- `out/F-values-connected-1`: connected plan at the default 128-node cap. The
+  four fixture functions encode widths `[8]`, `[16]`, `[64]` and `[16, 32, 64]`;
+  `obf_target` contributes 2 encoded PHI pairs and 125 persistent edges. 209
+  vectors agree across the release, control and native arms. The gate passes
+  because the coverage exists, not because it was skipped.
+- `out/F-values-legacy-1`: legacy plan, unchanged. Widths `[8]`, `[16]`, `[64]`
+  and `[32, 64]`, `connected_regions` empty, gate passes as before.
+- `out/F-values-cap4`: `--connected-nodes 4`. One region genuinely encodes, four
+  nodes at width 64, and the gate fails with "persistent-value width coverage is
+  incomplete: missing 8, 16, 32". `out/F-values-connected-cap2` fails earlier
+  still, with no encoded region at all. The gate can still fail.
+- `out/F-family-o0-s3` and `out/F-family-o0-s5`: cross-TU O0 fixture, two seeds.
+  593 vectors, clean/native/stock-post-O2 outputs agree; required memory and
+  predicate coverage pass; no planning violations. The producer reports widths
+  `[1, 8, 32, 64]`, so the i1 predicates appear in the evidence rather than
+  being filtered out of it.
+- `out/F-family-o2-s4`: O2 with `--connected-shards`, seed 4. 593 vectors agree
+  in all three arms; predicate, family-conversion and shard coverage pass; six
+  shards of one oversized component. The requested memory gate fails honestly:
+  no closed-memory object survives O2 on this fixture.
+  `out/F-control-main-o2-s4` reproduces that same failure from the `49d9b0e`
+  compiler with byte-identical protected IR, so it is a pre-existing fixture
+  limitation and not a regression from this change.
+- Flag-off control: all eleven default `conformance.run` cases at seed 3 produce
+  protected IR hashes identical to the `49d9b0e` build
+  (`out/F-control-mine-defaults` against `out/F-control-main-defaults`). The
+  connected path matches too: `out/F-values-connected-1` and
+  `out/F-control-main-connected` share protected IR `8cab6078`. This change adds
+  no `cl::opt`, no harness flag and no instruction; it is report-only.
+- Python unit suite: 56 tests pass, ten of them new, including the
+  incomplete-width, predicate-only, rolled-back and wrong-planner cases that
+  must fail.
+
+Report rows gained `widths` and `phi_pairs`; the `schema` string is untouched
+and a version bump is owed at integration. This closes a dead gate. It is not
+new protection and it is not hardness evidence.
 
 ## Next implementation batch
 

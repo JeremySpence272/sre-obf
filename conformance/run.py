@@ -22,6 +22,38 @@ CASES = ("arithmetic", "data", "widths", "constructors", "merging", "strings",
 LANE_TRANSITIONS = {"off": 0, "on": 1, "stale-relation": 2}
 
 
+# Required persistent-value widths. Both planners must cover all four.
+VALUE_WIDTHS = frozenset({8, 16, 32, 64})
+# Each planner publishes its own evidence rows: the legacy planner writes
+# "values", the connected planner writes "connected_regions". Only one of them
+# runs, so the gate must read the one the compiler recorded as active.
+VALUE_EVIDENCE = {"legacy": "values", "connected": "connected_regions"}
+
+
+def check_value_coverage(native_report: dict) -> None:
+    """Require the four persistent-value widths from whichever planner ran.
+
+    Raises ToolFailure naming what is missing. Extra widths are extra coverage,
+    not a violation: the connected planner also encodes i1 branch predicates,
+    while the legacy planner only ever selects the four required widths.
+    """
+    plan = native_report["features"]["region_plan"]
+    if plan not in VALUE_EVIDENCE:
+        raise ToolFailure(f"region plan {plan!r} publishes no persistent-value evidence")
+    encoded = [row for row in native_report[VALUE_EVIDENCE[plan]]
+               if row["status"] == "encoded"]
+    if not encoded:
+        raise ToolFailure(f"the {plan} planner encoded no persistent values")
+    if any("widths" not in row or "phi_pairs" not in row for row in encoded):
+        raise ToolFailure(f"the {plan} planner did not report encoded widths")
+    missing = VALUE_WIDTHS - {w for row in encoded for w in row["widths"]}
+    if missing:
+        raise ToolFailure("persistent-value width coverage is incomplete: missing "
+                          + ", ".join(str(w) for w in sorted(missing)))
+    if not any(row["phi_pairs"] and row["persistent_edges"] for row in encoded):
+        raise ToolFailure("persistent-value loop/join coverage is missing")
+
+
 def test_inputs(count: int = 128) -> bytes:
     edges = (0, 1, 2, 7, 31, 32, 0x7fffffff, 0x80000000, 0xffffffff)
     values = [(x, y) for x in edges for y in edges]
@@ -180,11 +212,7 @@ def run_case(args: argparse.Namespace, name: str, seed: int, out: Path) -> dict:
                 raise ToolFailure("required data/control coupling did not survive")
         enabled_pass = lambda name: not args.passes or name in args.passes.split(",")
         if name == "values" and args.values:
-            encoded = [v for v in native_report["values"] if v["status"] == "encoded"]
-            if {w for v in encoded for w in v["widths"]} != {8, 16, 32, 64}:
-                raise ToolFailure("persistent-value width coverage is incomplete")
-            if not any(v["phi_pairs"] and v["persistent_edges"] for v in encoded):
-                raise ToolFailure("persistent-value loop/join coverage is missing")
+            check_value_coverage(native_report)
         if name == "values" and args.outline:
             outlined = [v for v in native_report["outlined_regions"] if v["status"] == "outlined"]
             if not outlined:
