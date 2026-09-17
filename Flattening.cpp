@@ -396,6 +396,10 @@ namespace {
 				B.getInt32(PCtx.MultiRng.u32()), "fla.multi.next.key");
 			Value* NS = B.CreateXor(rotl32ir(B, B.CreateAdd(S, T), 7),
 				B.CreateAdd(NK, B.getInt32(PCtx.MultiRng.u32())), "fla.multi.next.salt");
+			// Words that actually key the emitted token. Without the P6 experiment
+			// they are exactly the two words the dispatcher loads from memory.
+			Value* EK = NK;
+			Value* ES = NS;
 			if (PCtx.ValueContext) {
 				if (PCtx.ValueWitness)
 					V = B.CreateXor(V, obf::nativeResidual(B, PCtx.ValueContext, PCtx.ValueWitness));
@@ -404,11 +408,23 @@ namespace {
 				// flattening prologue where insertion order could precede that store.
 				auto* History = B.CreateLoad(B.getInt32Ty(), PCtx.ValueContext);
 				History->setVolatile(true);
-				NK = B.CreateAdd(NK, History);
-				NS = B.CreateXor(NS, rotl32ir(B, History, 13));
+				if (obf::nativeLaneTransitions()) {
+					// P6. Fix the next data word BEFORE encoding, and leave it out of
+					// the stored key/salt, so the dispatcher has to re-read the live
+					// word that the pinned lanes wrote. Both ends call one relation.
+					NextContext = B.CreateXor(rotl32ir(B, History, 7),
+						B.CreateAdd(V, B.getInt32(PCtx.MultiRng.u32())), "fla.lane.next");
+					obf::nativeLaneKeys(B, EK, ES, NextContext);
+				} else {
+					NK = B.CreateAdd(NK, History);
+					NS = B.CreateXor(NS, rotl32ir(B, History, 13));
+					EK = NK;
+					ES = NS;
+				}
 			}
-			V = multiStateEncode(B, PCtx, V, NK, NS);
-			if (PCtx.ValueContext) NextContext = B.CreateXor(V, NS);
+			V = multiStateEncode(B, PCtx, V, EK, ES);
+			if (PCtx.ValueContext && !obf::nativeLaneTransitions())
+				NextContext = B.CreateXor(V, NS);
 			B.CreateStore(NK, PCtx.MultiKey)->setVolatile(true);
 			B.CreateStore(NS, PCtx.MultiSalt)->setVolatile(true);
 		}
@@ -1487,12 +1503,23 @@ namespace {
 			auto* S = B.CreateLoad(B.getInt32Ty(), PCtx.MultiSalt, "fla.multi.salt.load");
 			K->setVolatile(true);
 			S->setVolatile(true);
+			Value* EK = K;
+			Value* ES = S;
+			// Mode 1 reads the live data word here. Mode 2 is the canonical-repair
+			// arm: the transition is keyed on the lane but the dispatcher keeps the
+			// old three-word relation, which is exactly what replaying the previous
+			// canonicalizing script against this build assumes.
+			if (obf::nativeLaneTransitions() == 1 && PCtx.ValueContext) {
+				auto* Lane = B.CreateLoad(B.getInt32Ty(), PCtx.ValueContext, "fla.multi.lane.load");
+				Lane->setVolatile(true);
+				obf::nativeLaneKeys(B, EK, ES, Lane);
+			}
 			if (PCtx.Cfg.PerDispatcherDomain)
 				Token = dispatcherDomainIR(B, Token, I, Ctx);
 			for (unsigned J = 0; J < Cases.size(); ++J) {
 				B.SetInsertPoint(Current);
 				Value* Candidate = PCtx.Opaque.opaqueI32Const(B, Cases[J].first);
-				Value* Expected = multiStateEncode(B, PCtx, Candidate, K, S);
+				Value* Expected = multiStateEncode(B, PCtx, Candidate, EK, ES);
 				if (PCtx.Cfg.PerDispatcherDomain)
 					Expected = dispatcherDomainIR(B, Expected, I, Ctx);
 				Value* Match = B.CreateICmpEQ(Token, Expected, "fla.multi.match");

@@ -23,4 +23,21 @@ inline void storeNativeWitness(IRBuilder<> &B, AllocaInst *W, Value *H) {
   S->setVolatile(true);
   S->setMetadata("sre.native.invariant.update", MDNode::get(B.getContext(), {}));
 }
+
+// P6 experiment selector: 0 off, 1 lane-keyed dispatcher transitions,
+// 2 stale-relation ablation (transitions keyed, dispatcher reads the old
+// three-word relation). Defined once in NativeConnected.cpp.
+unsigned nativeLaneTransitions();
+
+// The single definition of the lane-keyed dispatcher relation, used by both the
+// transition that encodes a token and the dispatcher that re-encodes candidates.
+// Lane is the live per-activation encoded-data word. This is ordinary software
+// state that is present in the binary: an analyst who reads it can still rebase
+// the control state. It only removes the option of canonicalizing a dispatcher
+// from the three flattening words alone.
+inline void nativeLaneKeys(IRBuilder<> &B, Value *&Key, Value *&Salt, Value *Lane) {
+  Value *Rotate = B.CreateOr(B.CreateShl(Lane, 13), B.CreateLShr(Lane, 19));
+  Key = B.CreateAdd(Key, Lane, "sre.lane.key");
+  Salt = B.CreateXor(Salt, Rotate, "sre.lane.salt");
+}
 }

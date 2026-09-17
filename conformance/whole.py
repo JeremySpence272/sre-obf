@@ -14,6 +14,12 @@ EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "in
                "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure",
                "connected-shards", "connected-aggregates", "joint-outputs")
 
+# P6 useful data/control relation experiment. "stale-relation" is the
+# canonical-repair arm: transitions are keyed on the live encoded-data word
+# while the dispatcher keeps the previous three-word relation. It is an attack
+# replay and is expected to break the program, not a protection mode.
+LANE_TRANSITIONS = {"off": 0, "on": 1, "stale-relation": 2}
+
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
@@ -31,6 +37,8 @@ def parser():
     p.add_argument("--link-flag", action="append", default=[])
     for name in EXPERIMENTS:
         p.add_argument("--" + name, action="store_true")
+    p.add_argument("--lane-transitions", choices=tuple(LANE_TRANSITIONS), default="off",
+                   help="P6: key dispatcher transitions on the live encoded-data word")
     p.add_argument("--value-nodes", type=int, default=24)
     p.add_argument("--region-plan", choices=("legacy", "connected"), default="legacy")
     p.add_argument("--connected-nodes", type=int, default=128)
@@ -56,6 +64,8 @@ def build(args):
         raise ValueError("--coupled-state requires --values")
     if args.invariant and not args.coupled_state:
         raise ValueError("--invariant requires --coupled-state")
+    if args.lane_transitions != "off" and not args.coupled_state:
+        raise ValueError("--lane-transitions requires --coupled-state; the lane word is the value pass's context")
     if args.region_plan == "connected" and not (args.values and args.values_wide):
         raise ValueError("connected regions require --values --values-wide")
     if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
@@ -113,7 +123,8 @@ def build(args):
                     "-S", str(linked), "-o", str(prepared)])
     protected = out / "protected.ll"
     feature_flags = [f"-native-{name}={int(getattr(args, name.replace('-', '_')))}" for name in EXPERIMENTS]
-    feature_flags += [f"-native-region-plan={args.region_plan}", f"-native-connected-nodes={args.connected_nodes}"]
+    feature_flags += [f"-native-region-plan={args.region_plan}", f"-native-connected-nodes={args.connected_nodes}",
+                      f"-native-lane-transitions={LANE_TRANSITIONS[args.lane_transitions]}"]
     if not args.control_only:
         runner.run(opt_command(plugin) + ["-passes=native-obfuscation", f"-native-level={args.profile}",
                 *feature_flags, f"-native-value-nodes={args.value_nodes}",

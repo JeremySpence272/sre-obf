@@ -18,6 +18,9 @@ FIXTURES = ROOT / "conformance" / "fixtures"
 CASES = ("arithmetic", "data", "widths", "constructors", "merging", "strings",
          "literal", "foldable", "state", "values", "wide")
 
+# P6 useful data/control relation experiment; see conformance/whole.py.
+LANE_TRANSITIONS = {"off": 0, "on": 1, "stale-relation": 2}
+
 
 def test_inputs(count: int = 128) -> bytes:
     edges = (0, 1, 2, 7, 31, 32, 0x7fffffff, 0x80000000, 0xffffffff)
@@ -72,6 +75,7 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
               for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions", "scale_budget",
                            "scale_structure", "connected_shards", "connected_aggregates",
                            "joint_outputs")),
+            f"-native-lane-transitions={LANE_TRANSITIONS[getattr(args, 'lane_transitions', 'off')]}",
             f"-native-family={args.family}"]
 
 
@@ -345,6 +349,8 @@ def parser() -> argparse.ArgumentParser:
                  "scale-structure", "connected-shards", "connected-aggregates",
                  "joint-outputs"):
         p.add_argument("--" + name, action="store_true")
+    p.add_argument("--lane-transitions", choices=tuple(LANE_TRANSITIONS), default="off",
+                   help="P6: key dispatcher transitions on the live encoded-data word")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--probe-helpers", type=int, default=0,
                    help="Informed-entry probes for up to N distinct helper roles")
@@ -379,8 +385,9 @@ def main(argv=None) -> int:
         raise SystemExit("--connected-nodes must be 2..512")
     if args.region_plan == "connected" and not (args.values and args.values_wide):
         raise SystemExit("connected regions require --values --values-wide")
-    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
-            args.scale_budget, args.joint_outputs)) and args.region_plan != "connected":
+    if (any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
+             args.scale_budget, args.connected_shards, args.connected_aggregates, args.joint_outputs))
+            or args.lane_transitions != "off") and args.region_plan != "connected":
         raise SystemExit("connected subfeatures require --region-plan connected")
     if args.memory_ssa and not args.memory:
         raise SystemExit("--memory-ssa requires --memory")
@@ -390,6 +397,8 @@ def main(argv=None) -> int:
         raise SystemExit("--scale-structure requires --scale-budget")
     if args.coupled_state and (not args.values or args.no_multistate):
         raise SystemExit("--coupled-state requires --values and multi-state flattening")
+    if args.lane_transitions != "off" and not args.coupled_state:
+        raise SystemExit("--lane-transitions requires --coupled-state; the lane word is the value pass's context")
     if not 0 <= args.probe_helpers <= 8:
         raise SystemExit("--probe-helpers must be between 0 and 8")
     if any(seed < 0 or seed >= 2**64 for seed in args.seed or [1]):

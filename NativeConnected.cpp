@@ -9,12 +9,20 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Support/CommandLine.h"
 #include <memory>
 #include <numeric>
 #include <vector>
 
 using namespace llvm;
 namespace llvm::obf {
+namespace {
+cl::opt<unsigned> NativeLaneTransitionsOpt("native-lane-transitions",
+    cl::desc("P6 experiment: key flattening dispatcher transitions on the live encoded-data "
+             "word (0 off, 1 on, 2 stale-relation ablation for the canonical-repair arm)"),
+    cl::init(0));
+}
+unsigned nativeLaneTransitions() { return NativeLaneTransitionsOpt; }
 namespace {
 bool width(Type *T, bool Boolean = false) {
   return (T->isIntegerTy() && llvm::is_contained(ArrayRef<unsigned>{8, 16, 32, 64}, T->getIntegerBitWidth())) ||
@@ -887,7 +895,19 @@ public:
       IRBuilder<> B(getAllocaIP(F));
       Context = B.CreateAlloca(B.getInt32Ty(), nullptr, "sre.value.context");
       Context->setMetadata("sre.native.context", MDNode::get(F.getContext(), {}));
-      Value *H = B.getInt32(RNG.fork("context").u32()); B.CreateStore(H, Context)->setVolatile(true);
+      Value *H = B.getInt32(RNG.fork("context").u32());
+      if (O.LaneTransitions) {
+        // Every later value of this word already comes from pinned lane
+        // coordinates. Seed it from a live argument too, so the first
+        // transition of an activation is not keyed on a build constant.
+        // Freeze first: an undef argument must not make this poison.
+        for (Argument &A : F.args())
+          if (A.getType()->isIntegerTy()) {
+            H = B.CreateXor(H, B.CreateZExtOrTrunc(B.CreateFreeze(&A), B.getInt32Ty()), "sre.lane.seed");
+            break;
+          }
+      }
+      B.CreateStore(H, Context)->setVolatile(true);
       if (O.Invariant) {
         Witness = B.CreateAlloca(B.getInt32Ty(), nullptr, "sre.value.witness");
         Witness->setMetadata("sre.native.witness", MDNode::get(F.getContext(), {}));
@@ -970,7 +990,9 @@ public:
         {"aggregate_memory_objects", AggregateObjects}, {"aggregate_memory_edges", AggregateMemoryEdges},
         {"family_conversions", FamilyConversions}, {"mixed_family_components", MixedComponents},
         {"boundary_inputs", Inputs}, {"boundary_outputs", Outputs}, {"multiply_decode_bridges", MultiplyBridges},
-        {"reachable_invariant", Witness != nullptr}};
+        {"reachable_invariant", Witness != nullptr},
+        {"lane_transitions", O.LaneTransitions},
+        {"lane_word", Context != nullptr && O.LaneTransitions ? "sre.value.context" : ""}};
     accounting(Item);
     Item["objects"] = std::move(ObjectReport);
     return Item;

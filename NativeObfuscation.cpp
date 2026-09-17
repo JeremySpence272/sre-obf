@@ -2,6 +2,7 @@
 #include "llvm/Transforms/Obfuscator/NativeEncoding.h"
 #include "llvm/Transforms/Obfuscator/NativeRegions.h"
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
+#include "llvm/Transforms/Obfuscator/NativeInvariant.h"
 #include "llvm/Transforms/Obfuscator/NativeBudget.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
@@ -316,6 +317,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.JointOutputs = NativeJointOutputs;
     Options.CoupleState = NativeCoupledState;
     Options.Invariant = NativeInvariant;
+    Options.LaneTransitions = obf::nativeLaneTransitions();
     if (NativeScaleBudget) {
       checkModuleBudget(M, "before-connected-allocation");
       Options.BoundedGrowth = true;
@@ -523,12 +525,17 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     json::Array StateCoverage;
     for (const Function &F : M) {
       unsigned Words = 0, Comparisons = 0, DataUpdates = 0, ControlUpdates = 0;
+      unsigned LaneReads = 0;
       for (const Instruction &I : instructions(F)) {
         if (isa<AllocaInst>(I) &&
             (I.getName() == "fla.state" || I.getName() == "fla.multi.key" ||
              I.getName() == "fla.multi.salt")) ++Words;
         if (isa<ICmpInst>(I) && I.getName().starts_with("fla.multi.match"))
           ++Comparisons;
+        // Inventory the final IR: a dispatcher that survived rollback and later
+        // rewrites actually reads the live data word this many times.
+        if (isa<LoadInst>(I) && I.getName().starts_with("fla.multi.lane.load"))
+          ++LaneReads;
         if (auto *Tag = I.getMetadata("sre.native.context.update")) {
           StringRef Role = cast<MDString>(Tag->getOperand(0))->getString();
           if (Role == "data") ++DataUpdates;
@@ -538,6 +545,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       if (Words) StateCoverage.push_back(json::Object{
           {"function", F.getName().str()}, {"words", Words},
           {"coupled_data_updates", DataUpdates}, {"coupled_control_updates", ControlUpdates},
+          {"lane_keyed_dispatcher_reads", LaneReads},
           {"remaining_named_comparisons", Comparisons}});
     }
     std::error_code EC;
@@ -566,6 +574,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"connected_shards", NativeConnectedShards.getValue()},
                             {"connected_aggregates", NativeConnectedAggregates.getValue()},
                             {"joint_outputs", NativeJointOutputs.getValue()},
+                            {"lane_transitions", obf::nativeLaneTransitions()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
                         {"fused_calls", std::move(FusionCoverage)}, {"memory", std::move(MemoryCoverage)},
