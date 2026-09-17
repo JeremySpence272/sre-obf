@@ -49,3 +49,16 @@ def compare(x, y, width, signed=False, equality=False, logical_shift=lambda valu
     bxor, bnot, band, bor, _, _ = operations(1)
     different = bxor(sx, sy)
     return bor(band(different, sx), band(bnot(different), result))
+
+
+def xor_to_additive(x, refresh, width):
+    mask = (1 << width) - 1
+    return ((x[0] + x[1] - 2 * (x[0] & x[1]) + refresh) & mask, refresh & mask)
+
+
+def additive_to_xor(x, a, r, width, logical_shift=lambda value, amount: value >> amount):
+    mask = (1 << width) - 1
+    left = (x[0] ^ a, a & mask)
+    right = (x[1] ^ r, r & mask)
+    xor, inv, *_ = operations(width, logical_shift)
+    return add(left, inv(right), width, True, logical_shift)

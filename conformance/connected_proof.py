@@ -8,7 +8,8 @@ import argparse
 import json
 import time
 from pathlib import Path
-from conformance.connected_model import operations, add, compare
+from conformance.connected_model import (operations, add, compare,
+                                         xor_to_additive, additive_to_xor)
 
 
 def main():
@@ -24,21 +25,24 @@ def main():
         x, y, r, s = z3.BitVecs("x y r s", width)
         a, b = (x ^ r, r), (y ^ s, s)
         xor, inv, land, lor, shl, lshr = operations(width, z3.LShR)
-        cases = [("and", land(a, b), x & y),
-                 ("or", lor(a, b), x | y),
-                 ("add", add(a, b, width, logical_shift=z3.LShR), x + y),
-                 ("sub", add(a, inv(b), width, True, z3.LShR), x - y)]
+        cases = [("and", land(a, b), x & y, "xor"),
+                 ("or", lor(a, b), x | y, "xor"),
+                 ("add", add(a, b, width, logical_shift=z3.LShR), x + y, "xor"),
+                 ("sub", add(a, inv(b), width, True, z3.LShR), x - y, "xor")]
         for name, signed, equality in (("eq", False, True), ("ult", False, False), ("slt", True, False)):
             expected = x == y if equality else x < y if signed else z3.ULT(x, y)
             cases.append((name, compare(a, b, width, signed, equality, z3.LShR),
-                          z3.If(expected, z3.BitVecVal(1, width), z3.BitVecVal(0, width))))
+                          z3.If(expected, z3.BitVecVal(1, width), z3.BitVecVal(0, width)), "xor"))
         # Additive multiplication used by arithmetic-only components.
         ae, be, mask = x + r, y + s, r ^ s
-        cases.append(("affine-mul", (ae * be - (ae * s + be * r) + r * s + mask, mask), x * y))
-        for name, pair, expected in cases:
+        affine = xor_to_additive(a, s, width)
+        cases.append(("xor-to-additive", affine, x, "additive"))
+        cases.append(("additive-to-xor", additive_to_xor(affine, r, s, width, z3.LShR), x, "xor"))
+        cases.append(("affine-mul", (ae * be - (ae * s + be * r) + r * s + mask, mask), x * y, "additive"))
+        for name, pair, expected, representation in cases:
             solver = z3.SolverFor("QF_BV")
             solver.set(timeout=args.milliseconds)
-            decoded = pair[0] - pair[1] if name == "affine-mul" else pair[0] ^ pair[1]
+            decoded = pair[0] - pair[1] if representation == "additive" else pair[0] ^ pair[1]
             solver.add(decoded != expected)
             start = time.monotonic()
             answer = solver.check()
@@ -48,7 +52,7 @@ def main():
             if answer == z3.sat: result["model"] = str(solver.model())
             results.append(result)
             print(width, name, result["status"], flush=True)
-    report = {"schema": "sre-connected-reference-proofs-v1", "z3": z3.get_version_string(),
+    report = {"schema": "sre-connected-reference-proofs-v2", "z3": z3.get_version_string(),
               "scope": "reference laws only; not LLVM lowering, memory safety, ABI, or hardness",
               "per_law_timeout_ms": args.milliseconds, "results": results,
               "passed": all(r["status"] == "proved" for r in results)}

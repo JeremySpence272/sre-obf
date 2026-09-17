@@ -30,6 +30,8 @@ def coverage(report):
             "connected_functions": len(selected), "connected_nodes": sum(r["nodes"] for r in selected),
             "connected_eligible_nodes": sum(r.get("eligible_nodes", 0) for r in report.get("connected_regions", [])),
             "connected_predicates": sum(r["predicates"] for r in selected),
+            "connected_family_conversions": sum(r.get("family_conversions", 0) for r in selected),
+            "connected_mixed_family_components": sum(r.get("mixed_family_components", 0) for r in selected),
             "memory_edges": sum(r["memory_edges"] for r in selected),
             "input_memory_operations": sum(r["loads"] + r["stores"] for r in source_rows),
             "eligible_closed_memory_objects": sum(r.get("eligible_memory_objects", 0) for r in report.get("connected_regions", [])) if report["schema"] == "sre-native-v2" else None,

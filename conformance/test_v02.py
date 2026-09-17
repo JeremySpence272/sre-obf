@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 from conformance.fetch_scale import extract
 from conformance.recovery_reach import check_expression, validate
-from conformance.connected_model import compare, add
+from conformance.connected_model import compare, add, xor_to_additive, additive_to_xor
 from conformance.whole import parser
 from conformance.scale import coverage, coverage_passes
 
@@ -30,6 +30,16 @@ class ReplayTests(unittest.TestCase):
 
 
 class ConnectedTests(unittest.TestCase):
+    def test_direct_cross_family_conversions(self):
+        rng = random.Random(6204)
+        for width in (1, 4, 8, 16, 32, 64):
+            mask = (1 << width) - 1
+            for _ in range(3000):
+                value, share, refresh, a, r = [rng.getrandbits(width) for _ in range(5)]
+                additive = xor_to_additive((value ^ share, share), refresh, width)
+                self.assertEqual((additive[0] - additive[1]) & mask, value)
+                pair = additive_to_xor(additive, a, r, width)
+                self.assertEqual(pair[0] ^ pair[1], value)
     def test_shared_add_sub(self):
         rng = random.Random(6203)
         for width in (1, 4, 8, 16, 32, 64):

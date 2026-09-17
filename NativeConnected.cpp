@@ -45,7 +45,7 @@ struct Object {
 };
 struct Region {
   SmallVector<Instruction *, 32> Nodes;
-  unsigned ID = 0, Cost = 0, Score = 0;
+  unsigned ID = 0, Component = 0, Cost = 0, Score = 0;
   bool Affine = false;
 };
 
@@ -64,6 +64,7 @@ class Encoder {
   unsigned Inputs = 0, Outputs = 0, Predicates = 0, MultiplyBridges = 0;
   unsigned MemoryEdges = 0, PersistentEdges = 0, SkippedComponents = 0, Site = 0, Copies = 0, EligibleNodes = 0;
   unsigned EligibleMemoryEdges = 0;
+  unsigned FamilyConversions = 0, MixedComponents = 0;
   json::Array ObjectReport;
 
   ConstantInt *constant(Type *T, uint64_t X) {
@@ -104,6 +105,27 @@ class Encoder {
       if (D * 2 < W) P = band(B, P, shl(B, P, D));
     }
     return bxor(B, Original, shl(B, G, 1));
+  }
+  Pair convertFamily(IRBuilder<> &B, Pair X, bool FromAffine, bool ToAffine) {
+    if (FromAffine == ToAffine) return X;
+    ++FamilyConversions;
+    Type *T = X.E->getType();
+    if (ToAffine) {
+      // e xor r = e + r - 2*(e & r). Add a fresh second coordinate
+      // without ever creating the decoded scalar as an SSA value.
+      Value *R = constant(T, RNG.fork("conversion").fork(Site++).u64());
+      Value *TwiceBoth = B.CreateMul(B.CreateAnd(X.E, X.R), constant(T, 2));
+      Value *E = B.CreateAdd(B.CreateSub(B.CreateAdd(X.E, X.R), TwiceBoth), R);
+      return {E, R};
+    }
+    // Treat each additive coordinate as a separately shared XOR value, then
+    // subtract them with the verified carry network. Neither input share is
+    // the decoded value e-r.
+    Value *A = constant(T, RNG.fork("conversion-a").fork(Site++).u64());
+    Value *R = constant(T, RNG.fork("conversion-r").fork(Site++).u64());
+    Pair EShare{B.CreateXor(X.E, A), A};
+    Pair RShare{B.CreateXor(X.R, R), R};
+    return badd(B, EShare, bnot(B, RShare), true);
   }
   Pair less(IRBuilder<> &B, Pair X, Pair Y, bool Signed) {
     Pair P = bnot(B, bxor(B, X, Y)), G = band(B, bnot(B, X), Y);
@@ -157,8 +179,9 @@ class Encoder {
   }
   Pair input(IRBuilder<> &B, Value *V, unsigned RegionID) {
     if (auto *I = dyn_cast<Instruction>(V); I && RegionOf.count(I)) {
-      assert(RegionOf.lookup(I) == RegionID && "connected edge has inconsistent representation");
-      return emit(I);
+      unsigned Source = RegionOf.lookup(I);
+      return convertFamily(B, emit(I), Regions[Source].Affine,
+                           Regions[RegionID].Affine);
     }
     ++Inputs;
     Value *X = B.CreateFreeze(V);
@@ -283,18 +306,42 @@ class Encoder {
       return uint64_t(A.Score) * B.Cost > uint64_t(B.Score) * A.Cost;
     });
     unsigned Cost = 0;
+    unsigned Component = 0;
     for (Region &R : Planned) {
       unsigned Limit = O.BoundedGrowth ? std::min(20000u, O.GrowthBudget) : 20000;
       if (R.Nodes.size() < 2 || Nodes.size() + R.Nodes.size() > O.Nodes || Cost + R.Cost > Limit) {
         ++SkippedComponents; continue;
       }
-      R.ID = Regions.size();
-      R.Affine = O.Families && (RNG.fork("family").fork(R.ID).u32() & 1);
+      auto SupportsAffine = [](Instruction *I) {
+        return llvm::is_contained(ArrayRef<unsigned>{Instruction::Add, Instruction::Sub,
+            Instruction::Mul, Instruction::Shl, Instruction::PHI, Instruction::Load},
+            I->getOpcode());
+      };
+      bool HasMul = llvm::any_of(R.Nodes, [](Instruction *I) {
+        return I->getOpcode() == Instruction::Mul;
+      });
+      bool HasRequiredXor = llvm::any_of(R.Nodes, [&](Instruction *I) {
+        return !SupportsAffine(I);
+      });
+      bool HasAffine = llvm::any_of(R.Nodes, SupportsAffine);
+      bool UseAffine = O.Families && HasAffine && (HasMul || HasRequiredXor ||
+          (RNG.fork("family-partition").fork(Component).u32() & 1));
+      Region Affine, Xor;
+      Affine.Affine = true; Xor.Affine = false;
       for (Instruction *I : R.Nodes)
-        if (!llvm::is_contained(ArrayRef<unsigned>{Instruction::Add, Instruction::Sub, Instruction::Mul,
-              Instruction::Shl, Instruction::PHI, Instruction::Load}, I->getOpcode())) R.Affine = false;
-      for (Instruction *I : R.Nodes) { RegionOf[I] = R.ID; Nodes.push_back(I); }
-      Cost += R.Cost; Regions.push_back(std::move(R));
+        (UseAffine && SupportsAffine(I) ? Affine : Xor).Nodes.push_back(I);
+      if (!Affine.Nodes.empty() && !Xor.Nodes.empty()) ++MixedComponents;
+      for (Region *Part : {&Affine, &Xor}) {
+        if (Part->Nodes.empty()) continue;
+        Part->ID = Regions.size(); Part->Component = Component;
+        Part->Cost = R.Cost * Part->Nodes.size() / R.Nodes.size();
+        Part->Score = R.Score * Part->Nodes.size() / R.Nodes.size();
+        for (Instruction *I : Part->Nodes) {
+          RegionOf[I] = Part->ID; Nodes.push_back(I);
+        }
+        Regions.push_back(std::move(*Part));
+      }
+      Cost += R.Cost; ++Component;
     }
   }
   void prepareMemory() {
@@ -458,7 +505,7 @@ public:
       DecodedAt[Key] = Plain;
     }
     json::Array RegionReport;
-    for (const Region &R : Regions) RegionReport.push_back(json::Object{{"id", R.ID}, {"nodes", R.Nodes.size()},
+    for (const Region &R : Regions) RegionReport.push_back(json::Object{{"id", R.ID}, {"component", R.Component}, {"nodes", R.Nodes.size()},
         {"estimated_cost", R.Cost}, {"representation", R.Affine ? "additive-pair-v1" : "xor-prefix-pair-v1"}});
     for (StoreInst *S : MemoryStores) S->eraseFromParent();
     for (Instruction *I : Nodes) I->dropAllReferences();
@@ -474,6 +521,7 @@ public:
         {"eligible_memory_edges", EligibleMemoryEdges}, {"eligible_memory_objects", Objects.size()},
         {"regions", std::move(RegionReport)}, {"skipped_components", SkippedComponents},
         {"persistent_edges", PersistentEdges}, {"memory_edges", MemoryEdges}, {"predicates", Predicates},
+        {"family_conversions", FamilyConversions}, {"mixed_family_components", MixedComponents},
         {"boundary_inputs", Inputs}, {"boundary_outputs", Outputs}, {"multiply_decode_bridges", MultiplyBridges},
         {"objects", std::move(ObjectReport)}, {"normalized_copies", Copies}, {"reachable_invariant", Witness != nullptr}};
   }

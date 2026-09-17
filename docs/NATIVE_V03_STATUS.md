@@ -81,7 +81,48 @@ correctness failure and does not erase successful workload evidence.
   the compiler repairs; existing coverage/growth limitations remain.
 - 32 Python unit tests pass. Additional seed/post-O2 large runs are pending.
 
+Seed 2 SQLite and zlib runs with the structural allocator and a stock post-O2
+attack also preserve their unchanged workloads. SQLite retains 109 flattened
+functions and six memory edges. Zlib retains 81 flattened functions, but none
+of its six eligible closed-memory edges; that requested memory gate therefore
+fails honestly. These results do not broaden the supported memory denominator.
+
+## Cross-family connected regions
+
+Operation-compatible nodes within one selected component now use distinct
+additive and XOR-pair subregions. Edges crossing the representation boundary
+are converted directly: the lowering never materializes the decoded scalar as
+an SSA value. Mixed arithmetic/Boolean components use both families, and a
+component containing multiplication selects the additive path, removing the
+old plaintext XOR multiplication bridge. Pure arithmetic components retain
+seeded family selection. Reports expose components, mixed-family counts and
+conversion counts; scale reports aggregate both counters.
+
+`out/v03-family-transfer-o0-s3` seals the exact tested plugin. Across 593
+vectors, clean, native and stock-post-O2 outputs agree; required memory,
+predicate and cross-family gates pass. It contains 30 direct conversions in
+two mixed components and zero plaintext multiplication bridges. The 33-test
+Python suite includes 3,000 randomized round trips at each of six widths.
+Bounded SMT reference checks prove 38 laws and report 12 timeouts as
+inconclusive, with no counterexample. XOR-to-additive proves at all widths;
+additive-to-XOR proves at 1/8 bits and times out at wider widths under the
+three-second per-law cap. This is correctness evidence, not hardness evidence.
+
+The O2 transfer fixture in `out/v03-family-transfer-o2-s4` is correct in all
+three arms but fails coverage: frontend optimization produces one 212-node
+component whose estimated cost exceeds the fixed 20,000 connected-region
+limit, so no component is selected. Do not count it as a feature pass. Bounded
+partitioning of oversized components is required before using this fixture as
+an optimized coverage gate.
+
 ## Next implementation batch
+
+The private Sol control now reproduces exact recovery in 79.511 seconds with
+angr 10 on the retained compatible image. Solver and binary hashes are checked;
+only those two files enter its read-only container. The answer comes from the
+independently graded historical submission outside that container. An earlier
+API-mismatched image failed and remains recorded as inconclusive. This is an
+informed positive control, not new-version discovery or original-run compliance.
 
 1. Scale policy: preserve measured structural work within the existing module
    cap; retain uniform allocation as an ablation. Add eligible/selected memory
@@ -91,9 +132,8 @@ correctness failure and does not erase successful workload evidence.
    separate informed entry/state assumptions from binary-only discovery. Test
    dispatcher inversion, canonical-state rebasing and XOR/additive projection;
    distinguish unchanged transfer, repair, and unsupported/inconclusive tools.
-3. P4: operation-compatible arithmetic/Boolean regions with verified direct
-   cross-family transfers; remove avoidable plaintext multiplication bridges.
-   Bounded genuine joint-output coupling is a separate ablation with an inverse
+3. P4 direct cross-family transfer is implemented as described above. Bounded
+   genuine joint-output coupling remains a separate ablation with an inverse
    control, not an assumed hardness benefit.
 4. P5: bounded private encoded-call interfaces integrated with representations;
    preserve exported ABI, recursion/reentry, threads, and effect exclusions.

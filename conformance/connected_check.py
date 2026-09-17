@@ -12,6 +12,7 @@ def main():
     p.add_argument("--toolchain-image")
     p.add_argument("--require-memory", action="store_true")
     p.add_argument("--require-predicates", action="store_true")
+    p.add_argument("--require-family-conversions", action="store_true")
     args = p.parse_args()
     out = args.build.resolve()
     manifest = json.loads((out / "manifest.json").read_text())
@@ -26,9 +27,11 @@ def main():
     regions = [row for row in report["connected_regions"] if row["status"] == "encoded"]
     encoded_objects = [obj for row in regions for obj in row["objects"] if obj["status"] == "encoded"]
     coverage = {"regions": bool(regions), "memory": bool(encoded_objects),
-                "predicates": any(row["predicates"] > 0 for row in regions)}
+                "predicates": any(row["predicates"] > 0 for row in regions),
+                "family_conversions": sum(row.get("family_conversions", 0) for row in regions),
+                "mixed_family_components": sum(row.get("mixed_family_components", 0) for row in regions)}
     correct = len(values["clean"].splitlines()) == 593 and all(value == values["clean"] for value in values.values())
-    passed = correct and coverage["regions"] and (not args.require_memory or coverage["memory"]) and (not args.require_predicates or coverage["predicates"])
+    passed = correct and coverage["regions"] and (not args.require_memory or coverage["memory"]) and (not args.require_predicates or coverage["predicates"]) and (not args.require_family_conversions or coverage["family_conversions"] > 0)
     result = {"passed": passed, "correctness": correct, "vectors": 593, "coverage": coverage,
               "manifest_sha256": digest(out / "manifest.json"), "commands": runner.records}
     dump(out / "connected-correctness.json", result)
