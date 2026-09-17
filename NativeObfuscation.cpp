@@ -86,8 +86,7 @@ uint64_t moduleInstructions(const Module &M) {
   return Total;
 }
 
-void checkModuleBudget(const Module &M, StringRef Stage) {
-  uint64_t Total = moduleInstructions(M);
+void checkInstructionBudget(const Module &M, StringRef Stage, uint64_t Total) {
   if (Total > NativeModuleInsts) {
     if (!NativeReport.empty()) {
       std::error_code EC;
@@ -98,6 +97,10 @@ void checkModuleBudget(const Module &M, StringRef Stage) {
     }
     report_fatal_error(Twine("native module instruction cap exceeded: ") + Twine(Total) + " > " + Twine(NativeModuleInsts.getValue()));
   }
+}
+
+void checkModuleBudget(const Module &M, StringRef Stage) {
+  checkInstructionBudget(M, Stage, moduleInstructions(M));
 }
 
 std::string profile(bool Structural) {
@@ -283,9 +286,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   if (NativeSupportRegions) SupportCoverage = obf::absorbNativeSupport(M);
   if (NativeOutline)
     OutlineCoverage = obf::outlineNativeRegions(M, PreparedCache.ModuleSeed);
-  DenseMap<Function *, unsigned> SourceWeights;
+  SmallVector<std::pair<Function *, unsigned>, 64> SourceWeights;
   for (Function &F : M)
-    if (F.hasFnAttribute("sre.native.original")) SourceWeights[&F] = std::clamp(F.getInstructionCount(), 32u, 4096u);
+    if (F.hasFnAttribute("sre.native.original"))
+      SourceWeights.emplace_back(&F, std::clamp(F.getInstructionCount(), 32u, 4096u));
   json::Array GrowthCoverage;
   if (NativeRegionPlan == "connected") {
     obf::NativeConnectedOptions Options;
@@ -368,6 +372,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   unsigned HelperAllocation = NativeScaleBudget && !Helpers.empty()
       ? (NativeModuleInsts - moduleInstructions(M)) / (2 * Helpers.size()) : 0;
   json::Array HelperCoverage;
+  // This closed profile changes the current helper and adds globals, never
+  // other function bodies. Charge its delta rather than scan a million-IR
+  // module for each of thousands of helpers. Recount at the stage boundary.
+  uint64_t HelperTotal = moduleInstructions(M);
   for (Function *H : Helpers) {
     std::string Reason = structuralBlocker(*H);
     const bool Safe = Reason != "naked" && Reason != "source-inline-asm" &&
@@ -399,7 +407,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       FAM.invalidate(*H, PA);
       H->removeFnAttr("sre.native.helper.run");
       H->addFnAttr("sre.native.helper.processed");
-      checkModuleBudget(M, "after-helper");
+      HelperTotal = HelperTotal - Before + H->getInstructionCount();
+      checkInstructionBudget(M, "after-helper", HelperTotal);
     }
     json::Array Calls, Globals;
     SmallPtrSet<GlobalValue *, 16> Dependencies;
@@ -421,6 +430,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
         {"instructions_before", Before},
         {"instructions_after", H->getInstructionCount()}});
   }
+  checkModuleBudget(M, "after-helpers");
+  saveNativeStage(M, "helpers.ll");
   json::Array LateCoverage;
   if (NativeLate) {
     unsigned LateCount = 0;

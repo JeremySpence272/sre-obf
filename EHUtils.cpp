@@ -22,6 +22,13 @@ namespace llvm::obf {
 		if (BB->isEHPad())
 			return true;
 
+		// Valid LLVM EH regions require a personality. Native C modules have
+		// none; avoid a predecessor walk at every site in their flattened CFGs.
+		// Repeating that walk during each analysis rebuild is quadratic in the
+		// number of blocks even though the answer is always false.
+		if (!BB->getParent()->hasPersonalityFn())
+			return false;
+
 		// Walk predecessors up to a depth limit to check if all paths
 		// from entry go through an EH pad.
 		// Conservative: if we find any non-EH predecessor path to entry,

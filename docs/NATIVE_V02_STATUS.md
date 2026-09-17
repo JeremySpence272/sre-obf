@@ -1,5 +1,8 @@
 # v02 implementation ledger
 
+Subsequent fixes and work are tracked in [v03](NATIVE_V03_STATUS.md). Historical
+failures below remain recorded; they are not the current compiler's status.
+
 Work in progress against [the v02 plan](NATIVE_V02_PLAN.md). No v02 preset has
 been promoted and no paid v02 agent run has been launched. Large-program gates
 remain required; the crackme alone cannot satisfy them.

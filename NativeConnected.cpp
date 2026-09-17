@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
+#include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 #include "llvm/ADT/DenseMap.h"
@@ -7,7 +8,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
-#include "llvm/Transforms/Utils/Cloning.h"
+#include <memory>
 #include <numeric>
 
 using namespace llvm;
@@ -491,30 +492,19 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
     auto Local = O;
     if (O.BoundedGrowth) Local.GrowthBudget = uint64_t(O.GrowthBudget) * weight(*F) / Weight;
     unsigned Before = F->getInstructionCount();
-    Function *Snapshot = nullptr;
-    auto Attributes = F->getAttributes();
-    auto Linkage = F->getLinkage();
-    if (O.BoundedGrowth) {
-      ValueToValueMapTy Map;
-      Snapshot = CloneFunction(F, Map);
-      Snapshot->setLinkage(GlobalValue::InternalLinkage);
-    }
+    std::unique_ptr<FunctionSnapshot> Snapshot;
+    if (O.BoundedGrowth) Snapshot = std::make_unique<FunctionSnapshot>(*F);
     auto Item = Encoder(*F, Seed, Local).run();
     unsigned After = F->getInstructionCount();
     if (Snapshot && After > uint64_t(Before) + Local.GrowthBudget) {
       // Connected encoding creates only local instructions/allocas, no module
       // globals or callees. This body-only rollback is therefore complete.
-      F->deleteBody(); F->setLinkage(Linkage);
-      ValueToValueMapTy Map;
-      for (unsigned I = 0; I < F->arg_size(); ++I) Map[Snapshot->getArg(I)] = F->getArg(I);
-      SmallVector<ReturnInst *, 8> Returns;
-      CloneFunctionInto(F, Snapshot, Map, CloneFunctionChangeType::LocalChangesOnly, Returns);
-      F->setAttributes(Attributes);
+      Snapshot->restore();
       Item = json::Object{{"function", F->getName().str()}, {"status", "skipped"},
           {"reason", "connected-growth-rollback"}, {"attempted_instructions", After},
           {"eligible_nodes", *Item.getInteger("eligible_nodes")}};
     }
-    if (Snapshot) Snapshot->eraseFromParent();
+    Snapshot.reset();
     Item["instructions_before"] = Before;
     Item["instructions_after"] = F->getInstructionCount();
     Item["bounded_growth"] = O.BoundedGrowth;

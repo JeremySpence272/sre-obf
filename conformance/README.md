@@ -107,6 +107,19 @@ assembly and timing reads are prohibited by the native entry point.
 
 ## Further IR experiments
 
+`python3 -m conformance.rollback --out out/rollback-001 --toolchain-image
+sre-obf-dev:llvm22` forces repeated budget rollback on a computed-goto function
+with a global jump table and recursive calls. Three seeds, 593 full-output
+vectors and the stock-O2 normalization arm must pass. The IR check also rejects
+the `inttoptr(1)` table corruption that previously crashed unchanged Lua. Use
+`--plugin PATH` to replay a retained historical compiler as a negative control.
+
+`python3 -m conformance.scale_stage --spec MANIFEST --ir STAGE.ll --out OUT
+--toolchain-image IMAGE` runs the independently specified workloads against a
+retained IR stage without changing the production artifact. This diagnostic
+retains private symbols and links dynamic libc. Tool failures remain failures,
+never evidence of resistance. This is stage isolation, not sanitizer coverage.
+
 `--values` enables persistent paired integer SSA representations; `--outline`
 enables bounded native pure-region outlining. They are independent and opt-in.
 `--coupled-state` additionally ties data masks to per-call flattening state and

@@ -13,6 +13,7 @@
 #include "llvm/Transforms/Obfuscator/EHUtils.h"
 #include "llvm/Transforms/Obfuscator/FunctionMerging.h"
 #include "llvm/Transforms/Obfuscator/FunctionObfContextAnalysis.h"
+#include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/IRBudget.h"
 #include "llvm/Transforms/Obfuscator/ObfMetrics.h"
 #include "llvm/Transforms/Obfuscator/ObfRepairSSA.h"
@@ -27,58 +28,9 @@
 #include "llvm/Transforms/Obfuscator/StringEncryption.h"
 #include "llvm/Transforms/Obfuscator/TargetCompat.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
-#include "llvm/Transforms/Utils/Cloning.h"
+#include <memory>
 
 namespace llvm {
-
-	namespace {
-
-		// ================================================================
-		// Transactional budget enforcement: snapshot / restore helpers
-		// ================================================================
-		//
-		// Used by the per-pass driver loop below to give the absolute IR
-		// budget hard cap a real guarantee: if a single pass expands a
-		// function past the cap, the function is rolled back to its
-		// pre-pass state and the pass is recorded as skipped, rather than
-		// merely being caught (too late) by the *next* pass's pre-check.
-
-		/// Take a full, throwaway snapshot of \p F's current body. The
-		/// clone lives in F's module (self-recursive calls inside F keep
-		/// resolving to the original @F, which is what we want -- only the
-		/// snapshot's *body* is ever consulted, via restoreFunctionSnapshot).
-		/// Caller owns the returned Function and must eraseFromParent() it.
-		Function* snapshotFunction(Function& F) {
-			ValueToValueMapTy SnapVMap;
-			Function* Snap = CloneFunction(&F, SnapVMap);
-			Snap->setLinkage(GlobalValue::InternalLinkage);
-			return Snap;
-		}
-
-		/// Replace \p F's (bloated) body with a fresh clone of \p Snap's
-		/// pristine body, taken by snapshotFunction() before the offending
-		/// pass ran. Does not erase \p Snap -- the caller still owns it.
-		void restoreFunctionSnapshot(Function& F, Function* Snap) {
-			// Function::deleteBody() forces ExternalLinkage as a side
-			// effect (see FunctionMerging.cpp's buildThunk for the same
-			// gotcha) -- save/restore around it so an internal F stays
-			// internal.
-			AttributeList SavedAttrs = F.getAttributes();
-			GlobalValue::LinkageTypes SavedLinkage = F.getLinkage();
-			F.deleteBody();
-			F.setLinkage(SavedLinkage);
-
-			ValueToValueMapTy BackVMap;
-			for (unsigned i = 0, e = F.arg_size(); i != e; ++i)
-				BackVMap[Snap->getArg(i)] = F.getArg(i);
-
-			SmallVector<ReturnInst*, 8> Returns;
-			CloneFunctionInto(&F, Snap, BackVMap,
-				CloneFunctionChangeType::LocalChangesOnly, Returns);
-			F.setAttributes(SavedAttrs);
-		}
-
-	} // namespace
 
 	class ObfuscationFunctionDriverPass
 		: public PassInfoMixin<ObfuscationFunctionDriverPass> {
@@ -396,11 +348,11 @@ namespace llvm {
 				// --- Transactional snapshot ---
 				// Honor both per-function and global hard caps. This restores
 				// the function body, not module-level side effects of a pass.
-				Function* Snap = nullptr;
+				std::unique_ptr<obf::FunctionSnapshot> Snap;
 				unsigned EffectiveHardCap = Cfg.budgetHardCap
 					? Cfg.budgetHardCap : static_cast<unsigned>(ObfIRBudgetMax);
 				if (Budget.isEnabled() && EffectiveHardCap > 0)
-					Snap = snapshotFunction(F);
+					Snap = std::make_unique<obf::FunctionSnapshot>(F);
 
 				// --- Run the pass ---
 				PreservedAnalyses PA = Entry.Run(F, FAM);
@@ -415,9 +367,8 @@ namespace llvm {
 				if (Snap) {
 					unsigned PostRunInsts = llvm::obf::countInstructions(F);
 					if (PostRunInsts > EffectiveHardCap) {
-						restoreFunctionSnapshot(F, Snap);
-						Snap->eraseFromParent();
-						Snap = nullptr;
+						Snap->restore();
+						Snap.reset();
 
 						FAM.invalidate(F, PreservedAnalyses::none());
 						Budget.markLastRecordSkipped("budget_rollback");
@@ -437,8 +388,7 @@ namespace llvm {
 						continue;
 					}
 					// Kept: the snapshot is no longer needed.
-					Snap->eraseFromParent();
-					Snap = nullptr;
+					Snap.reset();
 				}
 
 				// --- Pass-published skip channel ---
