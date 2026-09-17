@@ -11,6 +11,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--wide", action="store_true")
     parser.add_argument("--invariant", action="store_true")
+    parser.add_argument("--connected", action="store_true")
+    parser.add_argument("--fixture", choices=("duplicate_edges", "nonentry_alloca"), default="duplicate_edges")
     args = parser.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False, mode=0o700)
@@ -18,7 +20,7 @@ def main():
     plugin = ROOT / "build/Obfuscator.so"
     plugin_hash = digest(plugin)
     driver, control = out / "driver.o", out / "control"
-    source = FIXTURES / "duplicate_edges.ll"
+    source = FIXTURES / (args.fixture + ".ll")
     runner.run(["clang", "-O2", "-c", str(FIXTURES / "driver.c"), "-o", str(driver)])
     runner.run(["clang", str(source), str(driver), "-o", str(control)])
     inputs = test_inputs(512)
@@ -33,6 +35,10 @@ def main():
             "-obf-verify", "-obf-deterministic", "-native-level=smoke", "-native-values=1",
             f"-native-value-nodes={limit}", "-native-outline=0", "-native-merge=0",
             f"-native-values-wide={int(args.wide)}",
+            f"-native-region-plan={'connected' if args.connected else 'legacy'}",
+            f"-native-connected-nodes={limit}",
+            f"-native-predicate-regions={int(args.connected)}",
+            f"-native-regional-families={int(args.connected)}",
             f"-native-coupled-state={int(args.invariant and flattening)}",
             f"-native-invariant={int(args.invariant and flattening)}",
             "-native-strings=0", "-native-data=0", "-native-diversity=0",

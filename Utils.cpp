@@ -12,6 +12,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
@@ -363,6 +364,17 @@ namespace llvm::obf {
 		llvm::Instruction* AllocaIP = llvm::obf::getAllocaIP(F);
 		if (!AllocaIP)
 			AllocaIP = Entry.getTerminator();
+		bool Changed = false;
+
+		// LLVM lifetime intrinsics must retain an alloca-derived operand, not
+		// a reg2mem reload/PHI of its address. Dropping these optional markers
+		// conservatively extends liveness; the actual allocation stays put.
+		for (llvm::BasicBlock& BB : F)
+			for (llvm::Instruction& I : llvm::make_early_inc_range(BB))
+				if (auto* II = llvm::dyn_cast<llvm::IntrinsicInst>(&I); II && II->isLifetimeStartOrEnd())
+					if (auto* AI = llvm::dyn_cast<llvm::AllocaInst>(llvm::getUnderlyingObject(II->getArgOperand(0)));
+						AI && AI->getParent() != &Entry)
+						{ II->eraseFromParent(); Changed = true; }
 
 		// Snapshot existing allocas so we can robustly collect the new reg2mem ones
 		llvm::SmallPtrSet<llvm::AllocaInst*, 32> ExistingAllocas;
@@ -372,7 +384,6 @@ namespace llvm::obf {
 
 		std::vector<llvm::PHINode*> TmpPhi;
 		std::vector<llvm::Instruction*> TmpReg;
-		bool Changed = false;
 
 		do {
 			TmpPhi.clear();
@@ -386,9 +397,11 @@ namespace llvm::obf {
 					}
 
 					
-					// Never demote allocas (they're memory objects already; demoting their "result" pointer
-					// can create non-promotable patterns and is not what we want for CFG safety).
-					if (llvm::isa<llvm::AllocaInst>(I))
+					// Entry allocas dominate every router target. Non-entry
+					// allocas (including merged bodies and VLAs) do not: spill
+					// their pointer result when it crosses a block boundary.
+					// Do not hoist the allocation or change its execution count.
+					if (llvm::isa<llvm::AllocaInst>(I) && I.getParent() == &Entry)
 						continue;
 
 					// Token / label / metadata types are unsized — DemoteRegToStack will
