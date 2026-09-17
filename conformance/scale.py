@@ -15,17 +15,31 @@ from conformance.whole import build, parser as build_parser
 from conformance.run import ROOT
 
 
+def coverage_passes(measured, require_flattening=False, require_memory=False):
+    return ((not require_flattening or measured["functions_with_surviving_flattening"] > 0) and
+            (not require_memory or measured["memory_edges"] > 0))
+
+
 def coverage(report):
     original = report["input_inventory"]
     selected = [r for r in report.get("connected_regions", []) if r["status"] == "encoded"]
     names = {r["function"] for r in selected}
+    flattened = {r["function"] for r in report["flattening_state"]}
     source_rows = original["functions"]
     return {"input_definitions": original["definitions"], "input_instructions": original["instructions"],
             "connected_functions": len(selected), "connected_nodes": sum(r["nodes"] for r in selected),
             "connected_eligible_nodes": sum(r.get("eligible_nodes", 0) for r in report.get("connected_regions", [])),
             "connected_predicates": sum(r["predicates"] for r in selected),
             "memory_edges": sum(r["memory_edges"] for r in selected),
+            "input_memory_operations": sum(r["loads"] + r["stores"] for r in source_rows),
+            "eligible_closed_memory_objects": sum(r.get("eligible_memory_objects", 0) for r in report.get("connected_regions", [])) if report["schema"] == "sre-native-v2" else None,
+            "eligible_closed_memory_edges": sum(r.get("eligible_memory_edges", 0) for r in report.get("connected_regions", [])) if report["schema"] == "sre-native-v2" else None,
+            "memory_eligibility_scope": "supported closed entry allocas in analyzed functions; NOT all program memory operations",
+            "memory_object_skips": dict(Counter(o["reason"] for r in report.get("connected_regions", [])
+                                              for o in r.get("objects", []) if o["status"] == "skipped")),
             "functions_with_surviving_flattening": len(report["flattening_state"]),
+            "flattening_matched_source_definitions": sum(r["function"] in flattened for r in source_rows),
+            "flattening_matched_source_instructions": sum(r["instructions"] for r in source_rows if r["function"] in flattened),
             "connected_matched_source_definitions": sum(r["function"] in names for r in source_rows),
             "connected_matched_source_instructions": sum(r["instructions"] for r in source_rows if r["function"] in names),
             "source_weight_scope": "input bodies containing a matched selected region; NOT number of protected instructions; merged/unmatched origins are not credited",
@@ -46,9 +60,19 @@ def main():
     p.add_argument("--module-insts", type=int, default=250000)
     p.add_argument("--compile-timeout", type=float, default=180)
     p.add_argument("--scale-budget", action="store_true", help="Explicit fair growth-allocation experiment; not a promotion flag")
+    p.add_argument("--scale-structure", action="store_true")
+    p.add_argument("--require-flattening", action="store_true")
+    p.add_argument("--require-memory", action="store_true")
+    p.add_argument("--post-o2-attack", action="store_true")
     args = p.parse_args()
     if args.scale_budget and args.variant != "v02":
         p.error("--scale-budget requires v02")
+    if args.scale_structure and not args.scale_budget:
+        p.error("--scale-structure requires --scale-budget")
+    if args.variant == "control" and (args.require_flattening or args.require_memory):
+        p.error("protection coverage cannot be required of a control-only build")
+    if args.variant == "control" and args.post_o2_attack:
+        p.error("the post-O2 attack requires a protected build")
     spec = json.loads(args.spec.read_text())
     if spec.get("schema") != "sre-scale-v1" or not spec.get("revision") or not spec.get("sources"):
         p.error("a revision-pinned scale manifest is required")
@@ -69,18 +93,22 @@ def main():
     if out.exists():
         p.error("use a fresh output directory")
     out.mkdir(parents=True)
-    result = {"schema": "sre-scale-result-v1", "project": spec["project"], "revision": spec["revision"],
+    result = {"schema": "sre-scale-result-v2", "project": spec["project"], "revision": spec["revision"],
               "spec_sha256": digest(args.spec), "variant": args.variant, "seed": args.seed,
               "status": "incomplete", "hardness_evaluated": False,
               "generality_gate": "not-promoted", "workloads": [],
               "module_instruction_limit": args.module_insts, "compile_timeout": args.compile_timeout,
               "scale_budget": args.scale_budget,
+              "scale_structure": args.scale_structure,
+              "post_o2_attack": args.post_o2_attack,
+              "required_coverage": {"flattening": args.require_flattening, "memory": args.require_memory},
               "input_hash_scope": "sources-and-headers" if "inputs" in spec else "source-files-only"}
     argv = [*map(str, sources), "--out", str(out / "build"), "--toolchain-image", args.toolchain_image,
             "--optimization", "O2", "--seed", str(args.seed), "--no-disassembly",
             "--module-insts", str(args.module_insts), "--compile-timeout", str(args.compile_timeout)]
     argv += ["--cflag=" + flag for flag in spec.get("cflags", [])]
     argv += ["--link-flag=" + flag for flag in spec.get("link_flags", [])]
+    if args.post_o2_attack: argv += ["--post-o2-attack"]
     if args.variant == "control":
         argv += ["--control-only"]
     else:
@@ -88,6 +116,7 @@ def main():
         if args.variant == "v02":
             argv += ["--region-plan", "connected", "--memory-ssa", "--predicate-regions", "--regional-families", "--support-regions"]
             if args.scale_budget: argv += ["--scale-budget"]
+            if args.scale_structure: argv += ["--scale-structure"]
     phase = "build"
     try:
         manifest = build(build_parser().parse_args(argv))
@@ -109,6 +138,9 @@ def main():
             result["workloads"].append({"name": workload["name"], "differential": equal, "expected_output": expected,
                 "output_bytes": len(outputs["clean"]), "sha256": hashlib.sha256(outputs["clean"]).hexdigest()})
         result["status"] = "conformance-pass" if result["workloads"] and all(w["differential"] and w["expected_output"] for w in result["workloads"]) else "correctness-failure"
+        if result["status"] == "conformance-pass" and args.variant != "control":
+            if not coverage_passes(result["coverage"], args.require_flattening, args.require_memory):
+                result["status"] = "coverage-failure"
         result["commands"] = runner.records
     except (OSError, ValueError, ToolFailure) as exc:
         result.update(status="workload-or-tool-failure" if phase == "workload" else "build-or-tool-failure", reason=str(exc), failure_phase=phase)

@@ -87,7 +87,7 @@ def main(args: list[str] | None = None) -> int:
     coupled = os.environ.get("SRE_OBF_COUPLED_STATE", "0")
     extras = {name: os.environ.get("SRE_OBF_" + name.upper(), "0")
               for name in ("fusion", "memory", "values_wide", "invariant", "memory_ssa",
-                           "predicate_regions", "regional_families", "support_regions", "scale_budget")}
+                           "predicate_regions", "regional_families", "support_regions", "scale_budget", "scale_structure")}
     region_plan = os.environ.get("SRE_OBF_REGION_PLAN", "legacy")
     connected_nodes = int(os.environ.get("SRE_OBF_CONNECTED_NODES", "128"))
     if region_plan not in ("legacy", "connected") or not 2 <= connected_nodes <= 512:
@@ -98,6 +98,8 @@ def main(args: list[str] | None = None) -> int:
         raise ValueError("connected subfeatures require the connected planner")
     if extras["memory_ssa"] == "1" and extras["memory"] != "1":
         raise ValueError("memory_ssa requires memory")
+    if extras["scale_structure"] == "1" and extras["scale_budget"] != "1":
+        raise ValueError("scale_structure requires scale_budget")
     if any(value not in ("0", "1") for value in extras.values()):
         raise ValueError("experimental SRE_OBF flags must be 0 or 1")
     if values not in ("0", "1") or outline not in ("0", "1"):

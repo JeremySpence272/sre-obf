@@ -2,6 +2,7 @@
 #include "llvm/Transforms/Obfuscator/NativeEncoding.h"
 #include "llvm/Transforms/Obfuscator/NativeRegions.h"
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
+#include "llvm/Transforms/Obfuscator/NativeBudget.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InlineAsm.h"
@@ -66,6 +67,7 @@ cl::opt<bool> NativeSupportRegions("native-support-regions", cl::desc("Absorb bo
 cl::opt<std::string> NativeStageDir("native-stage-dir", cl::desc("Private directory for pre-driver and post-driver IR snapshots"), cl::init(""));
 cl::opt<unsigned> NativeModuleInsts("native-module-insts", cl::desc("Explicit module IR instruction cap (10000..5000000)"), cl::init(250000));
 cl::opt<bool> NativeScaleBudget("native-scale-budget", cl::desc("Opt-in fair connected/application/helper growth allocations; reports all coverage losses"), cl::init(false));
+cl::opt<bool> NativeScaleStructure("native-scale-structure", cl::desc("Reserve usable CFF transactions before fair expression allocation"), cl::init(false));
 
 void saveNativeStage(const Module &M, StringRef Stage) {
   if (NativeStageDir.empty()) return;
@@ -186,6 +188,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-module-insts must be 10000..5000000");
   if (NativeScaleBudget && NativeRegionPlan != "connected")
     report_fatal_error("native-scale-budget requires connected regions");
+  if (NativeScaleStructure && !NativeScaleBudget)
+    report_fatal_error("native-scale-structure requires native-scale-budget");
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
     report_fatal_error("connected regions require native-values and native-values-wide");
   if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions) && NativeRegionPlan != "connected")
@@ -328,6 +332,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
           CB->removeFnAttr(Attribute::Speculatable);
         }
   if (obf::isReportEnabled()) (void)AM.getResult<ObfReportAnalysis>(M);
+  json::Array StructuralCoverage;
+  if (NativeScaleStructure) {
+    uint64_t Pool = (NativeModuleInsts - moduleInstructions(M)) * 3 / 5;
+    StructuralCoverage = obf::budgetNativeStructure(M, AM, Pool, SourceWeights);
+    checkModuleBudget(M, "after-structural-allocation");
+    saveNativeStage(M, "structural.ll");
+  }
   if (NativeScaleBudget) {
     uint64_t Weight = 0;
     for (const auto &Item : SourceWeights) Weight += Item.second;
@@ -519,7 +530,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     std::error_code EC;
     raw_fd_ostream OS(NativeReport, EC, sys::fs::OF_Text);
     if (EC) report_fatal_error(Twine("native report: ") + EC.message());
-    json::Object Result{{"schema", "sre-native-v1"},
+    json::Object Result{{"schema", "sre-native-v2"},
                         {"profile", "native-" + NativeLevel.getValue() + "-ir"},
                         {"seed", std::to_string(static_cast<uint64_t>(ObfSeed))},
                         {"vm", false}, {"injected_assembly", false},
@@ -536,6 +547,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"region_plan", NativeRegionPlan.getValue()}, {"connected_nodes", NativeConnectedNodes.getValue()},
                             {"module_instruction_limit", NativeModuleInsts.getValue()},
                             {"scale_budget", NativeScaleBudget.getValue()}, {"helper_limit", HelperLimit},
+                            {"scale_structure", NativeScaleStructure.getValue()},
                             {"memory_ssa", NativeMemorySSA.getValue()}, {"predicate_regions", NativePredicateRegions.getValue()},
                             {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
@@ -551,6 +563,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"functions", std::move(Coverage)}};
     Result["input_inventory"] = std::move(InputInventory);
     Result["growth_allocations"] = std::move(GrowthCoverage);
+    Result["structural_allocations"] = std::move(StructuralCoverage);
     Result["region_inventory"] = std::move(RegionInventory);
     Result["final_inventory"] = obf::nativeBoundaryInventory(M, "final-ir");
     OS << formatv("{0:2}\n", json::Value(std::move(Result)));

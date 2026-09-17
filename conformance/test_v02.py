@@ -8,6 +8,7 @@ from conformance.fetch_scale import extract
 from conformance.recovery_reach import check_expression, validate
 from conformance.connected_model import compare, add
 from conformance.whole import parser
+from conformance.scale import coverage, coverage_passes
 
 
 class ReplayTests(unittest.TestCase):
@@ -63,6 +64,30 @@ class ConnectedTests(unittest.TestCase):
 
 
 class ScaleSourceTests(unittest.TestCase):
+    def test_required_coverage_is_not_selection_or_eligibility(self):
+        measured = {"functions_with_surviving_flattening": 0, "memory_edges": 0,
+                    "eligible_closed_memory_edges": 300}
+        self.assertTrue(coverage_passes(measured))
+        self.assertFalse(coverage_passes(measured, require_flattening=True))
+        self.assertFalse(coverage_passes(measured, require_memory=True))
+        self.assertTrue(coverage_passes({**measured, "memory_edges": 1}, require_memory=True))
+
+    def test_old_report_missing_memory_denominator_is_unknown(self):
+        report = {"schema": "sre-native-v1", "input_inventory": {
+            "definitions": 0, "instructions": 0, "functions": []},
+            "connected_regions": [], "flattening_state": [],
+            "final_inventory": {"instructions": 0, "helper_instructions": 0}}
+        self.assertIsNone(coverage(report)["eligible_closed_memory_edges"])
+        report["schema"] = "sre-native-v2"
+        self.assertEqual(coverage(report)["eligible_closed_memory_edges"], 0)
+
+    def test_structural_budget_is_independent_opt_in(self):
+        args = parser().parse_args(["input.c", "--out", "/tmp/not-created"])
+        self.assertFalse(args.scale_structure)
+        args = parser().parse_args(["input.c", "--out", "/tmp/not-created", "--scale-budget"])
+        self.assertTrue(args.scale_budget)
+        self.assertFalse(args.scale_structure)
+
     def test_reject_archive_escape(self):
         data = io.BytesIO()
         with zipfile.ZipFile(data, "w") as archive:

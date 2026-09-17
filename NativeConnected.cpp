@@ -63,6 +63,7 @@ class Encoder {
   AllocaInst *Context = nullptr, *Witness = nullptr;
   unsigned Inputs = 0, Outputs = 0, Predicates = 0, MultiplyBridges = 0;
   unsigned MemoryEdges = 0, PersistentEdges = 0, SkippedComponents = 0, Site = 0, Copies = 0, EligibleNodes = 0;
+  unsigned EligibleMemoryEdges = 0;
   json::Array ObjectReport;
 
   ConstantInt *constant(Type *T, uint64_t X) {
@@ -244,6 +245,7 @@ class Encoder {
   }
   void plan() {
     findObjects();
+    for (const Object &Obj : Objects) EligibleMemoryEdges += Obj.Loads.size() + Obj.Stores.size();
     SmallVector<Instruction *, 128> Candidates;
     DenseMap<Instruction *, unsigned> Index;
     for (Instruction &I : instructions(F)) if (candidate(I)) {
@@ -388,6 +390,7 @@ public:
   json::Object run() {
     if (Nodes.empty()) return json::Object{{"function", F.getName().str()}, {"status", "skipped"},
         {"reason", "no-whole-component-within-budget"}, {"skipped_components", SkippedComponents},
+        {"eligible_memory_edges", EligibleMemoryEdges}, {"eligible_memory_objects", Objects.size()},
         {"normalized_copies", Copies}, {"eligible_nodes", EligibleNodes}, {"objects", std::move(ObjectReport)}};
     if (O.CoupleState) {
       IRBuilder<> B(getAllocaIP(F));
@@ -468,6 +471,7 @@ public:
     F.setMemoryEffects(MemoryEffects::unknown()); F.removeFnAttr(Attribute::Speculatable);
     return json::Object{{"function", F.getName().str()}, {"status", "encoded"}, {"nodes", Nodes.size()},
         {"eligible_nodes", EligibleNodes},
+        {"eligible_memory_edges", EligibleMemoryEdges}, {"eligible_memory_objects", Objects.size()},
         {"regions", std::move(RegionReport)}, {"skipped_components", SkippedComponents},
         {"persistent_edges", PersistentEdges}, {"memory_edges", MemoryEdges}, {"predicates", Predicates},
         {"boundary_inputs", Inputs}, {"boundary_outputs", Outputs}, {"multiply_decode_bridges", MultiplyBridges},
@@ -502,6 +506,8 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
       Snapshot->restore();
       Item = json::Object{{"function", F->getName().str()}, {"status", "skipped"},
           {"reason", "connected-growth-rollback"}, {"attempted_instructions", After},
+          {"eligible_memory_edges", *Item.getInteger("eligible_memory_edges")},
+          {"eligible_memory_objects", *Item.getInteger("eligible_memory_objects")},
           {"eligible_nodes", *Item.getInteger("eligible_nodes")}};
     }
     Snapshot.reset();

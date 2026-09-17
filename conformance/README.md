@@ -107,6 +107,14 @@ assembly and timing reads are prohibited by the native entry point.
 
 ## Further IR experiments
 
+For the manifest-pinned large runner, `--scale-budget --scale-structure`
+reserves usable CFF transactions before distributing expression budgets.
+`--scale-budget` alone retains the uniform-allocation control. Use explicit
+`--require-flattening` and/or `--require-memory` to fail zero-coverage builds;
+`--post-o2-attack` adds stock optimization and workload comparison. The report
+distinguishes input memory operations, eligible closed-object edges and selected
+edges. Passing a nonzero gate is not broad source coverage or hardness promotion.
+
 `python3 -m conformance.rollback --out out/rollback-001 --toolchain-image
 sre-obf-dev:llvm22` forces repeated budget rollback on a computed-goto function
 with a global jump table and recursive calls. Three seeds, 593 full-output

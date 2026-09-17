@@ -11,7 +11,7 @@ from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, image_identity, opt_command
 
 EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "invariant", "outline",
-               "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget")
+               "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure")
 
 
 def parser():
@@ -61,6 +61,8 @@ def build(args):
         raise ValueError("connected subfeatures require --region-plan connected")
     if args.memory_ssa and not args.memory:
         raise ValueError("--memory-ssa requires --memory")
+    if args.scale_structure and not args.scale_budget:
+        raise ValueError("--scale-structure requires --scale-budget")
     if not 2 <= args.connected_nodes <= 512 or not 2 <= args.value_nodes <= 64:
         raise ValueError("connected-nodes must be 2..512; value-nodes must be 2..64")
     if args.control_only and args.post_o2_attack:

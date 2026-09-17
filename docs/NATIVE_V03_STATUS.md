@@ -49,6 +49,38 @@ rolled back: proportional growth shares are too small to buy the transformation.
 The next scale milestone must allocate usable structural budgets and report
 actual coverage, rather than declaring the zero-coverage build protected.
 
+## Usable structural budgets and coverage gates
+
+`--scale-structure` / `-native-scale-structure` is an independent defaults-off
+experiment requiring fair scale budgets. It reserves 60% of remaining module
+headroom for actual CFF transactions before ordinary expression allocation.
+Candidates rank by bounded source weight per current control block, with a
+stable symbol-order tie break. A function receives at most one eighth of the
+pool (with a 2,048-instruction minimum grant ceiling); its exact emitted growth
+is charged. Unspent space returns to the ordinary allocator. Failed attempts
+remain recorded and are not retried in the application stage. No instruction
+limit is increased, and uniform allocation remains an ablation.
+
+The native report is now `sre-native-v2`, including structural allocations and
+eligible closed-memory counts. Scale result v2 records required coverage and
+supports `--require-flattening`, `--require-memory` and `--post-o2-attack`.
+Missing old-schema denominators are unknown, not zero. Eligibility refers only
+to supported closed entry allocations in analyzed functions, not arbitrary heap,
+escaped, aggregate or aliased memory. Coverage failure is separate from a
+correctness failure and does not erase successful workload evidence.
+
+- `out/scale-v03-sqlite-structural`: 156.42-second obfuscation; unchanged
+  workload plus both required coverage checks pass under the same caps.
+  117 functions retain CFF (100 matched original definitions containing 5,712
+  original instructions; merged/unmatched origins are not credited). Final IR
+  is 1,435,019 instructions. Six of 54 eligible closed-memory edges survive;
+  input has 69,036 memory operations. **This is narrow coverage, not promotion.**
+- `out/v03-structure-small-r2`: cross-TU O0 fixture, clean/native/post-O2
+  outputs agree on 593 vectors; required memory and predicate coverage pass.
+- `out/scale-v03-zlib-rollback`: unchanged gzip workload still passes after
+  the compiler repairs; existing coverage/growth limitations remain.
+- 32 Python unit tests pass. Additional seed/post-O2 large runs are pending.
+
 ## Next implementation batch
 
 1. Scale policy: preserve measured structural work within the existing module
