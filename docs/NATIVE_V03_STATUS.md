@@ -227,6 +227,136 @@ Known remaining limits are unchanged by this work: boundary decodes at region
 exits, the narrow closed-object eligibility of `findObjects()`, the absent
 encoded call ABI, and software-invertible dispatch. Coverage is not hardness.
 
+## Lane-keyed dispatcher transitions (P6 relation experiment)
+
+`--lane-transitions` / `-native-lane-transitions` is an independent defaults-off
+experiment with three values: `off` (0), `on` (1) and `stale-relation` (2).
+Mode 2 is an **attack replay**, not a protection mode; it is described with the
+arms below. The experiment requires `--coupled-state`, because the word it uses
+is the value pass's per-activation context.
+
+### What changed
+
+Before this work the flattening transition folded the encoded-data word into
+`fla.multi.key` and `fla.multi.salt` and then stored those words. The dispatcher
+loaded them back and re-encoded each candidate label, so the emitted token was a
+function of the three flattening words alone. The only other coupling was
+`nativeResidual()`, whose value is zero at every reachable program point by
+construction; resetting the witness together with the context changes nothing
+observable, which is why it never forced an analyst to recover live data.
+
+With the experiment on, `storeState()` fixes the next context word **before**
+encoding, keeps it out of the stored key and salt, and keys the token with it;
+`buildMultiStateDispatch()` re-reads that word (`fla.multi.lane.load`, volatile)
+and applies the same relation to the candidates. Both ends call one definition,
+`obf::nativeLaneKeys()` in `NativeInvariant.h`, so they cannot drift apart. The
+word itself is written only by `pin()`, from the pinned coordinates of live
+connected-region values through volatile slots, and by the transition. Under the
+flag its entry seed is additionally mixed with a frozen integer argument, so the
+first transition of an activation is not keyed on a build constant. The
+known-zero residual term is left exactly as it was and is superseded, not
+removed.
+
+**All four words are ordinary software state that is present in the binary.**
+An analyst who reads the fourth word can still rebase the control state. This is
+not secrecy, it does not defeat canonical repair, and it is not a hardness
+claim. The only thing it can do is raise the joint cost of following control and
+recovering data at the same time, which is what the arms below measure.
+
+### Arms
+
+`conformance/relation_recovery.py` (schema `sre-relation-recovery-v1`) runs
+three arms over one protected module. It reads value names, which a stripped
+binary does not carry, so it is deliberately generous to the analyst.
+
+- **supplied-relation.** The family and the participating words are handed over.
+  Inversion stays closed-form in `conformance/state_model.py`; no search is
+  required. The residual cost is exactly that one further per-activation word
+  must be read at runtime. Word count goes from two to three.
+- **inferred-relation.** Nothing is handed over; the word set is recovered by a
+  backward slice from each dispatcher comparison. It succeeds in every module
+  tested, in 0.08 to 0.20 seconds. The slice per comparison grows from 33 to 39
+  instructions on the whole-program fixture and from 780 to 923 on `obf_target`,
+  about 18 percent. **Inference cost barely moves.**
+- **canonical-repair.** The previous relation — token as a function of
+  state/key/salt only — is replayed unchanged. With the experiment off it
+  describes 2 of 2 and 2 of 2 dispatcher-bearing functions. With it on it
+  describes 1 of 2 and 0 of 2: it fails in exactly the functions that carry
+  encoded data. Mode 2 emits that stale relation into a real build, and the
+  protected binary then does not terminate: the dispatcher matches no case and
+  cycles through its miss chain. The repair is nevertheless available, and the
+  report says so: read one more word.
+
+### Evidence
+
+LLVM 22.1.8 in `sre-obf-dev:llvm22`, plugin
+`a9ff4e25dbf3716d4ada60ca58ade1065db691ecaca758ba9ccfe144ad5366eb`.
+
+- `out/D-lane-off-o0-s3`: the experiment off. Its protected module is
+  `0e378f373e7e506737e1d1372b9c39ef361e3c7d1a4d3039e5f3b61232fdd055`,
+  byte-identical to the sealed `out/v03-family-transfer-o0-s3` module, from a
+  different plugin hash. The post-O2 module differs from a matched `main` build
+  only in the embedded `ModuleID` path. The experiment is a no-op when off.
+- `out/D-lane-on-o0-s3`, `out/D-lane-on-o0-s4`: 593 vectors agree across clean,
+  native and stock-post-O2. Required memory, predicate and lane-coupling gates
+  pass. `producer` keeps three state words, 66 data updates, 13 control updates
+  and **2 lane-keyed dispatcher reads**; `main` keeps flattening but has no
+  encoded data, so it is not couplable. `out/D-lane-off-o0-s4` is the matched
+  control.
+- `out/D-probe-on` (`run.py --case state`, connected plan, seed 3): 209 vectors
+  agree across release, control, native and post-O2. `obf_target` has one
+  lane-keyed read and the **recursive** `state_recurse` has two, so per-activation
+  state holds across recursion. Ghidra was not configured, so its case status is
+  `partial`, never `pass`.
+- Survival: the volatile `fla.multi.lane.load` reads are still present after a
+  stock `-O2` simplification attack.
+- `out/D-lane-stale-o0-s3` and `out/D-probe-stale`: the canonical-repair arm.
+  The clean arm is unaffected; the protected and post-O2 arms do not terminate
+  within 20 and 10 seconds respectively.
+- 61 Python unit tests pass, including 15 new ones covering the flag default,
+  the slice, the three arms and the coverage denominator.
+
+### An honest coverage failure at O2
+
+`out/D-lane-on-o2-s4` and `out/D-lane-on-o2-s5`, both with `--connected-shards`,
+are correct on 593 vectors and pass their predicate and shard gates, but
+**`connected_check.py --require-lane-coupling` fails on them** and that failure
+is recorded. At frontend O2 the only function that keeps flattening is `main`,
+which has no encoded data; `producer` carries the encoded region but exhausts
+the 30,000-instruction per-function IR budget inside the connected pass, so
+flattening never runs on it. That is true with the experiment off as well
+(19 instructions of headroom left) and on (1 left), so it is a pre-existing
+budget interaction, not a regression. No limit was raised to make this green.
+The experiment therefore has **zero coverage at O2 on this fixture**, and its
+O2 protected module differs from the matched off build only by the argument-mixed
+context seed.
+
+`connected_check.py` gains `--require-lane-coupling` plus a
+`couplable_flattened_functions` denominator: a function can only be coupled if
+it keeps both a flattening state and a data context. Reports that predate the
+field report the numerator as null, and unknown never satisfies the gate.
+
+### Where this leaves the canonicalization attack
+
+The existing symbolic recovery harness does not resolve the comparison.
+`conformance/recovery.py` with `recovery_probe.py`, in the retained angr 10
+image `sha256:1b877636b131a9ed96e2fc9470f6587e493ecfcbbad3068a87b9924eb1799ea8`,
+returns `budget` on both control arms and `unsupported-state-or-control-flow` on
+both protected arms, at 228 and 230 steps. Those are inconclusive results, not
+protection. Running it at all needed a one-line import shim, because angr 10
+vendors its solver as `angr.claripy`; the shim does not change what is measured.
+
+The measured conclusion is narrow and should be stated as such. Keying
+transitions on a live encoded-data word does **not** defeat dispatcher
+canonicalization. It falsifies one specific reusable assumption — that the
+token is a function of the three flattening words — and the word an analyst must
+add is produced only by actually evaluating the encoded lanes, so a recovery run
+that summarizes the data region away can no longer follow control. The repair
+costs one further word, which is closed-form, in the binary, and recoverable by
+a slice that runs in under a fifth of a second. **This is a small, real,
+measured transfer failure, not hardness**, and the coupling only exists where a
+function keeps both an encoded region and a surviving dispatcher.
+
 ## Next implementation batch
 
 The private Sol control now reproduces exact recovery in 79.511 seconds with

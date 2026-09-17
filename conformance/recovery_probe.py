@@ -15,7 +15,12 @@ import time
 
 def probe(args):
     import angr
-    import claripy
+    try:
+        import claripy
+    except ModuleNotFoundError:
+        # angr 10 vendors the solver as angr.claripy. This is an import shim for
+        # the available analysis image; it does not change what is measured.
+        from angr import claripy
     from angr.calling_conventions import SimCCSystemVAMD64
     from angr.sim_type import SimTypeFunction, SimTypeInt
 

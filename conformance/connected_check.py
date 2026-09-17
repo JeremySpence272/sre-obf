@@ -49,6 +49,25 @@ def invariants(report):
     return violations
 
 
+def lane_coverage(report):
+    """P6 coupling coverage, with an explicit denominator.
+
+    A dispatcher can only be keyed on encoded data in a function that keeps both
+    a surviving flattening state and a coupled data context. Reports that predate
+    the field leave the numerator unknown, never zero.
+    """
+    state = report.get("flattening_state", [])
+    known = [row for row in state if "lane_keyed_dispatcher_reads" in row]
+    couplable = [row for row in state if row.get("coupled_data_updates", 0) > 0 and row.get("words", 0) > 0]
+    return {"flattened_functions": len(state),
+            "couplable_flattened_functions": len(couplable),
+            "lane_keyed_functions": (sum(1 for row in known if row["lane_keyed_dispatcher_reads"] > 0)
+                                     if len(known) == len(state) else None),
+            "lane_keyed_dispatcher_reads": (sum(row["lane_keyed_dispatcher_reads"] for row in known)
+                                            if len(known) == len(state) else None),
+            "lane_transitions": report.get("features", {}).get("lane_transitions")}
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("build", type=Path)
@@ -58,6 +77,8 @@ def main():
     p.add_argument("--require-family-conversions", action="store_true")
     p.add_argument("--require-shards", action="store_true",
                    help="require at least one oversized component actually partitioned into selected shards")
+    p.add_argument("--require-lane-coupling", action="store_true",
+                   help="require at least one surviving dispatcher to read the encoded-data word")
     args = p.parse_args()
     out = args.build.resolve()
     manifest = json.loads((out / "manifest.json").read_text())
@@ -87,12 +108,15 @@ def main():
                 "selected_estimated_cost": sum(row.get("selected_estimated_cost", 0) for row in planned),
                 "skipped_estimated_cost": sum(row.get("skipped_estimated_cost", 0) for row in planned),
                 "shard_lost_estimated_cost": sum(row.get("shard_lost_estimated_cost", 0) for row in planned)}
+    coverage.update(lane_coverage(report))
     violations = invariants(report)
     correct = len(values["clean"].splitlines()) == 593 and all(value == values["clean"] for value in values.values())
     passed = (correct and not violations and coverage["regions"] and (not args.require_memory or coverage["memory"])
               and (not args.require_predicates or coverage["predicates"])
               and (not args.require_family_conversions or coverage["family_conversions"] > 0)
-              and (not args.require_shards or coverage["shards"] > 0))
+              and (not args.require_shards or coverage["shards"] > 0)
+              # Unknown is not success: an old report cannot satisfy this gate.
+              and (not args.require_lane_coupling or bool(coverage["lane_keyed_dispatcher_reads"])))
     result = {"passed": passed, "correctness": correct, "vectors": 593, "coverage": coverage,
               "planning_violations": violations, "report_schema": report["schema"],
               "manifest_sha256": digest(out / "manifest.json"), "commands": runner.records}
