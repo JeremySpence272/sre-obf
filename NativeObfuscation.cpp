@@ -60,6 +60,8 @@ cl::opt<bool> NativeWide("native-values-wide", cl::desc("XOR-share regions inclu
 cl::opt<bool> NativeInvariant("native-invariant", cl::desc("Reachable witness invariant shared by data and control"), cl::init(false));
 cl::opt<std::string> NativeRegionPlan("native-region-plan", cl::desc("Value planner: legacy or connected"), cl::init("legacy"));
 cl::opt<unsigned> NativeConnectedNodes("native-connected-nodes", cl::desc("Connected node cap per function (2..512)"), cl::init(128));
+cl::opt<bool> NativeConnectedShards("native-connected-shards",
+    cl::desc("Partition an oversized connected component into bounded shards under the same cost limit"), cl::init(false));
 cl::opt<bool> NativeMemorySSA("native-memory-ssa", cl::desc("Connected memory and SSA lanes without per-load decoding"), cl::init(false));
 cl::opt<bool> NativePredicateRegions("native-predicate-regions", cl::desc("Connected bit-vector comparisons and Boolean uses"), cl::init(false));
 cl::opt<bool> NativeRegionalFamilies("native-regional-families", cl::desc("Seeded XOR/additive families for whole supported components"), cl::init(false));
@@ -192,7 +194,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-scale-structure requires native-scale-budget");
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
     report_fatal_error("connected regions require native-values and native-values-wide");
-  if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions) && NativeRegionPlan != "connected")
+  if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions ||
+       NativeConnectedShards) && NativeRegionPlan != "connected")
     report_fatal_error("connected subfeatures require native-region-plan=connected");
   if (NativeMemorySSA && !NativeMemory) report_fatal_error("native-memory-ssa requires native-memory");
   if (NativeWide && !NativeValues) report_fatal_error("native-values-wide requires native-values");
@@ -301,6 +304,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.Memory = NativeMemorySSA;
     Options.Predicates = NativePredicateRegions;
     Options.Families = NativeRegionalFamilies;
+    Options.Shards = NativeConnectedShards;
     Options.CoupleState = NativeCoupledState;
     Options.Invariant = NativeInvariant;
     if (NativeScaleBudget) {
@@ -530,7 +534,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     std::error_code EC;
     raw_fd_ostream OS(NativeReport, EC, sys::fs::OF_Text);
     if (EC) report_fatal_error(Twine("native report: ") + EC.message());
-    json::Object Result{{"schema", "sre-native-v2"},
+    json::Object Result{{"schema", "sre-native-v3"},
                         {"profile", "native-" + NativeLevel.getValue() + "-ir"},
                         {"seed", std::to_string(static_cast<uint64_t>(ObfSeed))},
                         {"vm", false}, {"injected_assembly", false},
@@ -550,6 +554,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"scale_structure", NativeScaleStructure.getValue()},
                             {"memory_ssa", NativeMemorySSA.getValue()}, {"predicate_regions", NativePredicateRegions.getValue()},
                             {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},
+                            {"connected_shards", NativeConnectedShards.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
                         {"fused_calls", std::move(FusionCoverage)}, {"memory", std::move(MemoryCoverage)},

@@ -11,7 +11,8 @@ from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, image_identity, opt_command
 
 EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "invariant", "outline",
-               "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure")
+               "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure",
+               "connected-shards")
 
 
 def parser():
@@ -57,7 +58,8 @@ def build(args):
         raise ValueError("--invariant requires --coupled-state")
     if args.region_plan == "connected" and not (args.values and args.values_wide):
         raise ValueError("connected regions require --values --values-wide")
-    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions, args.scale_budget)) and args.region_plan != "connected":
+    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
+            args.scale_budget, args.connected_shards)) and args.region_plan != "connected":
         raise ValueError("connected subfeatures require --region-plan connected")
     if args.memory_ssa and not args.memory:
         raise ValueError("--memory-ssa requires --memory")

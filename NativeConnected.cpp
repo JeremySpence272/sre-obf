@@ -45,9 +45,21 @@ struct Object {
 };
 struct Region {
   SmallVector<Instruction *, 32> Nodes;
-  unsigned ID = 0, Component = 0, Cost = 0, Score = 0;
-  bool Affine = false;
+  unsigned ID = 0, Component = 0, Shard = 0, Cost = 0, Score = 0;
+  bool Affine = false, Sharded = false;
 };
+// Shared node estimates so component, shard and region accounting cannot
+// drift apart. They include pin/context/boundary work; the exact
+// transactional ceiling catches underestimates. These are not hardness scores.
+unsigned nodeCost(const Instruction *I) {
+  return (I->getOpcode() == Instruction::Add || I->getOpcode() == Instruction::Sub ||
+          isa<ICmpInst>(I)) ? 320 : 96;
+}
+unsigned nodeScore(const Instruction *I) {
+  unsigned Score = isa<ICmpInst>(I) ? 8 : isa<LoadInst>(I) ? 4 : 1;
+  for (const User *U : I->users()) if (isa<ReturnInst, StoreInst, BranchInst>(U)) Score += 4;
+  return Score;
+}
 
 class Encoder {
   Function &F;
@@ -65,6 +77,9 @@ class Encoder {
   unsigned MemoryEdges = 0, PersistentEdges = 0, SkippedComponents = 0, Site = 0, Copies = 0, EligibleNodes = 0;
   unsigned EligibleMemoryEdges = 0;
   unsigned FamilyConversions = 0, MixedComponents = 0;
+  unsigned OversizedComponents = 0, ShardedComponents = 0, SelectedShards = 0, ShardLostNodes = 0;
+  unsigned EligibleCost = 0, SelectedCost = 0, SkippedCost = 0, ShardLostCost = 0;
+  unsigned CostLimit = 0, ShardCostLimit = 0;
   json::Array ObjectReport;
 
   ConstantInt *constant(Type *T, uint64_t X) {
@@ -293,55 +308,126 @@ class Encoder {
       if (!Groups.count(Key)) { Groups[Key] = Planned.size(); Planned.push_back(Region{}); }
       Region &R = Planned[Groups[Key]];
       R.Nodes.push_back(I);
-      // Include pin/context/boundary work. The exact transactional ceiling
-      // below catches underestimates; these estimates are not hardness scores.
-      R.Cost += (I->getOpcode() == Instruction::Add || I->getOpcode() == Instruction::Sub || isa<ICmpInst>(I)) ? 320 : 96;
-      R.Score += isa<ICmpInst>(I) ? 8 : isa<LoadInst>(I) ? 4 : 1;
-      for (User *U : I->users()) if (isa<ReturnInst, StoreInst, BranchInst>(U)) R.Score += 4;
+      R.Cost += nodeCost(I);
+      R.Score += nodeScore(I);
     }
     // Stable input order breaks equal scores; unrelated function order does
     // not change this function's stream. Whole-component selection avoids
-    // cutting a memory object in half to meet the node cap.
+    // cutting a memory object in half to meet the node cap; shards keep every
+    // load of one encoded object inside a single shard for the same reason.
     llvm::stable_sort(Planned, [](const Region &A, const Region &B) {
       return uint64_t(A.Score) * B.Cost > uint64_t(B.Score) * A.Cost;
     });
+    for (const Region &R : Planned) EligibleCost += R.Cost;
     unsigned Cost = 0;
     unsigned Component = 0;
-    for (Region &R : Planned) {
-      unsigned Limit = O.BoundedGrowth ? std::min(20000u, O.GrowthBudget) : 20000;
-      if (R.Nodes.size() < 2 || Nodes.size() + R.Nodes.size() > O.Nodes || Cost + R.Cost > Limit) {
-        ++SkippedComponents; continue;
-      }
+    bool SawAffine = false, SawXor = false;
+    // One selection step: split a node set into its representation families
+    // and register the resulting regions. Selection order fixes Component, so
+    // a build without shards keeps its exact previous family stream.
+    auto select = [&](ArrayRef<Instruction *> Selected, unsigned Origin, unsigned Shard,
+                      bool Sharded, unsigned PartCost, unsigned PartScore) {
       auto SupportsAffine = [](Instruction *I) {
         return llvm::is_contained(ArrayRef<unsigned>{Instruction::Add, Instruction::Sub,
             Instruction::Mul, Instruction::Shl, Instruction::PHI, Instruction::Load},
             I->getOpcode());
       };
-      bool HasMul = llvm::any_of(R.Nodes, [](Instruction *I) {
+      bool HasMul = llvm::any_of(Selected, [](Instruction *I) {
         return I->getOpcode() == Instruction::Mul;
       });
-      bool HasRequiredXor = llvm::any_of(R.Nodes, [&](Instruction *I) {
+      bool HasRequiredXor = llvm::any_of(Selected, [&](Instruction *I) {
         return !SupportsAffine(I);
       });
-      bool HasAffine = llvm::any_of(R.Nodes, SupportsAffine);
+      bool HasAffine = llvm::any_of(Selected, SupportsAffine);
       bool UseAffine = O.Families && HasAffine && (HasMul || HasRequiredXor ||
-          (RNG.fork("family-partition").fork(Component).u32() & 1));
+          ((Sharded ? RNG.fork("family-shard").fork(Component).fork(Shard)
+                    : RNG.fork("family-partition").fork(Component)).u32() & 1));
       Region Affine, Xor;
       Affine.Affine = true; Xor.Affine = false;
-      for (Instruction *I : R.Nodes)
+      for (Instruction *I : Selected)
         (UseAffine && SupportsAffine(I) ? Affine : Xor).Nodes.push_back(I);
-      if (!Affine.Nodes.empty() && !Xor.Nodes.empty()) ++MixedComponents;
       for (Region *Part : {&Affine, &Xor}) {
         if (Part->Nodes.empty()) continue;
-        Part->ID = Regions.size(); Part->Component = Component;
-        Part->Cost = R.Cost * Part->Nodes.size() / R.Nodes.size();
-        Part->Score = R.Score * Part->Nodes.size() / R.Nodes.size();
+        if (Part->Affine) SawAffine = true; else SawXor = true;
+        Part->ID = Regions.size(); Part->Component = Origin;
+        Part->Shard = Shard; Part->Sharded = Sharded;
+        Part->Cost = PartCost * Part->Nodes.size() / Selected.size();
+        Part->Score = PartScore * Part->Nodes.size() / Selected.size();
         for (Instruction *I : Part->Nodes) {
           RegionOf[I] = Part->ID; Nodes.push_back(I);
         }
         Regions.push_back(std::move(*Part));
       }
-      Cost += R.Cost; ++Component;
+      SelectedCost += PartCost;
+    };
+    CostLimit = O.BoundedGrowth ? std::min(20000u, O.GrowthBudget) : 20000;
+    // Shards divide the same component limit; they never raise it.
+    ShardCostLimit = std::min(CostLimit, std::max(2048u, CostLimit / 4));
+    for (unsigned N = 0; N < Planned.size(); ++N) {
+      Region &R = Planned[N];
+      if (R.Nodes.size() < 2) { ++SkippedComponents; SkippedCost += R.Cost; continue; }
+      SawAffine = SawXor = false;
+      if (Nodes.size() + R.Nodes.size() <= O.Nodes && Cost + R.Cost <= CostLimit) {
+        select(R.Nodes, N, 0, false, R.Cost, R.Score);
+        Cost += R.Cost; ++Component;
+        if (SawAffine && SawXor) ++MixedComponents;
+        continue;
+      }
+      ++OversizedComponents;
+      if (!O.Shards) { ++SkippedComponents; SkippedCost += R.Cost; continue; }
+      // Bounded shards in stable instruction order. A unit is one node, except
+      // that all loads of one encoded object form a single atomic unit:
+      // prepareMemory() redirects every store of an encoded object, so a load
+      // left unselected would read an abandoned allocation.
+      struct Unit { SmallVector<Instruction *, 8> Nodes; unsigned Cost = 0, Score = 0; };
+      SmallVector<Unit, 32> Units;
+      DenseMap<unsigned, unsigned> ObjectUnit;
+      for (Instruction *I : R.Nodes) {
+        unsigned Slot = Units.size();
+        if (auto *L = dyn_cast<LoadInst>(I); L && MemoryLoads.count(L))
+          Slot = ObjectUnit.try_emplace(MemoryLoads.lookup(L), Slot).first->second;
+        if (Slot == Units.size()) Units.push_back(Unit{});
+        Units[Slot].Nodes.push_back(I);
+        Units[Slot].Cost += nodeCost(I);
+        Units[Slot].Score += nodeScore(I);
+      }
+      unsigned Shard = 0, ShardCost = 0, ShardScore = 0;
+      SmallVector<Instruction *, 32> Current;
+      // Seeded extent inside the fixed bound, so two seeded builds of one
+      // program cut the same component at different points. The stream depends
+      // on the component's planning index, never on pointer order.
+      auto extent = [&](unsigned Index) {
+        unsigned Half = ShardCostLimit / 2;
+        return ShardCostLimit - Half + RNG.fork("shard-extent").fork(N).fork(Index).range(Half + 1);
+      };
+      unsigned Target = extent(0);
+      auto flush = [&]() {
+        // A single-node shard would encode a value and immediately decode it.
+        if (Current.size() >= 2) {
+          select(Current, N, Shard++, true, ShardCost, ShardScore);
+          Cost += ShardCost; ++SelectedShards;
+        } else {
+          ShardLostNodes += Current.size(); ShardLostCost += ShardCost;
+        }
+        Current.clear(); ShardCost = ShardScore = 0;
+        Target = extent(Shard);
+      };
+      for (const Unit &U : Units) {
+        if (Nodes.size() + Current.size() + U.Nodes.size() > O.Nodes ||
+            Cost + ShardCost + U.Cost > CostLimit || ShardCost + U.Cost > Target) {
+          flush();
+          if (Nodes.size() + U.Nodes.size() > O.Nodes || Cost + U.Cost > CostLimit) {
+            ShardLostNodes += U.Nodes.size(); ShardLostCost += U.Cost; continue;
+          }
+        }
+        Current.append(U.Nodes.begin(), U.Nodes.end());
+        ShardCost += U.Cost; ShardScore += U.Score;
+      }
+      flush();
+      if (Shard) {
+        ++ShardedComponents; ++Component;
+        if (SawAffine && SawXor) ++MixedComponents;
+      } else ++SkippedComponents;
     }
   }
   void prepareMemory() {
@@ -434,11 +520,36 @@ class Encoder {
 public:
   Encoder(Function &F, uint64_t Seed, NativeConnectedOptions O)
       : F(F), O(O), RNG(Rng(Seed).fork("native-connected-v1").fork(F.getName())) { plan(); }
+  // Exact planning accounting: eligible = selected + skipped + shard loss.
+  // Estimates are the planner's own cost model, not measured instructions.
+  void accounting(json::Object &Item) {
+    Item["eligible_nodes"] = EligibleNodes;
+    Item["eligible_memory_edges"] = EligibleMemoryEdges;
+    Item["eligible_memory_objects"] = Objects.size();
+    Item["skipped_components"] = SkippedComponents;
+    Item["oversized_components"] = OversizedComponents;
+    Item["sharded_components"] = ShardedComponents;
+    Item["shards"] = SelectedShards;
+    Item["shard_lost_nodes"] = ShardLostNodes;
+    Item["eligible_estimated_cost"] = EligibleCost;
+    Item["selected_estimated_cost"] = SelectedCost;
+    Item["skipped_estimated_cost"] = SkippedCost;
+    Item["shard_lost_estimated_cost"] = ShardLostCost;
+    Item["component_estimated_cost_limit"] = CostLimit;
+    Item["shard_estimated_cost_limit"] = O.Shards ? ShardCostLimit : 0;
+    Item["shard_policy"] = O.Shards ? "instruction-order-units-with-atomic-memory-objects"
+                                    : "whole-component-only";
+    Item["normalized_copies"] = Copies;
+  }
   json::Object run() {
-    if (Nodes.empty()) return json::Object{{"function", F.getName().str()}, {"status", "skipped"},
-        {"reason", "no-whole-component-within-budget"}, {"skipped_components", SkippedComponents},
-        {"eligible_memory_edges", EligibleMemoryEdges}, {"eligible_memory_objects", Objects.size()},
-        {"normalized_copies", Copies}, {"eligible_nodes", EligibleNodes}, {"objects", std::move(ObjectReport)}};
+    if (Nodes.empty()) {
+      json::Object Item{{"function", F.getName().str()}, {"status", "skipped"},
+          {"reason", O.Shards && OversizedComponents ? "no-shard-within-budget"
+                                                     : "no-whole-component-within-budget"}};
+      accounting(Item);
+      Item["objects"] = std::move(ObjectReport);
+      return Item;
+    }
     if (O.CoupleState) {
       IRBuilder<> B(getAllocaIP(F));
       Context = B.CreateAlloca(B.getInt32Ty(), nullptr, "sre.value.context");
@@ -505,7 +616,10 @@ public:
       DecodedAt[Key] = Plain;
     }
     json::Array RegionReport;
-    for (const Region &R : Regions) RegionReport.push_back(json::Object{{"id", R.ID}, {"component", R.Component}, {"nodes", R.Nodes.size()},
+    // component is the original connected component's stable planning index;
+    // shard identifies the bounded part of it that this region belongs to.
+    for (const Region &R : Regions) RegionReport.push_back(json::Object{{"id", R.ID}, {"component", R.Component},
+        {"shard", R.Shard}, {"sharded", R.Sharded}, {"nodes", R.Nodes.size()},
         {"estimated_cost", R.Cost}, {"representation", R.Affine ? "additive-pair-v1" : "xor-prefix-pair-v1"}});
     for (StoreInst *S : MemoryStores) S->eraseFromParent();
     for (Instruction *I : Nodes) I->dropAllReferences();
@@ -516,14 +630,15 @@ public:
       if (Obj.A->use_empty()) Obj.A->eraseFromParent();
     }
     F.setMemoryEffects(MemoryEffects::unknown()); F.removeFnAttr(Attribute::Speculatable);
-    return json::Object{{"function", F.getName().str()}, {"status", "encoded"}, {"nodes", Nodes.size()},
-        {"eligible_nodes", EligibleNodes},
-        {"eligible_memory_edges", EligibleMemoryEdges}, {"eligible_memory_objects", Objects.size()},
-        {"regions", std::move(RegionReport)}, {"skipped_components", SkippedComponents},
+    json::Object Item{{"function", F.getName().str()}, {"status", "encoded"}, {"nodes", Nodes.size()},
+        {"regions", std::move(RegionReport)},
         {"persistent_edges", PersistentEdges}, {"memory_edges", MemoryEdges}, {"predicates", Predicates},
         {"family_conversions", FamilyConversions}, {"mixed_family_components", MixedComponents},
         {"boundary_inputs", Inputs}, {"boundary_outputs", Outputs}, {"multiply_decode_bridges", MultiplyBridges},
-        {"objects", std::move(ObjectReport)}, {"normalized_copies", Copies}, {"reachable_invariant", Witness != nullptr}};
+        {"reachable_invariant", Witness != nullptr}};
+    accounting(Item);
+    Item["objects"] = std::move(ObjectReport);
+    return Item;
   }
 };
 }
@@ -552,11 +667,21 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
       // Connected encoding creates only local instructions/allocas, no module
       // globals or callees. This body-only rollback is therefore complete.
       Snapshot->restore();
-      Item = json::Object{{"function", F->getName().str()}, {"status", "skipped"},
-          {"reason", "connected-growth-rollback"}, {"attempted_instructions", After},
-          {"eligible_memory_edges", *Item.getInteger("eligible_memory_edges")},
-          {"eligible_memory_objects", *Item.getInteger("eligible_memory_objects")},
-          {"eligible_nodes", *Item.getInteger("eligible_nodes")}};
+      json::Object Rolled{{"function", F->getName().str()}, {"status", "skipped"},
+          {"reason", "connected-growth-rollback"}, {"attempted_instructions", After}};
+      // Planning denominators describe eligibility, so they survive a rollback.
+      for (StringRef Key : {"eligible_nodes", "eligible_memory_edges", "eligible_memory_objects",
+                            "eligible_estimated_cost", "oversized_components",
+                            "component_estimated_cost_limit", "shard_estimated_cost_limit",
+                            "shard_policy"})
+        if (auto *Value = Item.get(Key)) Rolled[Key] = std::move(*Value);
+      // Everything the encoder actually selected was undone: record it as
+      // attempted, never as coverage.
+      if (auto *Value = Item.get("nodes")) Rolled["attempted_nodes"] = std::move(*Value);
+      if (auto *Value = Item.get("shards")) Rolled["attempted_shards"] = std::move(*Value);
+      if (auto *Value = Item.get("selected_estimated_cost"))
+        Rolled["attempted_estimated_cost"] = std::move(*Value);
+      Item = std::move(Rolled);
     }
     Snapshot.reset();
     Item["instructions_before"] = Before;

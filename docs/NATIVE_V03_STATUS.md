@@ -115,6 +115,115 @@ limit, so no component is selected. Do not count it as a feature pass. Bounded
 partitioning of oversized components is required before using this fixture as
 an optimized coverage gate.
 
+## Bounded shards for oversized connected components
+
+Whole-component selection remains the default. `--connected-shards` /
+`-native-connected-shards` is an independent defaults-off experiment: when one
+connected component does not fit the existing per-function limit, the planner
+partitions it into bounded shards **under that same limit** instead of skipping
+it. No instruction or cost limit was raised.
+
+The policy is named in every report as
+`instruction-order-units-with-atomic-memory-objects`, because that is what it
+is. A unit is a single node, except that every load of one encoded closed
+object forms a single atomic unit: `prepareMemory()` redirects all of an
+object's stores, so a load left in a different budget decision would read an
+abandoned allocation. Units are consumed in stable instruction order. This is a
+bounded instruction-order slice, **not** a graph partition, and it is not
+claimed as one.
+
+A shard boundary inside a component costs no scalar decode. `input()` already
+consumes any selected node as a representation pair and converts families
+directly, so cross-shard and cross-family edges stay encoded. Only units that
+do not fit the remaining budget at all fall back to plaintext boundaries, and
+their exact estimated cost is reported as loss.
+
+Each shard's extent is drawn from a seeded stream within
+`[limit/2, limit]`, keyed by the component's stable planning index, so two
+seeded builds of one program cut the same component at different points. Total
+selected cost is unchanged by that draw. Selection order, unit order and the
+whole-component family stream are unchanged, so a build without shards is
+byte-identical to the previous compiler.
+
+Reports are now `sre-native-v3`. Per function the planner publishes eligible,
+selected, skipped and shard-lost node counts and estimated costs, the component
+and shard cost limits, the oversized/sharded component counts and the policy
+name. The accounting is exact: eligible equals selected plus skipped plus shard
+loss. Region rows carry the original component's planning index plus a shard
+id. Older schemas report the new denominators as null, never zero; the memory
+denominators stay known in v2 and v3. Estimated cost is the planner's own node
+cost model, not measured instructions.
+
+`connected_check.py` gains `--require-shards` and a planner self-consistency
+check: a report whose cost accounting, shard counts, shard ids or selected-node
+totals contradict its own region rows fails the gate as
+`planning_violations`, rather than being read as coverage. `scale.py` gains
+`--connected-shards` and `--require-shards` for large-program runs.
+
+### Evidence
+
+All runs use LLVM 22.1.8 in `sre-obf-dev:llvm22`, 593 vectors per arm, and
+clean/native/stock-post-O2 arms that must agree.
+
+- `out/v03-shard-final-o0-s3-control`: the previous O0 command with shards off,
+  built with the new compiler. Its protected module is byte-identical to the
+  sealed `out/v03-family-transfer-o0-s3` module
+  (`0e378f373e7e506737e1d1372b9c39ef361e3c7d1a4d3039e5f3b61232fdd055`), from a
+  different plugin hash, so the planner refactor is a no-op when the experiment
+  is off.
+- `out/v03-shard-extent-o2-s4`, `-s5`, `-s6`: **the optimized coverage gate now
+  passes.** At frontend O2 `producer` is one 212-node component costing an
+  estimated 36,256 against a 20,000 limit. Six shards select 124 nodes at an
+  estimated 19,968, report 16,288 of exact cost loss, and produce 66 direct
+  cross-family conversions with no plaintext multiplication bridge. Required
+  predicate, family-conversion and shard gates pass at all three seeds, with
+  different shard boundaries per seed and no planning violations.
+- `out/v03-shard-extent-o0-s3-memory`: the same fixture at O0 with a 40-node
+  cap, so an oversized component is sharded **while closed memory objects
+  exist**. Six objects stay encoded across 40 memory edges, and the two objects
+  whose loads were not selected are skipped whole as `component-budget`. The
+  required memory, predicate, family-conversion and shard gates all pass.
+- `out/v03-shard-o0-s8-budget`: shards under `--scale-budget`, where the fair
+  per-function allocation shrinks the component limit to 5,191. Three shards
+  fit inside it and the workload still agrees across all three arms.
+- `out/v03-shard-fixtures-r2`: the fixture differential suite with shards and a
+  deliberately small eight-node cap, so the oversized path runs on ordinary
+  fixtures. Ten cases at two seeds, all correct across control, native,
+  stock-post-O2 and release arms.
+- `out/v03-shard-fixtures-multi`: the same suite at a 48-node cap on the loop
+  fixtures, so components split into **two** shards each with live PHI cycles
+  crossing the boundary. `wide` and `widths` select 48 of 70 and 48 of 68 nodes
+  with 33, 12 and 7 direct cross-family conversions; all eight case/seed
+  combinations are correct.
+- `out/v03-shard-rollback`: the computed-goto block-address rollback regression
+  still passes; that path is untouched by this work.
+
+Ghidra was not configured for the fixture runs, so their per-case status is
+`partial`, never `pass`. Missing decompiler coverage is not evidence that
+anything survived a decompiler.
+
+### A pre-existing harness gap this work uncovered
+
+`conformance/run.py --case values` cannot pass under `--region-plan connected`,
+at any node cap, with or without shards. Its gate reads
+`native_report["values"]`, which only the legacy planner writes; the connected
+planner replaces that pass, so the required 8/16/32/64 width set is always
+empty. The check dates from `7718e7e`, long before shards, and reproduces on a
+build with the experiment off (`out/v03-shard-values-cap128-noshards` fails,
+`out/v03-shard-values-legacy` passes). It is recorded here rather than worked
+around: the fix is to give the connected report a real per-function encoded
+width set and gate on that, which is its own milestone. Do not weaken the
+existing width requirement to make the case green.
+
+The O2 transfer fixture has **zero** eligible closed-memory objects, because
+frontend O2 promotes its local arrays to SSA. Its gate therefore cannot and
+does not require memory coverage; the O0 run above is the memory evidence. Do
+not read an O2 pass as memory coverage.
+
+Known remaining limits are unchanged by this work: boundary decodes at region
+exits, the narrow closed-object eligibility of `findObjects()`, the absent
+encoded call ABI, and software-invertible dispatch. Coverage is not hardness.
+
 ## Next implementation batch
 
 The private Sol control now reproduces exact recovery in 79.511 seconds with
@@ -127,7 +236,9 @@ informed positive control, not new-version discovery or original-run compliance.
 1. Scale policy: preserve measured structural work within the existing module
    cap; retain uniform allocation as an ablation. Add eligible/selected memory
    and structural denominators, cost and source-weighted coverage, with explicit
-   failure when a requested gate has no surviving transformation.
+   failure when a requested gate has no surviving transformation. Bounded
+   shards are implemented as described above; the remaining scale question is
+   whether they hold on unchanged large applications, which has not been run.
 2. Sol recovery regressions: freeze the successful v02 scripts privately;
    separate informed entry/state assumptions from binary-only discovery. Test
    dispatcher inversion, canonical-state rebasing and XOR/additive projection;

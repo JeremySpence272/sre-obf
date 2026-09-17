@@ -69,7 +69,8 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             f"-native-region-plan={getattr(args, 'region_plan', 'legacy')}",
             f"-native-connected-nodes={getattr(args, 'connected_nodes', 128)}",
             *(f"-native-{name.replace('_', '-')}={int(getattr(args, name, False))}"
-              for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions", "scale_budget", "scale_structure")),
+              for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions", "scale_budget",
+                           "scale_structure", "connected_shards")),
             f"-native-family={args.family}"]
 
 
@@ -339,7 +340,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--invariant", action="store_true")
     p.add_argument("--region-plan", choices=("legacy", "connected"), default="legacy")
     p.add_argument("--connected-nodes", type=int, default=128)
-    for name in ("memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure"):
+    for name in ("memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget",
+                 "scale-structure", "connected-shards"):
         p.add_argument("--" + name, action="store_true")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
     p.add_argument("--probe-helpers", type=int, default=0,
