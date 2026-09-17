@@ -1,5 +1,8 @@
 # IR-only expansion: audit and implementation ledger
 
+Next planned hardening: [v02](NATIVE_V02_PLAN.md). Its selected work follows the
+completed v01 solve; it is not another implemented feature milestone yet.
+
 Latest implementation delta: [v01](NATIVE_V01.md). R1 has a wider operation
 family; R2 has a reachable witness relation; R3 includes bounded cross-call
 fusion; R4 includes closed mutable local objects; R5 has bounded static replay,

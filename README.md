@@ -220,6 +220,7 @@ Seeds cascade `base → module → function → pass`:
 |---|---|
 | [STATIC_NATIVE_PLAN.md](docs/STATIC_NATIVE_PLAN.md) | Fork work plan: static-only native flattening, initial IR features, evaluation gates, and follow-on relational/fusion research. |
 | [NATIVE_IR_STATUS.md](docs/NATIVE_IR_STATUS.md) | Implemented native IR features, verified results, and remaining resistance-evaluation limits. |
+| [NATIVE_V02_PLAN.md](docs/NATIVE_V02_PLAN.md) | Planned v02: continuous representations, encoded predicates, regional diversity, helper closure and recovery-transfer gates informed by the v01 solve. |
 | [Native conformance](conformance/README.md) | Build this fork, run differential compiler/Ghidra checks, compare artifacts, and connect the standalone crackme harness. |
 | [FUTURE_MACHINE_BINARY_IDEAS.md](docs/FUTURE_MACHINE_BINARY_IDEAS.md) | Deferred machine-code and post-link ideas; not part of the initial IR implementation. |
 | [BUILD.md](docs/BUILD.md) | Full compilation guide — static-extension toolchain (Linux/Windows), `.so` plugin, prerequisites, troubleshooting. |

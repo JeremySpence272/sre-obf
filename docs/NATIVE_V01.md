@@ -104,6 +104,11 @@ MC/post-link ideas remain in `FUTURE_MACHINE_BINARY_IDEAS.md`.
   eight PHI pairs and two explicitly reported multiplication decode bridges.
 
 The local harness versions are `/home/jeremy/obfuscation-harness/versions/v0`
-and `v01`. Only v0 has a completed paid-agent benchmark. No v01 solve time or
-agent-failure claim exists yet. Private binaries/answers/transcripts stay outside
+and `v01`. The first v01 agent run completed on 2026-09-17: exact-match success
+in 932.9 seconds (15m 32.9s), versus the historical v0 protected run's 713.5
+seconds and clean run's 31.7 seconds. This is one instance/seed, not per-pass
+attribution or evidence of general-purpose resistance. The agent summarized a
+generated data decoder and irrelevant message work, then used constrained
+path splitting during symbolic execution of main. See the [v02 plan](NATIVE_V02_PLAN.md)
+for the resulting priorities. Private binaries/answers/transcripts stay outside
 Git; reproducible sources, configuration and test code are committed.
