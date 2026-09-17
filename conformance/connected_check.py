@@ -46,7 +46,38 @@ def invariants(report):
                 violations.append(f"{where}: component {component} shard ids are not contiguous from zero")
         if row["sharded_components"] > row["oversized_components"]:
             violations.append(f"{where}: more components sharded than were oversized")
+        violations += joint_invariants(row, where)
     return violations
+
+
+def joint_invariants(row, where):
+    """Joint-output self-consistency, or nothing when the field set is absent.
+
+    A report written before this experiment existed carries no joint fields at
+    all; that is unknown, not a violation and not zero coverage.
+    """
+    if "joint_policy" not in row or "joint_output_groups" not in row:
+        return []
+    violations = []
+    groups = row["joint_output_groups"]
+    if row["joint_policy"] == "disabled" and groups:
+        violations.append(f"{where}: joint groups reported with the coupling disabled")
+    if 2 * groups > row["joint_output_candidates"]:
+        violations.append(f"{where}: {groups} joint groups need more candidates than were eligible")
+    # Each group must govern at least one lane use per member, otherwise it
+    # mixed and unmixed values nothing downstream reads.
+    if row["joint_lane_uses_rewritten"] < 2 * groups:
+        violations.append(f"{where}: joint groups rewrote fewer lane uses than members")
+    return violations
+
+
+def joint_coverage(regions):
+    """Selected joint groups, or None when any encoded row cannot report them."""
+    if not regions or any("joint_output_groups" not in row for row in regions):
+        return None, None, None
+    return (sum(row["joint_output_groups"] for row in regions),
+            sum(row["joint_output_candidates"] for row in regions),
+            sum(row["joint_lane_uses_rewritten"] for row in regions))
 
 
 def main():
@@ -58,6 +89,8 @@ def main():
     p.add_argument("--require-family-conversions", action="store_true")
     p.add_argument("--require-shards", action="store_true",
                    help="require at least one oversized component actually partitioned into selected shards")
+    p.add_argument("--require-joint-outputs", action="store_true",
+                   help="require at least one emitted joint-output group; an unreported count is unknown, not a pass")
     args = p.parse_args()
     out = args.build.resolve()
     manifest = json.loads((out / "manifest.json").read_text())
@@ -87,12 +120,18 @@ def main():
                 "selected_estimated_cost": sum(row.get("selected_estimated_cost", 0) for row in planned),
                 "skipped_estimated_cost": sum(row.get("skipped_estimated_cost", 0) for row in planned),
                 "shard_lost_estimated_cost": sum(row.get("shard_lost_estimated_cost", 0) for row in planned)}
+    groups, candidates, rewritten = joint_coverage(regions)
+    # None means the compiler that wrote this report predates the experiment.
+    coverage["joint_output_groups"] = groups
+    coverage["joint_output_candidates"] = candidates
+    coverage["joint_lane_uses_rewritten"] = rewritten
     violations = invariants(report)
     correct = len(values["clean"].splitlines()) == 593 and all(value == values["clean"] for value in values.values())
     passed = (correct and not violations and coverage["regions"] and (not args.require_memory or coverage["memory"])
               and (not args.require_predicates or coverage["predicates"])
               and (not args.require_family_conversions or coverage["family_conversions"] > 0)
-              and (not args.require_shards or coverage["shards"] > 0))
+              and (not args.require_shards or coverage["shards"] > 0)
+              and (not args.require_joint_outputs or bool(coverage["joint_output_groups"])))
     result = {"passed": passed, "correctness": correct, "vectors": 593, "coverage": coverage,
               "planning_violations": violations, "report_schema": report["schema"],
               "manifest_sha256": digest(out / "manifest.json"), "commands": runner.records}

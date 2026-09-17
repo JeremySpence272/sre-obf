@@ -6,10 +6,12 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include <memory>
 #include <numeric>
+#include <vector>
 
 using namespace llvm;
 namespace llvm::obf {
@@ -48,6 +50,31 @@ struct Region {
   unsigned ID = 0, Component = 0, Shard = 0, Cost = 0, Score = 0;
   bool Affine = false, Sharded = false;
 };
+// One bounded joint-output group: two selected nodes whose encoded lanes are
+// replaced by the lanes of U = First + Second and V = First + 2*Second.
+struct JointGroup { Instruction *First = nullptr, *Second = nullptr; };
+// Fixed skip vocabularies. Node reasons count each examined node once; pair
+// reasons count each examined ordered pair once. Unknown is never success.
+enum JointNodeSkip { JN_Phi, JN_Unused, JN_WalkBound, JN_NoRoots, JN_Budget,
+                     JN_TestBudget, JN_NoPartner, JN_Count };
+enum JointPairSkip { JP_Width, JP_Family, JP_Dominance, JP_Shared, JP_Identical,
+                     JP_NoUse, JP_Paired, JP_Count };
+const char *const JointNodeSkipName[JN_Count] = {
+    "phi-representation", "unused-value", "dependency-walk-bound", "no-live-dependency",
+    "group-budget", "pair-test-budget", "no-compatible-partner"};
+const char *const JointPairSkipName[JP_Count] = {
+    "width-mismatch", "family-mismatch", "no-dominance", "shared-dependency",
+    "identical-dependencies", "no-dominated-use", "already-grouped"};
+// Normalize a dependency root so that two reloads of one object, or a cast of
+// one value, are not mistaken for two distinct live dependencies.
+Value *rootKey(Value *V) {
+  for (unsigned Steps = 0; Steps < 8; ++Steps) {
+    if (auto *L = dyn_cast<LoadInst>(V)) { V = getUnderlyingObject(L->getPointerOperand()); continue; }
+    if (auto *C = dyn_cast<CastInst>(V)) { V = C->getOperand(0); continue; }
+    break;
+  }
+  return V;
+}
 // Shared node estimates so component, shard and region accounting cannot
 // drift apart. They include pin/context/boundary work; the exact
 // transactional ceiling catches underestimates. These are not hardness scores.
@@ -80,6 +107,10 @@ class Encoder {
   unsigned OversizedComponents = 0, ShardedComponents = 0, SelectedShards = 0, ShardLostNodes = 0;
   unsigned EligibleCost = 0, SelectedCost = 0, SkippedCost = 0, ShardLostCost = 0;
   unsigned CostLimit = 0, ShardCostLimit = 0;
+  DominatorTree DT;
+  SmallVector<JointGroup, 8> JointGroups;
+  unsigned JointCandidates = 0, JointCoupled = 0, JointRewrittenUses = 0, JointPairTests = 0;
+  unsigned JointNodeSkips[JN_Count] = {}, JointPairSkips[JP_Count] = {};
   json::Array ObjectReport;
 
   ConstantInt *constant(Type *T, uint64_t X) {
@@ -162,7 +193,21 @@ class Encoder {
       Z = bor(B, Z, lshr(B, Z, D));
     return bnot(B, convert(B, Z, B.getInt1Ty()));
   }
-  Pair pin(IRBuilder<> &B, Pair X, bool Affine) {
+  // Pair-level linear combination on encoded lanes. The additive family is
+  // linear coordinate-wise; the XOR family reuses the verified carry network.
+  // Neither path ever forms the decoded scalar.
+  Pair padd(IRBuilder<> &B, Pair X, Pair Y, bool Affine) {
+    if (Affine) return {B.CreateAdd(X.E, Y.E), B.CreateAdd(X.R, Y.R)};
+    return badd(B, X, Y);
+  }
+  Pair psub(IRBuilder<> &B, Pair X, Pair Y, bool Affine) {
+    if (Affine) return {B.CreateSub(X.E, Y.E), B.CreateSub(X.R, Y.R)};
+    return badd(B, X, bnot(B, Y), true);
+  }
+  // Doubling is a pair addition, never `shl 1`: a one-bit shift by one is
+  // poison at width 1, and the carry network already covers that width.
+  Pair pdouble(IRBuilder<> &B, Pair X, bool Affine) { return padd(B, X, X, Affine); }
+  Pair pin(IRBuilder<> &B, Pair X, bool Affine, bool Joint = false) {
     Type *T = X.E->getType();
     Value *Refresh = B.CreateXor(rotate(B, X.E, 7), constant(T, RNG.fork(Site++).u64()));
     X = Affine ? Pair{B.CreateAdd(X.E, Refresh), B.CreateAdd(X.R, Refresh)}
@@ -173,8 +218,9 @@ class Encoder {
     }
     IRBuilder<> Entry(getAllocaIP(F));
     auto *AT = ArrayType::get(T, 2);
-    auto *Slot = Entry.CreateAlloca(AT, nullptr, "sre.connected.pair");
+    auto *Slot = Entry.CreateAlloca(AT, nullptr, Joint ? "sre.connected.joint" : "sre.connected.pair");
     Slot->setMetadata("sre.native.value", MDNode::get(F.getContext(), {}));
+    if (Joint) Slot->setMetadata("sre.native.joint", MDNode::get(F.getContext(), {}));
     Value *EP = B.CreateInBoundsGEP(AT, Slot, {B.getInt32(0), B.getInt32(0)});
     Value *RP = B.CreateInBoundsGEP(AT, Slot, {B.getInt32(0), B.getInt32(1)});
     B.CreateStore(X.E, EP)->setVolatile(true); B.CreateStore(X.R, RP)->setVolatile(true);
@@ -429,6 +475,119 @@ class Encoder {
         if (SawAffine && SawXor) ++MixedComponents;
       } else ++SkippedComponents;
     }
+    planJointOutputs();
+  }
+  // Bounded pairing of selected nodes into joint-output groups, decided on the
+  // pre-emission IR in stable instruction order. Nothing here depends on
+  // pointer or hash iteration order, and nothing runs when the flag is off.
+  static constexpr unsigned JointLimit = 4, JointTestLimit = 4096;
+  void planJointOutputs() {
+    if (!O.JointOutputs || Nodes.empty()) return;
+    DT.recalculate(F);
+    SmallVector<Instruction *, 64> Members;
+    for (Instruction &I : instructions(F)) if (RegionOf.count(&I)) Members.push_back(&I);
+    struct Facts {
+      SmallPtrSet<Instruction *, 32> Reach;
+      SmallPtrSet<Value *, 16> Roots;
+      bool Bounded = true, Eligible = false;
+    };
+    std::vector<Facts> Live(Members.size());
+    for (unsigned K = 0; K < Members.size(); ++K) {
+      Instruction *N = Members[K];
+      // A PHI's lane pair is pre-created and filled after emission; rewriting
+      // it would break that fill, so PHIs are never group members.
+      if (isa<PHINode>(N)) { ++JointNodeSkips[JN_Phi]; continue; }
+      if (N->use_empty()) { ++JointNodeSkips[JN_Unused]; continue; }
+      Facts &A = Live[K];
+      SmallVector<Instruction *, 32> Work{N};
+      while (!Work.empty()) {
+        Instruction *P = Work.pop_back_val();
+        if (!A.Reach.insert(P).second) continue;
+        if (A.Reach.size() + A.Roots.size() > 256) { A.Bounded = false; break; }
+        for (Value *V : P->operands()) {
+          if (isa<Constant>(V)) continue;
+          if (auto *Q = dyn_cast<Instruction>(V); Q && RegionOf.count(Q)) { Work.push_back(Q); continue; }
+          A.Roots.insert(rootKey(V));
+        }
+      }
+      if (!A.Bounded) { ++JointNodeSkips[JN_WalkBound]; continue; }
+      if (A.Roots.empty()) { ++JointNodeSkips[JN_NoRoots]; continue; }
+      A.Eligible = true; ++JointCandidates;
+    }
+    auto has_private = [](const SmallPtrSetImpl<Value *> &A, const SmallPtrSetImpl<Value *> &B) {
+      return llvm::any_of(A, [&](Value *V) { return !B.count(V); });
+    };
+    SmallVector<bool, 64> Paired(Members.size(), false);
+    for (unsigned I = 0; I < Members.size(); ++I) {
+      if (!Live[I].Eligible || Paired[I]) continue;
+      if (JointGroups.size() >= JointLimit) { ++JointNodeSkips[JN_Budget]; continue; }
+      bool Found = false, Budget = false;
+      for (unsigned J = I + 1; J < Members.size() && !Found; ++J) {
+        if (!Live[J].Eligible) continue;
+        if (JointPairTests >= JointTestLimit) { Budget = true; break; }
+        ++JointPairTests;
+        if (Paired[J]) { ++JointPairSkips[JP_Paired]; continue; }
+        Instruction *X = Members[I], *Y = Members[J];
+        if (X->getType() != Y->getType()) { ++JointPairSkips[JP_Width]; continue; }
+        if (Regions[RegionOf.lookup(X)].Affine != Regions[RegionOf.lookup(Y)].Affine) {
+          ++JointPairSkips[JP_Family]; continue;
+        }
+        if (!DT.dominates(X, Y)) { ++JointPairSkips[JP_Dominance]; continue; }
+        // Dataflow dependence in either direction disqualifies the pair: a
+        // value coupled with something it already feeds, or that feeds it, is
+        // not two distinct live dependencies.
+        if (Live[J].Reach.count(X) || Live[I].Reach.count(Y)) { ++JointPairSkips[JP_Shared]; continue; }
+        // Each member must depend on a normalized root the other does not.
+        // Reloads of one object and casts of one value share a root, so a
+        // copy can never present itself as a distinct dependency.
+        if (!has_private(Live[I].Roots, Live[J].Roots) || !has_private(Live[J].Roots, Live[I].Roots)) {
+          ++JointPairSkips[JP_Identical]; continue;
+        }
+        // The coupling governs only lane uses the unmix dominates. Require at
+        // least one for the first member; every use of the second qualifies.
+        if (llvm::none_of(X->uses(), [&](const Use &U) { return DT.dominates(Y, U); })) {
+          ++JointPairSkips[JP_NoUse]; continue;
+        }
+        JointGroups.push_back({X, Y});
+        Paired[I] = Paired[J] = true; Found = true;
+      }
+      if (!Found) ++JointNodeSkips[Budget ? JN_TestBudget : JN_NoPartner];
+    }
+  }
+  unsigned redirect(Value *Old, Value *New, Instruction *Anchor) {
+    SmallVector<Use *, 16> Uses;
+    for (Use &U : Old->uses()) Uses.push_back(&U);
+    unsigned Count = 0;
+    for (Use *U : Uses) if (DT.dominates(Anchor, *U)) { U->set(New); ++Count; }
+    return Count;
+  }
+  // Replace both members' lanes with lanes recovered from the pinned joint
+  // pairs. This runs after every other lane use exists, so each use is either
+  // dominated by the unmix and redirected, or left on the original lanes and
+  // counted as ungoverned.
+  void coupleJointOutputs() {
+    for (const JointGroup &G : JointGroups) {
+      Pair X = Encoded.lookup(G.First), Y = Encoded.lookup(G.Second);
+      if (!X.E || !Y.E) continue;
+      bool Affine = Regions[RegionOf.lookup(G.First)].Affine;
+      IRBuilder<> B(G.Second);
+      // U = X + Y and V = X + 2Y are the only quantities that cross the pinned
+      // per-activation slots. The inverse X = 2U - V, Y = V - U is exact at
+      // every width because the coupling matrix has determinant one; doubling
+      // is a pair addition, so width 1 never sees a one-bit shift by one.
+      Pair U = pin(B, padd(B, X, Y, Affine), Affine, true);
+      Pair V = pin(B, padd(B, X, pdouble(B, Y, Affine), Affine), Affine, true);
+      Pair RX = psub(B, pdouble(B, U, Affine), V, Affine);
+      Pair RY = psub(B, V, U, Affine);
+      // G.Second still sits after everything emitted above, so it is an exact
+      // anchor for "the unmix dominates this use". Encoded is deliberately not
+      // updated: its pairs are valid everywhere, these are not.
+      JointRewrittenUses += redirect(X.E, RX.E, G.Second);
+      JointRewrittenUses += redirect(X.R, RX.R, G.Second);
+      JointRewrittenUses += redirect(Y.E, RY.E, G.Second);
+      JointRewrittenUses += redirect(Y.R, RY.R, G.Second);
+      ++JointCoupled;
+    }
   }
   void prepareMemory() {
     for (unsigned N = 0; N < Objects.size(); ++N) {
@@ -540,6 +699,20 @@ public:
     Item["shard_policy"] = O.Shards ? "instruction-order-units-with-atomic-memory-objects"
                                     : "whole-component-only";
     Item["normalized_copies"] = Copies;
+    // Joint-output accounting. Candidates are the selected nodes that could be
+    // a group member at all; every rejection carries a fixed reason, and the
+    // rewritten-use count is measured, not estimated.
+    Item["joint_output_groups"] = JointCoupled;
+    Item["joint_output_candidates"] = JointCandidates;
+    Item["joint_lane_uses_rewritten"] = JointRewrittenUses;
+    Item["joint_policy"] = O.JointOutputs ? "pairwise-unimodular-u-v-v1" : "disabled";
+    Item["joint_dependency_test"] = O.JointOutputs
+        ? "distinct-normalized-root-dependencies-both-ways-plus-no-dataflow-dependence" : "none";
+    json::Object NodeSkips, PairSkips;
+    for (unsigned K = 0; K < JN_Count; ++K) NodeSkips[JointNodeSkipName[K]] = JointNodeSkips[K];
+    for (unsigned K = 0; K < JP_Count; ++K) PairSkips[JointPairSkipName[K]] = JointPairSkips[K];
+    Item["joint_node_skips"] = std::move(NodeSkips);
+    Item["joint_pair_skips"] = std::move(PairSkips);
   }
   json::Object run() {
     if (Nodes.empty()) {
@@ -615,6 +788,7 @@ public:
       U->set(Plain); ++Outputs;
       DecodedAt[Key] = Plain;
     }
+    coupleJointOutputs();
     json::Array RegionReport;
     // component is the original connected component's stable planning index;
     // shard identifies the bounded part of it that this region belongs to.
@@ -673,8 +847,12 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
       for (StringRef Key : {"eligible_nodes", "eligible_memory_edges", "eligible_memory_objects",
                             "eligible_estimated_cost", "oversized_components",
                             "component_estimated_cost_limit", "shard_estimated_cost_limit",
-                            "shard_policy"})
+                            "shard_policy", "joint_output_candidates", "joint_policy",
+                            "joint_dependency_test", "joint_node_skips", "joint_pair_skips"})
         if (auto *Value = Item.get(Key)) Rolled[Key] = std::move(*Value);
+      if (auto *Value = Item.get("joint_output_groups")) Rolled["attempted_joint_output_groups"] = std::move(*Value);
+      if (auto *Value = Item.get("joint_lane_uses_rewritten"))
+        Rolled["attempted_joint_lane_uses_rewritten"] = std::move(*Value);
       // Everything the encoder actually selected was undone: record it as
       // attempted, never as coverage.
       if (auto *Value = Item.get("nodes")) Rolled["attempted_nodes"] = std::move(*Value);

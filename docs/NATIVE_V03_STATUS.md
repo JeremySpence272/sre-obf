@@ -227,6 +227,83 @@ Known remaining limits are unchanged by this work: boundary decodes at region
 exits, the narrow closed-object eligibility of `findObjects()`, the absent
 encoded call ABI, and software-invertible dispatch. Coverage is not hardness.
 
+## Bounded genuine joint outputs
+
+`--joint-outputs` / `-native-joint-outputs` is an independent defaults-off
+ablation, the P4 remainder. It couples two selected nodes so that the lanes
+crossing a pinned slot carry joint quantities instead of either value:
+
+    U = X + Y        V = X + 2Y        X = 2U - V        Y = V - U
+
+The coupling matrix has determinant one, so the inverse is exact at every
+supported width, width 1 included, with no division and no wrap correction.
+Every step is pair arithmetic on encoded lanes. The additive family is linear
+coordinate-wise; the XOR family reuses the already verified carry network.
+Neither path ever forms `E xor R` or `E - R`, so no decoded scalar X or Y
+exists as an SSA value at any point. Doubling is emitted as a pair addition,
+never `shl 1`, because a one-bit shift by one bit is poison at width 1 — the
+same hazard `convertFamily` documents.
+
+Both members must be genuinely distinct. The named test, reported per function
+as `joint_dependency_test`, is
+`distinct-normalized-root-dependencies-both-ways-plus-no-dataflow-dependence`:
+
+- neither node may appear in the other's bounded transitive dependency
+  closure, in either direction, so a value is never coupled with something it
+  already feeds or is fed by;
+- each node must depend on at least one normalized root the other does not.
+  Roots are normalized through loads to their underlying object and through
+  casts to their source, so two reloads of one alloca, or a cast of one value,
+  cannot present themselves as two live dependencies;
+- both nodes must be genuinely used, and the first must have at least one use
+  the unmix dominates, so no group mixes and unmixes something nothing reads.
+
+PHI nodes are never members: their lane pairs are pre-created and filled after
+emission, and rewriting them would break that fill. Members must share a
+representation family and an integer type, and the first must strictly dominate
+the second. Pairing is first fit over selected nodes in stable instruction
+order; it consumes no random stream, and the joint pins draw after every other
+site, so an existing site's stream is unchanged. Groups are capped at four per
+function with a bounded pair-test budget.
+
+The coupling is applied after every other lane use exists. A use is redirected
+to the recovered lanes only if the unmix dominates it; any other use keeps the
+original lanes and is reported as ungoverned rather than counted. Reports carry
+`joint_output_groups`, `joint_output_candidates`, the measured
+`joint_lane_uses_rewritten`, the policy name `pairwise-unimodular-u-v-v1` and
+two fixed skip vocabularies: `joint_node_skips` over examined nodes
+(`phi-representation`, `unused-value`, `dependency-walk-bound`,
+`no-live-dependency`, `group-budget`, `pair-test-budget`,
+`no-compatible-partner`) and `joint_pair_skips` over examined pairs
+(`width-mismatch`, `family-mismatch`, `no-dominance`, `shared-dependency`,
+`identical-dependencies`, `no-dominated-use`, `already-grouped`). A rolled-back
+function reports its attempted groups as attempted, never as coverage.
+
+`connected_check.py` gains `--require-joint-outputs` plus joint self-consistency
+checks: groups may not exceed half the candidates, may not appear under the
+disabled policy, and must govern at least one lane use per member. A report
+written by a compiler that predates the experiment carries no joint fields at
+all; that is read as unknown, never as zero, and it cannot satisfy the gate.
+`connected_model.py` holds the reference laws (`pair_add`, `pair_sub`,
+`pair_double`, `joint_mix`, `joint_unmix`, `decode`) and `connected_proof.py`
+checks them bounded in both families at every width.
+
+The schema string is deliberately unchanged at `sre-native-v3`; a bump to v4 is
+owed once the parallel v03 field additions are integrated.
+
+### Evidence
+
+Not yet recorded. The gates for this section have not been run in this
+checkout, so nothing here may be cited as measured. Required before this
+section can claim anything: the fixture differential at O0 and O2 at two seeds
+with `--post-o2-attack`, the flag-off control proving the protected IR hash is
+unchanged, the Python suite, the bounded reference proofs, and the honest
+stock-O2 survival comparison the handoff asks for — the pinned slots are a
+compiler barrier, not a semantic one, so a measurement showing the coupling
+survives `opt -passes=default<O2>` says only that, and an attacker who models a
+volatile slot as a plain store-to-load recovers X and Y immediately. Density is
+not hardness and this ablation is not a hardness claim.
+
 ## Next implementation batch
 
 The private Sol control now reproduces exact recovery in 79.511 seconds with

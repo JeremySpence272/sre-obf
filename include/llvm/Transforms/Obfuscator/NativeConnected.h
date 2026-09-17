@@ -14,6 +14,10 @@ struct NativeConnectedOptions {
   // Partition an oversized component into bounded shards under the same cost
   // limit instead of skipping it whole. The limit itself is never raised.
   bool Shards = false;
+  // Couple two genuinely used encoded lanes into joint outputs U = X + Y and
+  // V = X + 2Y, pinned, and recover X = 2U - V, Y = V - U. Lane arithmetic
+  // only: no decoded scalar is ever created.
+  bool JointOutputs = false;
   unsigned GrowthBudget = 0;
 };
 json::Array encodeNativeConnected(Module &, uint64_t, const NativeConnectedOptions &);

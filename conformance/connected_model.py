@@ -56,6 +56,46 @@ def xor_to_additive(x, refresh, width):
     return ((x[0] + x[1] - 2 * (x[0] & x[1]) + refresh) & mask, refresh & mask)
 
 
+def pair_add(x, y, width, affine, logical_shift=lambda value, amount: value >> amount):
+    """Add two encoded pairs of one family without decoding either of them."""
+    mask = (1 << width) - 1
+    if affine:
+        return ((x[0] + y[0]) & mask, (x[1] + y[1]) & mask)
+    return add(x, y, width, False, logical_shift)
+
+
+def pair_sub(x, y, width, affine, logical_shift=lambda value, amount: value >> amount):
+    mask = (1 << width) - 1
+    if affine:
+        return ((x[0] - y[0]) & mask, (x[1] - y[1]) & mask)
+    _, inv, *_ = operations(width, logical_shift)
+    return add(x, inv(y), width, True, logical_shift)
+
+
+def pair_double(x, width, affine, logical_shift=lambda value, amount: value >> amount):
+    """Doubling as a pair addition: a one-bit shift by one would be poison."""
+    return pair_add(x, x, width, affine, logical_shift)
+
+
+def joint_mix(x, y, width, affine, logical_shift=lambda value, amount: value >> amount):
+    """Joint outputs U = X + Y and V = X + 2Y as encoded pairs."""
+    u = pair_add(x, y, width, affine, logical_shift)
+    v = pair_add(x, pair_double(y, width, affine, logical_shift), width, affine, logical_shift)
+    return u, v
+
+
+def joint_unmix(u, v, width, affine, logical_shift=lambda value, amount: value >> amount):
+    """The exact inverse X = 2U - V, Y = V - U; the matrix has determinant one."""
+    x = pair_sub(pair_double(u, width, affine, logical_shift), v, width, affine, logical_shift)
+    y = pair_sub(v, u, width, affine, logical_shift)
+    return x, y
+
+
+def decode(pair, affine, width):
+    mask = (1 << width) - 1
+    return ((pair[0] - pair[1]) & mask) if affine else (pair[0] ^ pair[1])
+
+
 def additive_to_xor(x, a, r, width, logical_shift=lambda value, amount: value >> amount):
     mask = (1 << width) - 1
     left = (x[0] ^ a, a & mask)
