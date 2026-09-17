@@ -162,8 +162,10 @@ totals contradict its own region rows fails the gate as
 
 ### Evidence
 
-All runs use LLVM 22.1.8 in `sre-obf-dev:llvm22`, 593 vectors per arm, and
-clean/native/stock-post-O2 arms that must agree.
+All runs use LLVM 22.1.8 in `sre-obf-dev:llvm22`, plugin
+`5cd545b64ccb9f700ebc60cc70fe818091bb8c52852c9caa5d0d23b2b3c29d39`, 593 vectors
+per arm, and clean/native/stock-post-O2 arms that must agree. Each directory
+retains its own manifest with the exact command, seed and hashes.
 
 - `out/v03-shard-final-o0-s3-control`: the previous O0 command with shards off,
   built with the new compiler. Its protected module is byte-identical to the
@@ -183,9 +185,10 @@ clean/native/stock-post-O2 arms that must agree.
   exist**. Six objects stay encoded across 40 memory edges, and the two objects
   whose loads were not selected are skipped whole as `component-budget`. The
   required memory, predicate, family-conversion and shard gates all pass.
-- `out/v03-shard-o0-s8-budget`: shards under `--scale-budget`, where the fair
-  per-function allocation shrinks the component limit to 5,191. Three shards
-  fit inside it and the workload still agrees across all three arms.
+- `out/v03-shard-final-o0-s8-budget`: shards under `--scale-budget`, where the
+  fair per-function allocation shrinks the component limit to 5,191. Three
+  shards select 39 nodes inside it, memory stays encoded across 40 edges, and
+  the required memory, predicate and shard gates pass.
 - `out/v03-shard-fixtures-r2`: the fixture differential suite with shards and a
   deliberately small eight-node cap, so the oversized path runs on ordinary
   fixtures. Ten cases at two seeds, all correct across control, native,
