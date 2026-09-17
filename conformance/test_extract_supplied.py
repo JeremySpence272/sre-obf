@@ -212,6 +212,124 @@ class AntiOverclaimTest(unittest.TestCase):
     self.assertEqual(result["status"], "ok")
     self.assertEqual(result["kinds"], ["xor-constant"])
     self.assertGreaterEqual(result["slices_accepted"], 2)
+    self.assertFalse(result["budget_exhausted"])
+
+  def test_a_slice_sweep_that_runs_out_of_budget_says_so(self):
+    # Zero budget stops before the first slice. The verdict must be
+    # budget-exhausted, never "nothing fitted".
+    site = {"result": oracle(lambda a, b: (a ^ b) & 0xFF, 8, 2, domain=256)}
+    result = ph.slice_family(site, 8, 256, seconds=-1)
+    self.assertEqual(result["status"], "inconclusive")
+    self.assertEqual(result["reason"], "budget-exhausted")
+    self.assertEqual(result["slices_probed"], 0)
+
+
+class RecoveryBridgeTest(unittest.TestCase):
+  """The discovery adapter's models, made provable instead of only enumerable."""
+
+  def model(self, family, params, width=W, arity=1):
+    return ph.RecoveryModel({"family": family, "params": params,
+                             "width": width, "arity": arity})
+
+  def test_each_family_evaluates(self):
+    cases = [
+        ("identity", {}, [5], 5),
+        ("xor_const", {"k": 0xF0}, [0x0F], 0xFF),
+        ("add_const", {"k": 3}, [M], 2),
+        ("sub_const", {"k": 10}, [4], 6),
+        ("mask_const", {"k": 0xFF}, [0x1234], 0x34),
+        ("rotl", {"r": 4}, [0x0000000F], 0x000000F0),
+        ("rotl", {"r": 0}, [0x1234], 0x1234),
+        ("affine", {"a": 3, "b": 1}, [5], 16),
+        ("bounds", {"low": 10, "high": 20}, [15], 1),
+        ("bounds", {"low": 10, "high": 20}, [21], 0),
+        ("bounds", {"low": 10, "high": 20}, [9], 0),
+        ("table", {"domain": [0, 2, 7], "values": [11, 22, 33]}, [2], 22),
+    ]
+    for family, params, args, want in cases:
+      with self.subTest(family=family, args=args):
+        self.assertEqual(self.model(family, params).apply(args), want)
+
+  def test_pair_families(self):
+    self.assertEqual(self.model("xor_join", {"k": 1}, arity=2).apply([6, 3]), 4)
+    self.assertEqual(self.model("sum_join", {"k": 1}, arity=2).apply([6, 3]), 10)
+    self.assertEqual(self.model("difference", {"k": 1}, arity=2).apply([6, 3]), 4)
+    self.assertEqual(self.model("affine_join", {"a": 2, "b": 3, "k": 1},
+                                arity=2).apply([5, 7]), 32)
+
+  def test_gf2_linear_is_a_xor_of_selected_columns(self):
+    columns = [1 << i for i in range(W)]
+    self.assertEqual(self.model("gf2_linear", {"columns": columns}).apply([0xABCD]), 0xABCD)
+
+  def test_a_recurrence_has_no_fixed_size_term(self):
+    # Its trip count is an input, so there is no term to prove. Refusing is the
+    # honest answer; inventing one would manufacture a proof.
+    with self.assertRaises(ValueError):
+      self.model("recurrence", {"a": 5, "b": 3, "seed": 1}).apply([4])
+
+  def test_an_unknown_family_is_rejected(self):
+    with self.assertRaises(ValueError):
+      self.model("telekinesis", {})
+
+  def test_bridged_models_carry_perturbations_and_witnesses(self):
+    bounded = self.model("bounds", {"low": 10, "high": 20})
+    self.assertTrue(bounded.perturbations())
+    self.assertIn((10,), bounded.witnesses())
+    self.assertIn((21,), bounded.witnesses())
+    table = self.model("table", {"domain": [0, 2, 7], "values": [1, 2, 3]})
+    self.assertEqual(table.witnesses(), [(0,), (2,), (7,)])
+    self.assertTrue(any(m.params["values"] != [1, 2, 3] for m in table.perturbations()))
+
+  def test_a_bridged_model_is_accepted_only_on_the_usual_evidence(self):
+    model = self.model("xor_const", {"k": 0xAB}, width=8)
+    result = ph.test_model(model, oracle(lambda x: x ^ 0xAB, 8, domain=256), 8, domain=256)
+    self.assertTrue(result["accepted"])
+    wrong = self.model("xor_const", {"k": 0xAC}, width=8)
+    self.assertFalse(ph.test_model(wrong, oracle(lambda x: x ^ 0xAB, 8, domain=256),
+                                   8, domain=256)["accepted"])
+
+  def test_models_round_trip_into_the_discovery_dict_form(self):
+    self.assertEqual(ph.as_recovery_model(ph.XorConst(W, k=9)),
+                     {"family": "xor_const", "params": {"k": 9}, "width": W, "arity": 1})
+    self.assertEqual(ph.as_recovery_model(ph.Mask(W, m=0xFF))["family"], "mask_const")
+    self.assertEqual(ph.as_recovery_model(ph.Identity(W))["family"], "identity")
+    self.assertEqual(ph.as_recovery_model(ph.Difference(W))["arity"], 2)
+    bridged = self.model("rotl", {"r": 3})
+    self.assertEqual(ph.as_recovery_model(bridged)["family"], "rotl")
+
+  def test_a_family_the_other_grammar_lacks_reports_the_gap(self):
+    # Better a null than a dict that means something else on the other side.
+    self.assertIsNone(ph.as_recovery_model(ph.BitPermutation(W, perm=list(range(W)))))
+    self.assertIsNone(ph.as_recovery_model(ph.Bound(W, n=5)))
+
+  def test_agreement_with_the_discovery_adapter_when_it_is_present(self):
+    # Live cross-check once both branches are integrated; skipped before that.
+    try:
+      from conformance import recovery
+    except ImportError:  # pragma: no cover
+      self.skipTest("conformance.recovery is unavailable")
+    if not hasattr(recovery, "predict"):
+      self.skipTest("conformance.recovery predates the shared grammar")
+    cases = [("identity", {}, 1), ("xor_const", {"k": 0xDEAD}, 1),
+             ("add_const", {"k": 7}, 1), ("sub_const", {"k": 7}, 1),
+             ("mask_const", {"k": 0xFF00}, 1), ("rotl", {"r": 11}, 1),
+             ("affine", {"a": 1103515245, "b": 12345}, 1),
+             ("bounds", {"low": 3, "high": 9}, 1),
+             ("table", {"domain": [0, 4, 8], "values": [1, 2, 3]}, 1),
+             ("xor_join", {"k": 5}, 2), ("sum_join", {"k": 5}, 2),
+             ("difference", {"k": 5}, 2), ("affine_join", {"a": 3, "b": 5, "k": 7}, 2)]
+    points = [0, 1, 2, 3, 4, 8, 9, 10, M, M - 1, 1 << 31, 0x55555555]
+    for family, params, arity in cases:
+      spec = {"family": family, "params": params, "width": W, "arity": arity}
+      bridged = ph.RecoveryModel(spec)
+      for x in points:
+        for y in (0, 1, M):
+          args = [x, y][:arity]
+          want = recovery.predict(spec, args)
+          if want is None:
+            continue
+          with self.subTest(family=family, args=args):
+            self.assertEqual(bridged.apply(args), want)
 
 
 class IndexMapTest(unittest.TestCase):

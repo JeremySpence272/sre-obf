@@ -428,6 +428,161 @@ class Recurrence(Model):
 
 
 # --------------------------------------------------------------------------
+# Bridge to the discovery adapter's grammar.
+#
+# `conformance/recovery.py` (agent E2) fits the same kind of grammar, but its
+# models are plain dicts fitted from a concrete observation grid, so they carry
+# no symbolic form and can only be validated by enumerating a domain. The
+# wrapper below gives any of its families a `build`, which is what turns a
+# counterexample check into a *proof* over the whole input space rather than an
+# enumeration over sampled points.
+#
+# The intent is that only one fitter survives integration. This is what makes
+# that choice free: either fitter may produce the model, and it can still be
+# proved against a lifted expression.
+# --------------------------------------------------------------------------
+
+RECOVERY_FAMILIES = (
+    "identity", "xor_const", "add_const", "sub_const", "mask_const", "rotl",
+    "affine", "gf2_linear", "table", "bounds", "xor_join", "sum_join",
+    "difference", "affine_join", "recurrence",
+)
+
+
+class RecoveryModel(Model):
+  """One of the discovery adapter's fitted models, made symbolically buildable.
+
+  `recurrence` is deliberately not buildable: its trip count is an input, so it
+  has no fixed-size term. Asking for one raises, and the caller then reports the
+  counterexample check as inconclusive instead of inventing a proof.
+  """
+
+  def __init__(self, model):
+    family = model["family"]
+    if family not in RECOVERY_FAMILIES:
+      raise ValueError(f"unknown recovery family {family!r}")
+    super().__init__(int(model["width"]), **dict(model["params"]))
+    self.kind = f"recovery:{family}"
+    self.family = family
+    self.arity = int(model.get("arity", 1))
+
+  def as_recovery_model(self):
+    return {"family": self.family, "params": dict(self.params),
+            "width": self.width, "arity": self.arity}
+
+  def build(self, b, args):
+    p, family = self.params, self.family
+    x = args[0]
+    y = args[1] if len(args) > 1 else b.const(0)
+    if family == "identity":
+      return x
+    if family == "xor_const":
+      return b.xor(x, b.const(p["k"]))
+    if family == "add_const":
+      return b.add(x, b.const(p["k"]))
+    if family == "sub_const":
+      return b.sub(b.const(p["k"]), x)
+    if family == "mask_const":
+      return b.and_(x, b.const(p["k"]))
+    if family == "rotl":
+      r = p["r"] % self.width
+      return x if not r else b.or_(b.shl(x, r), b.lshr(x, self.width - r))
+    if family == "affine":
+      return b.add(b.mul(x, b.const(p["a"])), b.const(p["b"]))
+    if family == "gf2_linear":
+      out = b.const(0)
+      for index, column in enumerate(p["columns"]):
+        bit = b.and_(b.lshr(x, index), b.const(1))
+        out = b.xor(out, b.ite(b.eq(bit, b.const(1)), b.const(column), b.const(0)))
+      return out
+    if family == "table":
+      domain, values = p["domain"], p["values"]
+      if not domain:
+        raise ValueError("an empty table has no term")
+      # Outside its fitted domain the source model returns None, so the term
+      # falls through to the last entry and the domain is kept in the report.
+      out = b.const(values[-1])
+      for index in range(len(domain) - 2, -1, -1):
+        out = b.ite(b.eq(x, b.const(domain[index])), b.const(values[index]), out)
+      return out
+    if family == "bounds":
+      # low <= x <= high, as the unsigned range test (x - low) <u (high-low+1).
+      span = (p["high"] - p["low"]) & self.mask
+      inside = b.ult(b.sub(x, b.const(p["low"])), b.const((span + 1) & self.mask))
+      return b.ite(inside, b.const(1), b.const(0))
+    if family == "xor_join":
+      return b.xor(b.xor(x, y), b.const(p["k"]))
+    if family == "sum_join":
+      return b.add(b.add(x, y), b.const(p["k"]))
+    if family == "difference":
+      return b.add(b.sub(x, y), b.const(p["k"]))
+    if family == "affine_join":
+      return b.add(b.add(b.mul(x, b.const(p["a"])), b.mul(y, b.const(p["b"]))),
+                   b.const(p["k"]))
+    raise ValueError(f"{family} has no fixed-size term")
+
+  def _sibling(self, params):
+    return RecoveryModel({"family": self.family, "params": params,
+                          "width": self.width, "arity": self.arity})
+
+  def perturbations(self):
+    """Neighbouring models, by nudging one numeric parameter of the family."""
+    out = []
+    for key in sorted(self.params):
+      value = self.params[key]
+      if isinstance(value, bool) or not isinstance(value, int):
+        continue
+      for nudged in ((value ^ 1) & self.mask, (value + 1) & self.mask):
+        if nudged == value:
+          continue
+        params = dict(self.params)
+        params[key] = nudged
+        out.append(self._sibling(params))
+    if self.family == "table" and self.params.get("values"):
+      values = list(self.params["values"])
+      values[0] = (values[0] + 1) & self.mask
+      out.append(self._sibling({"domain": list(self.params["domain"]), "values": values}))
+    if self.family == "gf2_linear" and self.params.get("columns"):
+      columns = list(self.params["columns"])
+      columns[0] ^= 1
+      out.append(self._sibling({"columns": columns}))
+    return out
+
+  def witnesses(self):
+    if self.family == "table":
+      return [(value,) for value in self.params["domain"]]
+    if self.family == "bounds":
+      low, high = self.params["low"], self.params["high"]
+      return [((low - 1) & self.mask,), (low,), (high,), ((high + 1) & self.mask,)]
+    return []
+
+
+def as_recovery_model(model):
+  """Express one of this module's models in the discovery adapter's dict form.
+
+  Returns None for a model the other grammar has no family for, so a caller
+  reports the gap instead of emitting a model that means something else.
+  """
+  if isinstance(model, RecoveryModel):
+    return model.as_recovery_model()
+  p = model.params
+  family, params = {
+      "identity-index": ("identity", {}),
+      "xor-constant": ("xor_const", {"k": p.get("k")}),
+      "mask": ("mask_const", {"k": p.get("m")}),
+      "rotate-left": ("rotl", {"r": p.get("r")}),
+      "affine": ("affine", {"a": p.get("a"), "b": p.get("b")}),
+      "xor-pair": ("xor_join", {"k": 0}),
+      "sum": ("sum_join", {"k": 0}),
+      "difference": ("difference", {"k": 0}),
+  }.get(model.kind, (None, None))
+  if family is None:
+    return None
+  return {"family": family, "params": params, "width": model.width,
+          "arity": model.arity}
+
+
+# --------------------------------------------------------------------------
 # Oracles. Never the supplied target machine code: either a reference callable
 # (tests), a symbolic expression recovered by lifting, or a *reconstruction*
 # compiled from recovered C. The last is labelled and never conflated.
@@ -1284,7 +1439,8 @@ def analyze(spec, lift, oracles):
       tests.append(result)
   if not any(fitted.values()):
     phases.append(phase("fit", "inconclusive", "no-candidate-model", sites=fits))
-    sliced = slice_family(oracles, width, domain)
+    sliced = slice_family(oracles, width, domain,
+                          seconds=spec.get("limits", {}).get("slice_seconds", 300))
     if sliced is not None:
       phases.append(sliced)
     return phases, fitted
@@ -1309,18 +1465,26 @@ def analyze(spec, lift, oracles):
   return phases, fitted
 
 
-def slice_family(oracles, width, domain=None):
+def slice_family(oracles, width, domain=None, seconds=None):
   """Fit a one-operand family to any two-operand site that fit nothing whole.
 
   Reported only when the same grammar kind explains at least two slices: a
   relation that holds at a single pinned operand explains one example and is
   not a summary.
+
+  Every slice costs a fresh fit and a fresh proof against the lifted
+  expression, so the sweep carries a wall-clock budget. Running out of budget
+  is reported as `budget-exhausted` with the slices that did complete; it is
+  never silently treated as though the remaining slices had failed to fit.
   """
-  rows = []
+  rows, started, exhausted = [], time.monotonic(), False
   for site, oracle in sorted(oracles.items()):
     if getattr(oracle, "arity", 1) != 2:
       continue
     for fixed in SLICE_POINTS:
+      if seconds is not None and time.monotonic() - started > seconds:
+        exhausted = True
+        break
       view = SlicedOracle(oracle, fixed & mask_of(width))
       models = fit_models(view, width, domain)
       if not models:
@@ -1330,16 +1494,24 @@ def slice_family(oracles, width, domain=None):
       result = test_model(models[0], view, width, domain)
       rows.append({"site": site, "pinned": fixed, "model": models[0].describe(),
                    "accepted": result["accepted"], "reason": result["reason"]})
+    if exhausted:
+      break
   if not rows:
-    return None
+    return None if not exhausted else phase(
+        "slice-family", "inconclusive", "budget-exhausted", slices=[],
+        slices_accepted=0, slices_probed=0, seconds=round(time.monotonic() - started, 4))
   accepted = [r for r in rows if r["accepted"]]
   kinds = sorted({r["model"]["kind"] for r in accepted})
+  common = {"slices": rows, "slices_accepted": len(accepted),
+            "slices_probed": len(rows), "slices_available": len(SLICE_POINTS),
+            "budget_exhausted": exhausted,
+            "seconds": round(time.monotonic() - started, 4)}
+  if exhausted and len(accepted) < 2:
+    return phase("slice-family", "inconclusive", "budget-exhausted", **common)
   if len(accepted) < 2:
-    return phase("slice-family", "inconclusive", "single-site", slices=rows,
-                 slices_accepted=len(accepted), slices_probed=len(rows),
+    return phase("slice-family", "inconclusive", "single-site", **common,
                  note="fewer than two pinned slices are explained; this is not a summary")
-  return phase("slice-family", "ok", slices=rows, slices_accepted=len(accepted),
-               slices_probed=len(rows), kinds=kinds)
+  return phase("slice-family", "ok", **common, kinds=kinds)
 
 
 def worker(argv):
