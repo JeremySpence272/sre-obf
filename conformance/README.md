@@ -172,6 +172,47 @@ backend remains at its default O0. Object sidecars record these settings. The
 the matched stripped/static O0 pair, installs its exact-match grader and prompt,
 and retains private compiler provenance separately from agent-visible assets.
 
+## Locked evaluation matrix and coverage accounting
+
+`conformance/corpora.lock.json` fixes the programs, seeds and resource limits
+later milestones are measured against, as data rather than as arguments spread
+through commands. `python3 -m conformance.scale --corpus zlib --purpose
+regression --seed 3` takes the module cap, compile timeout, container limits
+and permitted seed set from the lock and records the lock revision and hash in
+the result. `--high-cap` selects the separately labelled 1.5M-instruction
+experiment; it never rewrites a primary-cap comparison. The lock also names the
+build flags a comparable scale run requires — currently `--scale-budget`, since
+without bounded growth allocation unchanged zlib passes 2.2M instructions where
+the retained v03 evidence stayed under 1.5M. A locked run that omits them is
+refused rather than silently switched on: a defaults-off flag stays off.
+
+The lock enforces the split rather than describing it. zlib, Lua and SQLite are
+`scale-regression`: they already influenced this work and cannot be relabelled
+held out. bzip2 and cJSON are `holdout`: they refuse every purpose but
+`holdout`, and because their input/output contracts are not frozen yet they
+currently refuse that too. Seeds 1/3/4 are regression, 11/13/17 promotion,
+23/29/31 holdout, and the three sets are disjoint. Another seed of the same
+program is not a held-out program.
+
+Scale coverage is reported as several views at once, never one number.
+`source_ledger` puts every source-owned function into exactly one disposition —
+encoded, rolled back, planner-skipped, not planned, not selected, absorbed
+before selection, or unaccounted — weighted both by count and by input
+instructions, crediting a merged origin at the function that owns its body. A
+function no pass touched is a bucket, not an absence. `coverage_views` reports
+raw operation coverage beside cost- and source-weighted coverage; on SQLite
+those differ by two orders of magnitude, which is the point. `loss_ledger`
+keeps selection loss and growth rollback apart and closes the identity
+`eligible = selected + skipped + shard-lost + rolled-back`. `cap_ledger` keeps
+the module, per-function, per-region, per-shard and per-object caps distinct;
+the per-object cap is null because the pass does not publish it, and null is
+unknown, not absent. `support_charge` charges each generated helper once at its
+owning symbol, so a helper called from forty functions is one charge.
+
+`--require-accounting` fails a run whose cost identity does not close or whose
+source denominator is unknown, with status `accounting-failure` or
+`accounting-unknown`. Unknown exits non-zero instead of passing by omission.
+
 No paid-agent solve or general obfuscation-hardness claim is established by
 these tests. The wider evaluation and remaining acceptance criteria are in
 [the plan](../docs/STATIC_NATIVE_PLAN.md).

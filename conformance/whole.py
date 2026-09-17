@@ -10,6 +10,12 @@ from conformance.cc import backend_flags
 from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, image_identity, opt_command
 
+# Per-function IR growth budget for the generic passes. Named here, and echoed
+# into every manifest, so that a later measurement can tell whether it was
+# taken under the same budget rather than having to reconstruct it from a
+# command line. The locked evaluation matrix pins the same two numbers.
+IR_BUDGET_MULTIPLIER, IR_BUDGET_MAX = 50, 30000
+
 EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "invariant", "outline",
                "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure",
                "connected-shards", "connected-aggregates", "joint-outputs", "encoded-calls")
@@ -135,7 +141,8 @@ def build(args):
                 f"-native-stage-dir={out / 'stages'}",
                 f"-native-module-insts={args.module_insts}",
                 f"-obf-seed={args.seed}", "-obf-deterministic", "-obf-verify",
-                "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
+                f"-obf-ir-budget-multiplier={IR_BUDGET_MULTIPLIER}",
+                f"-obf-ir-budget-max={IR_BUDGET_MAX}",
                 f"-native-report-json={out / 'native.json'}", f"-obf-report-json={out / 'passes.json'}",
                 "-S", str(prepared), "-o", str(protected)])
     arms = {"clean": prepared}
@@ -161,6 +168,13 @@ def build(args):
               "preparation": "llvm-link; optional explicit internalization; fusion optionally promotes private scalars",
               "second_production_optimization": False, "features": [] if args.control_only else feature_flags,
               "control_only": args.control_only, "full_disassembly": not args.no_disassembly,
+              "budgets": {"module_instruction_limit": args.module_insts,
+                          "compile_timeout_seconds": args.compile_timeout,
+                          "ir_budget_multiplier": IR_BUDGET_MULTIPLIER,
+                          "ir_budget_max": IR_BUDGET_MAX,
+                          "connected_nodes": args.connected_nodes, "value_nodes": args.value_nodes,
+                          "scope": "every limit this build ran under, recorded as data; a "
+                                   "measurement taken under different numbers is not comparable"},
               "module_instruction_limit": args.module_insts, "compile_timeout": args.compile_timeout,
               "sources": source_hashes,
               "plugin_sha256": plugin_hash, "plugin_archive": str(archived_plugin), "driver_sha256": driver_hash,

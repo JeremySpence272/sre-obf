@@ -1,0 +1,213 @@
+{
+  "schema": "sre-corpus-lock-v1",
+  "revision": "m0-2",
+  "scope": [
+    "The frozen v04 evaluation matrix: which programs, which seeds and which resource limits every later measurement is taken under.",
+    "Data, not arguments. A measurement that does not name an entry here is not part of the matrix.",
+    "A change to this file is a recorded configuration revision, never a silent gate relaxation: bump `revision` and say why in the run that first uses it."
+  ],
+  "resources": {
+    "build": {
+      "module_instruction_limit": 250000,
+      "high_cap_experiment_module_instruction_limit": 1500000,
+      "compile_timeout_seconds": 600,
+      "ir_budget_multiplier": 50,
+      "ir_budget_max": 30000,
+      "frontend_optimization": "O2",
+      "backend_optimization": "O0",
+      "scope": "The 250k cap is the comparison point. The 1.5M cap is a separately labelled experiment and never rewrites a 250k comparison.",
+      "required_scale_flags": [
+        "scale-budget"
+      ],
+      "required_scale_flags_scope": "A scale measurement without bounded growth allocation is not comparable to one with it: without --scale-budget the connected pass reserves no per-function allocation and never rolls back, and unchanged zlib then passes 2.2M instructions where the retained v03 evidence stayed under 1.5M. The runner refuses a locked corpus run that omits these flags rather than silently producing an incomparable number."
+    },
+    "container": {
+      "memory": "6g",
+      "cpus": 4,
+      "network": "none",
+      "scope": "Must equal what conformance.process.Runner actually passes to docker; the accounting tests assert that, so a drift in either is a failure rather than an undocumented change."
+    },
+    "workload": {
+      "timeout_seconds": 60
+    },
+    "agent": {
+      "steps": 600,
+      "wall_clock_hours": 2,
+      "matched_runs_per_artifact": 3,
+      "scope": "A timeout is a censored observation, not infinite hardness. Three runs are an initial variability check, not a statistical proof."
+    }
+  },
+  "seeds": {
+    "regression": [
+      1,
+      3,
+      4
+    ],
+    "promotion": [
+      11,
+      13,
+      17
+    ],
+    "holdout": [
+      23,
+      29,
+      31
+    ],
+    "scope": "The three sets are disjoint by construction and the loader checks it. A held-out seed is not a held-out program: another seed of the same program is still the same program family."
+  },
+  "splits": {
+    "tuning": {
+      "tuning_allowed": true,
+      "description": "Programs candidates may be designed and tuned against."
+    },
+    "scale-regression": {
+      "tuning_allowed": true,
+      "description": "zlib, Lua and SQLite have already influenced this work. They are scale continuity regressions, not fresh evidence of generalization, and must never be described as held-out."
+    },
+    "holdout": {
+      "tuning_allowed": false,
+      "description": "Results are reported and never used to tune the same candidate. Rotating an entry into tuning requires reporting its original holdout result first and replenishing the split."
+    }
+  },
+  "corpora": {
+    "crackme": {
+      "split": "tuning",
+      "family": "keyed-check-crackme",
+      "acquisition": {
+        "kind": "private-artifact",
+        "location": "obfuscation-harness/versions/**, excluded from Git and from agent workspaces",
+        "sha256": null,
+        "state": "unverifiable-from-this-workspace"
+      },
+      "workload_contract": "fixed crackme source and answer semantics, frozen before v04",
+      "notes": "The hash is null because this workspace cannot see the artifact. Null is unknown, not zero: a run that claims to have measured the crackme must supply and record the hash itself."
+    },
+    "fixtures": {
+      "split": "tuning",
+      "family": "designated-fixtures",
+      "acquisition": {
+        "kind": "in-repo",
+        "root": "conformance/fixtures",
+        "membership": "explicitly enumerated below; a fixture added later does not silently join the evaluation matrix",
+        "files": {
+          "arithmetic.c": "8229de4cda3b45a7aa309fe8154f86196f354707b6c0210d2c5e150212b7865b",
+          "cff_flags.c": "3b2e905aeae3968ae0e50289204fa4c4c93019a0d56cb0731db31bebae441de1",
+          "connected_affine.c": "5d2ffcc51ef014f0d38c22f72f2d6c05392dde8ead8ddb0af382d80f13a390c7",
+          "connected_aggregate.c": "33a83e78b3b13041a8e13e4df3495f73ef94dcd811a5d28c63eba6e00fd90e03",
+          "connected_aggregate_sink.c": "f78d92021a69241f85c8b5d5e0c2edde1b76bac3e88fb7ee8f65aef7ca878afc",
+          "connected_kernel.c": "d629f4e7221a78cea0680953acf07fc488e750b5e8c981377511accc00666a84",
+          "data.c": "19200c9a488dc07aa6c726f4f18a927413126986c18096a4ea23e1fa6d4739cc",
+          "driver.c": "d72e5bf7e44c3e51ffa9043cd92a3521bb5953202f8165d5b9d940b7b8bfae4b",
+          "encoded_calls.c": "a792966889491f25fab5ac68a337eb92ef76f1e91adad702b8cc161857e3756f",
+          "merging.c": "90f3e8639aa051d4fe02315890b03c9a18670676a70eaee207c61fbf1aa617fa",
+          "state.c": "4bf643f3d76be795093f8ef3f06e1934370a34726ddfebf9fd755306f26e6f4c",
+          "values.c": "a330c7b7bae276eb9f906c54e2ffd523b5595ac69bd8c8c3a9fb5f592afc605f",
+          "wide.c": "53b97eed0426d7d3ce5228aa55f5c2d1040a459d7a2112ae5b3c05688f6c0224",
+          "whole_main.c": "c9062692a5f23fe3021d4522e1472f99c6b612eafd5bce52d24e6d84dfeeecb2",
+          "whole_producer.c": "f1bda2352e833ec535460a15525763714eea6fa465bb5340467ce2e04433c1bb",
+          "widths.c": "8b0b03434c7c68706d4dd1a2e829a98a631d4d4ccd9e7e9b8c6b593c5ad0a8ec"
+        }
+      },
+      "families_covered": [
+        "bytewise and wordwise arithmetic: arithmetic.c, values.c",
+        "mixed-width transfers: widths.c, wide.c",
+        "parsing and state machines: state.c, cff_flags.c",
+        "table-driven kernels: connected_kernel.c, data.c",
+        "bounded memory loops and aliased objects: connected_affine.c, connected_aggregate.c, connected_aggregate_sink.c",
+        "multi-function and cross-module: merging.c, whole_main.c, whole_producer.c, encoded_calls.c"
+      ],
+      "gaps": [
+        "No recursive fixture is enumerated here. Gate 7D asks for one; M5 owns supported recursion. This is an open gap, not a satisfied requirement."
+      ]
+    },
+    "zlib": {
+      "split": "scale-regression",
+      "family": "stream-compression",
+      "acquisition": {
+        "kind": "upstream-archive",
+        "revision": "1.3.1",
+        "url": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+        "archive_sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+        "state": "acquired"
+      },
+      "spec_schema": "sre-scale-v1",
+      "workload_contract": "frozen in the generated scale manifest: source and header hashes, cflags, link flags, stdin and expected stdout hash",
+      "notes": "Already influenced this work. A scale continuity regression, never fresh generalization evidence."
+    },
+    "lua": {
+      "split": "scale-regression",
+      "family": "interpreter",
+      "acquisition": {
+        "kind": "upstream-archive",
+        "revision": "5.4.8",
+        "url": "https://www.lua.org/ftp/lua-5.4.8.tar.gz",
+        "archive_sha256": "4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae",
+        "state": "acquired"
+      },
+      "spec_schema": "sre-scale-v1",
+      "workload_contract": "frozen in the generated scale manifest",
+      "notes": "Already influenced this work. A scale continuity regression, never fresh generalization evidence."
+    },
+    "sqlite": {
+      "split": "scale-regression",
+      "family": "database-engine",
+      "acquisition": {
+        "kind": "upstream-archive",
+        "revision": "3.49.2",
+        "url": "https://www.sqlite.org/2025/sqlite-amalgamation-3490200.zip",
+        "archive_sha256": "921fc725517a694df7df38a2a3dfede6684024b5788d9de464187c612afb5918",
+        "state": "acquired"
+      },
+      "spec_schema": "sre-scale-v1",
+      "workload_contract": "frozen in the generated scale manifest",
+      "notes": "Already influenced this work. A scale continuity regression, never fresh generalization evidence."
+    },
+    "bzip2": {
+      "split": "holdout",
+      "family": "block-sorting-compression",
+      "acquisition": {
+        "kind": "upstream-archive",
+        "revision": "1.0.8",
+        "url": "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz",
+        "archive_sha256": "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269",
+        "state": "acquired",
+        "acquired_at": "2026-09-17",
+        "verification": "downloaded twice in one session with identical bytes; the hash also matches the value published with the release"
+      },
+      "spec_schema": null,
+      "workload_contract": null,
+      "workload_state": "pending",
+      "notes": [
+        "Burrows-Wheeler transform, MTF and Huffman coding with bit-level I/O: a different codebase and a different kernel shape from zlib.",
+        "The archive bytes are pinned. The input/output contract is NOT frozen yet, so no holdout result may be reported from this entry until a sre-scale-v1 manifest with expected outputs exists and its hash is recorded here."
+      ]
+    },
+    "cjson": {
+      "split": "holdout",
+      "family": "document-parser-serializer",
+      "acquisition": {
+        "kind": "upstream-archive",
+        "revision": "1.7.18",
+        "url": "https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.18.tar.gz",
+        "archive_sha256": "3aa806844a03442c00769b83e99970be70fbef03735ff898f4811dd03b9f5ee5",
+        "state": "acquired",
+        "acquired_at": "2026-09-17",
+        "verification": "downloaded twice in one session with identical bytes",
+        "stability_caveat": "A GitHub-generated tag tarball. If upstream regenerates it the hash can change without the source changing. Record the mismatch and re-pin deliberately; never overwrite this value silently."
+      },
+      "spec_schema": null,
+      "workload_contract": null,
+      "workload_state": "pending",
+      "notes": [
+        "Recursive-descent parsing and serialization over heap object graphs with aliased pointers: the recursion and aliasing shape that M3 and M5 claim to support, in code that never influenced the design.",
+        "The archive bytes are pinned. The input/output contract is NOT frozen yet, so no holdout result may be reported from this entry until a sre-scale-v1 manifest with expected outputs exists and its hash is recorded here."
+      ]
+    }
+  },
+  "honest_reporting": [
+    "A missing denominator is null, never zero.",
+    "Coverage is never inferred from a flag being enabled; only measured numerators count.",
+    "Emitted counts, AST size, taint-set size, nominal family count and decompiler output length are diagnostics, not protection.",
+    "Where a run cannot establish something it says unknown and exits non-zero rather than defaulting to a pass."
+  ]
+}
