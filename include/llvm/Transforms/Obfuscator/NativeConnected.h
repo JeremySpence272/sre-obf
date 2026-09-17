@@ -10,6 +10,8 @@ struct NativeConnectedOptions {
   bool Families = false;
   bool CoupleState = false;
   bool Invariant = false;
+  bool BoundedGrowth = false;
+  unsigned GrowthBudget = 0;
 };
 json::Array encodeNativeConnected(Module &, uint64_t, const NativeConnectedOptions &);
 json::Array absorbNativeSupport(Module &);

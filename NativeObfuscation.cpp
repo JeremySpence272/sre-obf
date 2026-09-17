@@ -64,6 +64,8 @@ cl::opt<bool> NativePredicateRegions("native-predicate-regions", cl::desc("Conne
 cl::opt<bool> NativeRegionalFamilies("native-regional-families", cl::desc("Seeded XOR/additive families for whole supported components"), cl::init(false));
 cl::opt<bool> NativeSupportRegions("native-support-regions", cl::desc("Absorb bounded generated data decoders before region planning"), cl::init(false));
 cl::opt<std::string> NativeStageDir("native-stage-dir", cl::desc("Private directory for pre-driver and post-driver IR snapshots"), cl::init(""));
+cl::opt<unsigned> NativeModuleInsts("native-module-insts", cl::desc("Explicit module IR instruction cap (10000..5000000)"), cl::init(250000));
+cl::opt<bool> NativeScaleBudget("native-scale-budget", cl::desc("Opt-in fair connected/application/helper growth allocations; reports all coverage losses"), cl::init(false));
 
 void saveNativeStage(const Module &M, StringRef Stage) {
   if (NativeStageDir.empty()) return;
@@ -78,11 +80,24 @@ void enableFamilies(Function &F) {
   if (NativeDiversity) F.addFnAttr("sre.native.families");
 }
 
-void checkModuleBudget(const Module &M) {
+uint64_t moduleInstructions(const Module &M) {
   uint64_t Total = 0;
   for (const Function &F : M) Total += F.getInstructionCount();
-  if (Total > 250000)
-    report_fatal_error("native module instruction cap exceeded (250000)");
+  return Total;
+}
+
+void checkModuleBudget(const Module &M, StringRef Stage) {
+  uint64_t Total = moduleInstructions(M);
+  if (Total > NativeModuleInsts) {
+    if (!NativeReport.empty()) {
+      std::error_code EC;
+      raw_fd_ostream OS(NativeReport.getValue() + ".budget.json", EC, sys::fs::OF_Text);
+      if (!EC) OS << formatv("{0:2}\n", json::Value(json::Object{
+          {"status", "module-budget-failure"}, {"stage", Stage.str()}, {"instructions", Total}, {"limit", NativeModuleInsts.getValue()},
+          {"inventory", obf::nativeBoundaryInventory(M, Stage)}}));
+    }
+    report_fatal_error(Twine("native module instruction cap exceeded: ") + Twine(Total) + " > " + Twine(NativeModuleInsts.getValue()));
+  }
 }
 
 std::string profile(bool Structural) {
@@ -164,6 +179,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-region-plan must be legacy or connected");
   if (NativeConnectedNodes < 2 || NativeConnectedNodes > 512)
     report_fatal_error("native-connected-nodes must be 2..512");
+  if (NativeModuleInsts < 10000 || NativeModuleInsts > 5000000)
+    report_fatal_error("native-module-insts must be 10000..5000000");
+  if (NativeScaleBudget && NativeRegionPlan != "connected")
+    report_fatal_error("native-scale-budget requires connected regions");
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
     report_fatal_error("connected regions require native-values and native-values-wide");
   if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions) && NativeRegionPlan != "connected")
@@ -199,7 +218,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     FusionCoverage = obf::fuseNativeFunctions(M, static_cast<uint64_t>(ObfSeed), NativeFunctions);
     AM.invalidate(M, PreservedAnalyses::none());
     if (verifyModule(M, &errs())) report_fatal_error("native fusion produced invalid IR");
-    checkModuleBudget(M);
+    checkModuleBudget(M, "after-fusion");
   }
   json::Array Coverage;
   auto &Cache = AM.getResult<ObfuscationAnnotationAnalysis>(M);
@@ -264,6 +283,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   if (NativeSupportRegions) SupportCoverage = obf::absorbNativeSupport(M);
   if (NativeOutline)
     OutlineCoverage = obf::outlineNativeRegions(M, PreparedCache.ModuleSeed);
+  DenseMap<Function *, unsigned> SourceWeights;
+  for (Function &F : M)
+    if (F.hasFnAttribute("sre.native.original")) SourceWeights[&F] = std::clamp(F.getInstructionCount(), 32u, 4096u);
+  json::Array GrowthCoverage;
   if (NativeRegionPlan == "connected") {
     obf::NativeConnectedOptions Options;
     Options.Nodes = NativeConnectedNodes;
@@ -272,6 +295,11 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.Families = NativeRegionalFamilies;
     Options.CoupleState = NativeCoupledState;
     Options.Invariant = NativeInvariant;
+    if (NativeScaleBudget) {
+      checkModuleBudget(M, "before-connected-allocation");
+      Options.BoundedGrowth = true;
+      Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
+    }
     ConnectedCoverage = obf::encodeNativeConnected(M, PreparedCache.ModuleSeed, Options);
   } else if (NativeValues)
     ValueCoverage = obf::encodeNativeValues(M, PreparedCache.ModuleSeed, NativeValueNodes, NativeCoupledState, NativeWide, NativeInvariant);
@@ -284,7 +312,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       if (!F.isDeclaration()) ChangedFAM.invalidate(F, PreservedAnalyses::none());
     if (verifyModule(M, &errs()))
       report_fatal_error("native value/region preparation produced invalid IR");
-    checkModuleBudget(M);
+    checkModuleBudget(M, "after-regions");
   }
   // O2 may put call-site memory(none)/readonly promises on calls. Updating only
   // the callee's attributes is insufficient when protection adds volatile reads.
@@ -296,11 +324,27 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
           CB->removeFnAttr(Attribute::Speculatable);
         }
   if (obf::isReportEnabled()) (void)AM.getResult<ObfReportAnalysis>(M);
+  if (NativeScaleBudget) {
+    uint64_t Weight = 0;
+    for (const auto &Item : SourceWeights) Weight += Item.second;
+    // Reserve one fifth of remaining headroom for generated support and late
+    // constants. Fixed shares avoid order-dependent module-budget starvation.
+    uint64_t Available = (NativeModuleInsts - moduleInstructions(M)) * 4 / 5;
+    auto &AC = AM.getResult<ObfuscationAnnotationAnalysis>(M);
+    for (auto &Item : SourceWeights) {
+      Function &F = *Item.first;
+      unsigned Limit = F.getInstructionCount() + (Weight ? Available * Item.second / Weight : 0);
+      auto &Config = AC.PerFunction[&F];
+      Config.budgetMultiplier = 1000000; Config.budgetHardCap = Limit;
+      GrowthCoverage.push_back(json::Object{{"function", F.getName().str()}, {"stage", "application"},
+          {"source_weight", Item.second}, {"instructions_before", F.getInstructionCount()}, {"instruction_ceiling", Limit}});
+    }
+  }
   ModulePassManager Applications;
   Applications.addPass(createModuleToFunctionPassAdaptor(ObfuscationFunctionDriverPass()));
   Applications.run(M, AM);
   saveNativeStage(M, "applications.ll");
-  checkModuleBudget(M);
+  checkModuleBudget(M, "after-applications");
 
   // Closed, generation-one worklist. New helpers are captured by identity,
   // never inferred solely from prefixes. The helper profile cannot create
@@ -317,9 +361,12 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
           ? F.getFnAttribute("obf.helper.origin").getValueAsString() : "native-application-pipeline");
     Helpers.push_back(&F);
   }
-  if (Helpers.size() > 256)
-    report_fatal_error("native generated-helper cap exceeded (256)");
+  unsigned HelperLimit = NativeScaleBudget ? 4096 : 256;
+  if (Helpers.size() > HelperLimit)
+    report_fatal_error(Twine("native generated-helper cap exceeded: ") + Twine(HelperLimit));
   auto &FAM = AM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+  unsigned HelperAllocation = NativeScaleBudget && !Helpers.empty()
+      ? (NativeModuleInsts - moduleInstructions(M)) / (2 * Helpers.size()) : 0;
   json::Array HelperCoverage;
   for (Function *H : Helpers) {
     std::string Reason = structuralBlocker(*H);
@@ -343,12 +390,16 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       H->addFnAttr("sre.native.helper.run");
       auto &HC = AM.getResult<ObfuscationAnnotationAnalysis>(M);
       HC.PerFunction[H] = AnnotationParser::parseAnnotationString(Spec);
+      if (NativeScaleBudget) {
+        HC.PerFunction[H].budgetMultiplier = 1000000;
+        HC.PerFunction[H].budgetHardCap = H->getInstructionCount() + HelperAllocation;
+      }
       FAM.invalidate(*H, PreservedAnalyses::none());
       auto PA = ObfuscationFunctionDriverPass().run(*H, FAM);
       FAM.invalidate(*H, PA);
       H->removeFnAttr("sre.native.helper.run");
       H->addFnAttr("sre.native.helper.processed");
-      checkModuleBudget(M);
+      checkModuleBudget(M, "after-helper");
     }
     json::Array Calls, Globals;
     SmallPtrSet<GlobalValue *, 16> Dependencies;
@@ -372,6 +423,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   }
   json::Array LateCoverage;
   if (NativeLate) {
+    unsigned LateCount = 0;
+    for (Function &F : M)
+      LateCount += F.hasFnAttribute("sre.native.original") || F.hasFnAttribute("sre.native.helper.processed");
+    unsigned LateAllocation = NativeScaleBudget && LateCount ? (NativeModuleInsts - moduleInstructions(M)) / LateCount : 0;
     for (Function &F : M) {
       if (!F.hasFnAttribute("sre.native.original") &&
           !F.hasFnAttribute("sre.native.helper.processed")) continue;
@@ -385,14 +440,23 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
       auto Saved = LC.PerFunction[&F];
       LC.PerFunction[&F] = AnnotationParser::parseAnnotationString(
           "obf: constenc(prob=100,maxSites=16,encFP=0)");
+      if (NativeScaleBudget) {
+        LC.PerFunction[&F].budgetMultiplier = 1000000;
+        LC.PerFunction[&F].budgetHardCap = F.getInstructionCount() + LateAllocation;
+      }
       FAM.invalidate(F, PreservedAnalyses::none());
-      auto PA = ConstEncPass().run(F, FAM);
+      // The ordinary driver supplies transactional hard-cap enforcement in
+      // scale mode; legacy late-pass behavior stays unchanged when disabled.
+      bool HelperRun = F.hasFnAttribute("sre.native.helper");
+      if (NativeScaleBudget && HelperRun) F.addFnAttr("sre.native.helper.run");
+      auto PA = NativeScaleBudget ? ObfuscationFunctionDriverPass().run(F, FAM) : ConstEncPass().run(F, FAM);
+      if (NativeScaleBudget && HelperRun) F.removeFnAttr("sre.native.helper.run");
       FAM.invalidate(F, PA);
       LC.PerFunction[&F] = std::move(Saved);
       LateCoverage.push_back(json::Object{{"function", F.getName().str()},
           {"status", PA.areAllPreserved() ? "no-change" : "processed"}});
     }
-    checkModuleBudget(M);
+    checkModuleBudget(M, "after-late-constants");
   }
   // Rewrite after helper passes so they cannot disappear from the legacy sink.
   if (obf::isReportEnabled())
@@ -459,6 +523,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"values_wide", NativeWide.getValue()}, {"invariant", NativeInvariant.getValue()},
                             {"value_nodes", NativeValueNodes.getValue()},
                             {"region_plan", NativeRegionPlan.getValue()}, {"connected_nodes", NativeConnectedNodes.getValue()},
+                            {"module_instruction_limit", NativeModuleInsts.getValue()},
+                            {"scale_budget", NativeScaleBudget.getValue()}, {"helper_limit", HelperLimit},
                             {"memory_ssa", NativeMemorySSA.getValue()}, {"predicate_regions", NativePredicateRegions.getValue()},
                             {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
@@ -473,6 +539,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
     Result["input_inventory"] = std::move(InputInventory);
+    Result["growth_allocations"] = std::move(GrowthCoverage);
     Result["region_inventory"] = std::move(RegionInventory);
     Result["final_inventory"] = obf::nativeBoundaryInventory(M, "final-ir");
     OS << formatv("{0:2}\n", json::Value(std::move(Result)));

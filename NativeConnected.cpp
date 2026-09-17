@@ -7,6 +7,7 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <numeric>
 
 using namespace llvm;
@@ -76,10 +77,11 @@ class Encoder {
     return {B.CreateXor(X.E, Y.E), B.CreateXor(X.R, Y.R)};
   }
   Pair band(IRBuilder<> &B, Pair X, Pair Y) {
-    Value *R = B.CreateXor(X.R, rotate(B, Y.R, 3));
+    // Keep one product in the second coordinate: no temporary combines all
+    // four terms into plaintext. Site-level pinning refreshes the pair later.
     Value *E = B.CreateXor(B.CreateXor(B.CreateAnd(X.E, Y.E), B.CreateAnd(X.E, Y.R)),
-                          B.CreateXor(B.CreateAnd(X.R, Y.E), B.CreateAnd(X.R, Y.R)));
-    return {B.CreateXor(E, R), R};
+                          B.CreateAnd(X.R, Y.E));
+    return {E, B.CreateAnd(X.R, Y.R)};
   }
   Pair bor(IRBuilder<> &B, Pair X, Pair Y) { return bxor(B, bxor(B, X, Y), band(B, X, Y)); }
   Pair bnot(IRBuilder<> &B, Pair X) { return {B.CreateNot(X.E), X.R}; }
@@ -88,14 +90,16 @@ class Encoder {
   Pair convert(IRBuilder<> &B, Pair X, Type *T, bool Sign = false) {
     return {B.CreateIntCast(X.E, T, Sign), B.CreateIntCast(X.R, T, Sign)};
   }
-  Pair badd(IRBuilder<> &B, Pair X, Pair Y) {
+  Pair badd(IRBuilder<> &B, Pair X, Pair Y, bool CarryIn = false) {
     Pair P = bxor(B, X, Y), Original = P;
     unsigned W = X.E->getType()->getIntegerBitWidth();
-    if (W == 1) return P;
+    if (CarryIn) Original.E = B.CreateXor(Original.E, constant(X.E->getType(), 1));
+    if (W == 1) return Original;
     Pair G = band(B, X, Y);
+    if (CarryIn) G = bor(B, G, band(B, P, {constant(X.E->getType(), 1), constant(X.E->getType(), 0)}));
     for (unsigned D = 1; D < W; D *= 2) {
       G = bor(B, G, band(B, P, shl(B, G, D)));
-      P = band(B, P, shl(B, P, D));
+      if (D * 2 < W) P = band(B, P, shl(B, P, D));
     }
     return bxor(B, Original, shl(B, G, 1));
   }
@@ -104,7 +108,7 @@ class Encoder {
     unsigned W = X.E->getType()->getIntegerBitWidth();
     for (unsigned D = 1; D < W; D *= 2) {
       G = bor(B, G, band(B, P, shl(B, G, D)));
-      P = band(B, P, shl(B, P, D));
+      if (D * 2 < W) P = band(B, P, shl(B, P, D));
     }
     Pair L = convert(B, W == 1 ? G : lshr(B, G, W - 1), B.getInt1Ty());
     if (!Signed) return L;
@@ -263,7 +267,9 @@ class Encoder {
       if (!Groups.count(Key)) { Groups[Key] = Planned.size(); Planned.push_back(Region{}); }
       Region &R = Planned[Groups[Key]];
       R.Nodes.push_back(I);
-      R.Cost += (I->getOpcode() == Instruction::Add || I->getOpcode() == Instruction::Sub || isa<ICmpInst>(I)) ? 128 : 16;
+      // Include pin/context/boundary work. The exact transactional ceiling
+      // below catches underestimates; these estimates are not hardness scores.
+      R.Cost += (I->getOpcode() == Instruction::Add || I->getOpcode() == Instruction::Sub || isa<ICmpInst>(I)) ? 320 : 96;
       R.Score += isa<ICmpInst>(I) ? 8 : isa<LoadInst>(I) ? 4 : 1;
       for (User *U : I->users()) if (isa<ReturnInst, StoreInst, BranchInst>(U)) R.Score += 4;
     }
@@ -275,7 +281,8 @@ class Encoder {
     });
     unsigned Cost = 0;
     for (Region &R : Planned) {
-      if (R.Nodes.size() < 2 || Nodes.size() + R.Nodes.size() > O.Nodes || Cost + R.Cost > 20000) {
+      unsigned Limit = O.BoundedGrowth ? std::min(20000u, O.GrowthBudget) : 20000;
+      if (R.Nodes.size() < 2 || Nodes.size() + R.Nodes.size() > O.Nodes || Cost + R.Cost > Limit) {
         ++SkippedComponents; continue;
       }
       R.ID = Regions.size();
@@ -361,7 +368,7 @@ class Encoder {
           case Instruction::And: Out = band(B, X, Y); break;
           case Instruction::Or: Out = bor(B, X, Y); break;
           case Instruction::Add: Out = badd(B, X, Y); break;
-          case Instruction::Sub: Out = badd(B, badd(B, X, bnot(B, Y)), {constant(I->getType(), 1), constant(I->getType(), 0)}); break;
+          case Instruction::Sub: Out = badd(B, X, bnot(B, Y), true); break;
           case Instruction::Mul: {
             ++MultiplyBridges;
             Value *V = B.CreateMul(B.CreateXor(X.E, X.R), B.CreateXor(Y.E, Y.R));
@@ -470,10 +477,49 @@ public:
 
 json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnectedOptions &O) {
   json::Array Report;
+  SmallVector<Function *, 64> Work;
+  uint64_t Weight = 0;
+  auto weight = [](const Function &F) { return std::clamp(F.getInstructionCount(), 32u, 4096u); };
   for (Function &F : M) {
     if (!F.hasFnAttribute("sre.native.original")) continue;
     if (!safe(F)) { Report.push_back(json::Object{{"function", F.getName().str()}, {"status", "skipped"}, {"reason", "structure-or-size"}}); continue; }
-    Report.push_back(Encoder(F, Seed, O).run());
+    Work.push_back(&F); Weight += weight(F);
+  }
+  // Allocate once, not first-come-first-served. Unused shares stay unused;
+  // adding/reordering functions cannot change an existing site's RNG stream.
+  for (Function *F : Work) {
+    auto Local = O;
+    if (O.BoundedGrowth) Local.GrowthBudget = uint64_t(O.GrowthBudget) * weight(*F) / Weight;
+    unsigned Before = F->getInstructionCount();
+    Function *Snapshot = nullptr;
+    auto Attributes = F->getAttributes();
+    auto Linkage = F->getLinkage();
+    if (O.BoundedGrowth) {
+      ValueToValueMapTy Map;
+      Snapshot = CloneFunction(F, Map);
+      Snapshot->setLinkage(GlobalValue::InternalLinkage);
+    }
+    auto Item = Encoder(*F, Seed, Local).run();
+    unsigned After = F->getInstructionCount();
+    if (Snapshot && After > uint64_t(Before) + Local.GrowthBudget) {
+      // Connected encoding creates only local instructions/allocas, no module
+      // globals or callees. This body-only rollback is therefore complete.
+      F->deleteBody(); F->setLinkage(Linkage);
+      ValueToValueMapTy Map;
+      for (unsigned I = 0; I < F->arg_size(); ++I) Map[Snapshot->getArg(I)] = F->getArg(I);
+      SmallVector<ReturnInst *, 8> Returns;
+      CloneFunctionInto(F, Snapshot, Map, CloneFunctionChangeType::LocalChangesOnly, Returns);
+      F->setAttributes(Attributes);
+      Item = json::Object{{"function", F->getName().str()}, {"status", "skipped"},
+          {"reason", "connected-growth-rollback"}, {"attempted_instructions", After},
+          {"eligible_nodes", *Item.getInteger("eligible_nodes")}};
+    }
+    if (Snapshot) Snapshot->eraseFromParent();
+    Item["instructions_before"] = Before;
+    Item["instructions_after"] = F->getInstructionCount();
+    Item["bounded_growth"] = O.BoundedGrowth;
+    if (O.BoundedGrowth) Item["growth_allocation"] = Local.GrowthBudget;
+    Report.push_back(std::move(Item));
   }
   return Report;
 }

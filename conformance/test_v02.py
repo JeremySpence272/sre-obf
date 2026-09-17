@@ -1,7 +1,12 @@
 import unittest
 import random
+import io
+import tempfile
+import zipfile
+from pathlib import Path
+from conformance.fetch_scale import extract
 from conformance.recovery_reach import check_expression, validate
-from conformance.connected_model import compare
+from conformance.connected_model import compare, add
 from conformance.whole import parser
 
 
@@ -24,6 +29,17 @@ class ReplayTests(unittest.TestCase):
 
 
 class ConnectedTests(unittest.TestCase):
+    def test_shared_add_sub(self):
+        rng = random.Random(6203)
+        for width in (1, 4, 8, 16, 32, 64):
+            mask = (1 << width) - 1
+            for _ in range(3000):
+                x, y, r, s = [rng.getrandbits(width) for _ in range(4)]
+                for subtract in (False, True):
+                    ye = y ^ s ^ (mask if subtract else 0)
+                    e, m = add((x ^ r, r), (ye, s), width, subtract)
+                    self.assertEqual(e ^ m, (x - y if subtract else x + y) & mask)
+
     def test_predicate_transfers(self):
         rng = random.Random(6202)
         for width in (1, 4, 8, 16, 32, 64):
@@ -42,6 +58,29 @@ class ConnectedTests(unittest.TestCase):
         args = parser().parse_args(["input.c", "--out", "/tmp/not-created"])
         self.assertEqual(args.region_plan, "legacy")
         self.assertFalse(any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions)))
+        self.assertFalse(args.scale_budget)
+        self.assertEqual(args.module_insts, 250000)
+
+
+class ScaleSourceTests(unittest.TestCase):
+    def test_reject_archive_escape(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w") as archive:
+            archive.writestr("../escape.c", "not extracted")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                extract(data.getvalue(), Path(directory) / "src", True)
+            self.assertFalse((Path(directory) / "escape.c").exists())
+
+    def test_reject_archive_symlink(self):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w") as archive:
+            entry = zipfile.ZipInfo("link")
+            entry.external_attr = 0o120777 << 16
+            archive.writestr(entry, "/tmp")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                extract(data.getvalue(), Path(directory) / "src", True)
 
 
 if __name__ == "__main__":

@@ -87,3 +87,67 @@ exposes corresponding `SRE_OBF_*` variables, including `SRE_OBF_REGION_PLAN`.
 P4 joint outputs, P5 private encoded-call interfaces, P6 alternative activation
 relations, comprehensive summary proof/repair ablations and large-program
 promotion gates are still outstanding. Do not call the full plan completed.
+
+## Scale/conformance expansion (still unpromoted)
+
+- Added pinned official SQLite 3.49.2, Lua 5.4.8 and zlib 1.3.1 source acquisition
+  and unchanged-source whole-application workload manifests. The runner verifies
+  source hashes and independently expected output, not merely two-build agreement.
+  Lua is a test application, not an obfuscation VM. No target sources are patched.
+- Clean full-program workload controls pass on all three. Initial protected Lua
+  and zlib builds exceeded the old 250,000-instruction module cap. Explicit
+  1.5-million calibration also failed: SQLite reached 4,201,450 instructions
+  before function passes; zlib reached 2,365,335 after them; Lua timed out at
+  600 seconds. These are compiler failures, never resistance evidence.
+- Module caps and compiler timeouts are now explicit and logged; defaults stay
+  unchanged. Failure reports retain stage and whole-module inventories. The
+  `--scale-budget` / `native-scale-budget` experiment allocates remaining growth
+  headroom across functions up front, with bounded source-size weights. Connected
+  body-only changes have exact transactional ceilings; unused shares are not
+  consumed in module order. Applications/support/late stages get separate shares.
+  The generated-helper cap is explicitly 4096 in this mode versus legacy 256.
+  This policy can sacrifice coverage; successful compilation is not promotion.
+- Removed a transient plaintext intermediate from XOR-pair AND and redundant
+  prefix work. Subtraction now uses one carry-in network. These are software
+  coordinates, not cryptographic secrecy. Generic predicates/PHIs and three
+  closed objects retain full-output correctness, including stock-O2 normalization.
+- `v02-affine-s1` actually selects the additive family and passes 593 outputs
+  per arm. `v02-compact-s4` passes memory/predicate requirements and 593 outputs.
+  `v02-compact-ghidra` passes its configured decompiler differential, including
+  the stock-O2 arm. None of these results measure recovery hardness.
+- Bounded reference-model SMT checks: 33 of 40 laws proved; seven timed out
+  with a three-second per-law cap; no counterexamples. The seven remain
+  inconclusive. These are not proofs of the complete LLVM implementation.
+- Whole-IR builds now archive the exact plugin before compiling and record
+  driver/source hashes at entry. Earlier unsealed candidates must be rebuilt
+  before treating them as frozen v02 artifacts.
+- Fair-budget zlib exposed a previously masked CFF bug: the shared CFG demoter
+  excluded every alloca, including non-entry allocation pointers whose uses
+  lose dominance after router edges are added. A minimal variable-array fixture
+  reproduces the old failure. The fix demotes cross-block pointer uses without
+  hoisting the allocation or changing how often it executes. LLVM lifetime
+  markers on those objects must be dropped before spilling addresses: reloads
+  are not legal lifetime operands. The extended regression passes all three
+  configurations (593 vectors each). The unit suite now has 29 passing tests.
+- Large gates still fail. The fair Lua build completes at 1,371,895 final IR
+  instructions, 190 selected connected functions and 2,728 generated helpers,
+  but its protected workload crashes (exit 139). Fair SQLite still reaches the
+  600-second compile cap. Preserve these failures; no hardness claim follows.
+- `scale-v02-zlib-lifetime-fixed` passes the unchanged full-byte-domain gzip
+  workload and independent expected-output check. It selects 1,912 of 7,943
+  eligible nodes in 77 functions, with 446 predicates and 46 surviving flattened
+  functions, but **zero connected memory edges**. Final IR is 1,266,392
+  instructions versus 18,290 input instructions. This passes one correctness
+  workload, not broad-coverage or overhead promotion.
+- `out/v02-core-sealed` passes 318 checks per crackme arm and retains its exact
+  plugin. The clean hash still matches v01. `v02-legacy-compat-final` is a
+  correctness/compatibility check, not an exact protected-binary reproduction:
+  the protected hash differs after intervening compiler changes. Only the
+  earlier report-only P0 build is claimed to reproduce the historical hashes.
+
+Scale coverage remains conservative and incomplete: reports include every input
+definition and instruction, skips by reason, region nodes and matched-origin
+body weights. A body containing a selected region is **not** fully protected.
+Merged/unmatched origins receive no invented coverage credit. Comparable
+in-process timing, peak memory, full-size useful-path coverage, independent
+held-out recovery and any default promotion remain outstanding.

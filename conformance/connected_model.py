@@ -1,25 +1,35 @@
 """Bit-precise reference for connected XOR transfers, not a compiler proof."""
 
-def operations(width):
+def operations(width, logical_shift=lambda value, amount: value >> amount):
     mask = (1 << width) - 1
     def xor(x, y): return (x[0] ^ y[0], x[1] ^ y[1])
     def inv(x): return (x[0] ^ mask, x[1])
-    def rotate(x):
-        if width == 1: return x
-        d = 1 + 3 % (width - 1)
-        return ((x << d) | (x >> (width-d))) & mask
     def land(x, y):
-        r = x[1] ^ rotate(y[1])
-        e = (x[0] & y[0]) ^ (x[0] & y[1]) ^ (x[1] & y[0]) ^ (x[1] & y[1])
-        return (e ^ r, r)
+        e = (x[0] & y[0]) ^ (x[0] & y[1]) ^ (x[1] & y[0])
+        return (e, x[1] & y[1])
     def lor(x, y): return xor(xor(x, y), land(x, y))
     def shl(x, d): return ((x[0] << d) & mask, (x[1] << d) & mask)
-    def lshr(x, d): return (x[0] >> d, x[1] >> d)
+    def lshr(x, d): return (logical_shift(x[0], d), logical_shift(x[1], d))
     return xor, inv, land, lor, shl, lshr
 
 
-def compare(x, y, width, signed=False, equality=False):
-    xor, inv, land, lor, shl, lshr = operations(width)
+def add(x, y, width, carry=False, logical_shift=lambda value, amount: value >> amount):
+    xor, inv, land, lor, shl, lshr = operations(width, logical_shift)
+    p = original = xor(x, y)
+    if carry: original = (original[0] ^ 1, original[1])
+    if width == 1: return original
+    g = land(x, y)
+    if carry: g = lor(g, land(p, (1, 0)))
+    d = 1
+    while d < width:
+        g = lor(g, land(p, shl(g, d)))
+        if d * 2 < width: p = land(p, shl(p, d))
+        d *= 2
+    return xor(original, shl(g, 1))
+
+
+def compare(x, y, width, signed=False, equality=False, logical_shift=lambda value, amount: value >> amount):
+    xor, inv, land, lor, shl, lshr = operations(width, logical_shift)
     if equality:
         z = xor(x, y)
         d = 1

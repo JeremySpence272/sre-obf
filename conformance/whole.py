@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import shutil
 import sys
 
 from conformance.cc import backend_flags
@@ -10,7 +11,7 @@ from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, image_identity, opt_command
 
 EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "invariant", "outline",
-               "memory-ssa", "predicate-regions", "regional-families", "support-regions")
+               "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget")
 
 
 def parser():
@@ -35,6 +36,8 @@ def parser():
     p.add_argument("--post-o2-attack", action="store_true")
     p.add_argument("--control-only", action="store_true", help="Build only the matched clean arm, including when a protected build cannot compile")
     p.add_argument("--no-disassembly", action="store_true", help="Skip full ELF disassembly for large scale-only runs; not a survival test")
+    p.add_argument("--module-insts", type=int, default=250000)
+    p.add_argument("--compile-timeout", type=float, default=180)
     return p
 
 
@@ -54,7 +57,7 @@ def build(args):
         raise ValueError("--invariant requires --coupled-state")
     if args.region_plan == "connected" and not (args.values and args.values_wide):
         raise ValueError("connected regions require --values --values-wide")
-    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions)) and args.region_plan != "connected":
+    if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions, args.scale_budget)) and args.region_plan != "connected":
         raise ValueError("connected subfeatures require --region-plan connected")
     if args.memory_ssa and not args.memory:
         raise ValueError("--memory-ssa requires --memory")
@@ -62,6 +65,8 @@ def build(args):
         raise ValueError("connected-nodes must be 2..512; value-nodes must be 2..64")
     if args.control_only and args.post_o2_attack:
         raise ValueError("the post-O2 attack requires a protected arm")
+    if not 10000 <= args.module_insts <= 5000000 or args.compile_timeout <= 0:
+        raise ValueError("invalid explicit module/time budget")
     if any(f.startswith(("-O", "-flto", "-fpass-plugin", "-Xclang")) or f in ("-o", "-c", "-S", "-emit-llvm")
            for f in args.cflag):
         raise ValueError("use --optimization; custom pipeline/output flags are forbidden")
@@ -70,8 +75,18 @@ def build(args):
         raise ValueError("link flags must not inject optimization or change the pipeline")
     sources = [s.resolve(strict=True) for s in args.sources]
     plugin_hash = digest(plugin)
+    driver_hash = digest(Path(__file__))
+    source_hashes = [{"path": str(s), "sha256": digest(s)} for s in sources]
     out.mkdir(parents=True)
-    runner = Runner(ROOT, out / "logs", args.toolchain_image,
+    # Seal the actual compiler plugin for each build. A concurrent rebuild in
+    # the development tree cannot change a running experiment's compiler.
+    archived_plugin = out / "toolchain" / "Obfuscator.so"
+    archived_plugin.parent.mkdir()
+    shutil.copyfile(plugin, archived_plugin)
+    if digest(archived_plugin) != plugin_hash:
+        raise ToolFailure("plugin changed while snapshotting")
+    plugin = archived_plugin
+    runner = Runner(ROOT, out / "logs", args.toolchain_image, timeout=args.compile_timeout,
                     mounts=tuple({out, plugin.parent, *(s.parent for s in sources)}))
     flags = ["-std=c11", "-" + args.optimization, *args.cflag]
     if args.optimization == "O0":
@@ -96,6 +111,7 @@ def build(args):
         runner.run(opt_command(plugin) + ["-passes=native-obfuscation", f"-native-level={args.profile}",
                 *feature_flags, f"-native-value-nodes={args.value_nodes}",
                 f"-native-stage-dir={out / 'stages'}",
+                f"-native-module-insts={args.module_insts}",
                 f"-obf-seed={args.seed}", "-obf-deterministic", "-obf-verify",
                 "-obf-ir-budget-multiplier=50", "-obf-ir-budget-max=30000",
                 f"-native-report-json={out / 'native.json'}", f"-obf-report-json={out / 'passes.json'}",
@@ -123,8 +139,9 @@ def build(args):
               "preparation": "llvm-link; optional explicit internalization; fusion optionally promotes private scalars",
               "second_production_optimization": False, "features": [] if args.control_only else feature_flags,
               "control_only": args.control_only, "full_disassembly": not args.no_disassembly,
-              "sources": [{"path": str(s), "sha256": digest(s)} for s in sources],
-              "plugin_sha256": plugin_hash, "driver_sha256": digest(Path(__file__)),
+              "module_instruction_limit": args.module_insts, "compile_timeout": args.compile_timeout,
+              "sources": source_hashes,
+              "plugin_sha256": plugin_hash, "plugin_archive": str(archived_plugin), "driver_sha256": driver_hash,
               "toolchain_image": image_identity(args.toolchain_image), "artifacts": hashes,
               "commands": runner.records}
     dump(out / "manifest.json", result)

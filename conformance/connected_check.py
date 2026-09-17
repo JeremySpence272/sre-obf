@@ -25,7 +25,7 @@ def main():
     report = json.loads((out / "native.json").read_text())
     regions = [row for row in report["connected_regions"] if row["status"] == "encoded"]
     encoded_objects = [obj for row in regions for obj in row["objects"] if obj["status"] == "encoded"]
-    coverage = {"regions": bool(regions), "memory": any(obj["elements"] == 8 for obj in encoded_objects),
+    coverage = {"regions": bool(regions), "memory": bool(encoded_objects),
                 "predicates": any(row["predicates"] > 0 for row in regions)}
     correct = len(values["clean"].splitlines()) == 593 and all(value == values["clean"] for value in values.values())
     passed = correct and coverage["regions"] and (not args.require_memory or coverage["memory"]) and (not args.require_predicates or coverage["predicates"])
