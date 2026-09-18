@@ -56,6 +56,33 @@ def xor_to_additive(x, refresh, width):
     return ((x[0] + x[1] - 2 * (x[0] & x[1]) + refresh) & mask, refresh & mask)
 
 
+def xor_to_additive_grouped(x, refresh, width):
+    """`xor_to_additive` reassociated so no intermediate is the plain value.
+
+    The v03 form computes `x0 + x1 - 2*(x0 & x1)` and only then adds the
+    refresh; that subexpression is exactly `x0 ^ x1`, so the decoded value
+    exists in a register between two inverses. Adding the refresh first is the
+    same function of the same operands -- the identity a + b = (a ^ b) + 2*(a&b)
+    holds in the ring -- with no such intermediate.
+    """
+    mask = (1 << width) - 1
+    return ((((x[0] + refresh) + x[1]) - 2 * (x[0] & x[1])) & mask, refresh & mask)
+
+
+def affine_mul_grouped(x, y, width):
+    """The v03 additive product, regrouped so no intermediate is the product.
+
+    The v03 form is `ex*ey - (ex*s + ey*r) + r*s` and only then `+ (r^s)`; that
+    subexpression is exactly x*y, so the plain product exists in a register
+    between two inverses. Adding the output mask to the first partial product
+    instead gives the same value with no such intermediate.
+    """
+    mask = (1 << width) - 1
+    r, s = x[1], y[1]
+    refresh = r ^ s
+    return (((x[0] * y[0] + refresh) - (x[0] * s + y[0] * r) + r * s) & mask, refresh & mask)
+
+
 def pair_add(x, y, width, affine, logical_shift=lambda value, amount: value >> amount):
     """Add two encoded pairs of one family without decoding either of them."""
     mask = (1 << width) - 1
