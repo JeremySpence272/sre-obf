@@ -323,20 +323,28 @@ class ArxNetwork:
 
   KINDS = ("mul", "addc", "xorc", "rot", "couple_add", "couple_xor", "swap")
 
-  def __init__(self, width, seed, words=2, rounds=3, allow=KINDS, pattern="random"):
+  def __init__(self, width, seed, words=2, rounds=3, allow=KINDS, pattern="random",
+               round_kernel="mul"):
     if width not in WIDTHS: raise ValueError(f"unsupported width {width}")
     if words < 1: raise ValueError("need at least one lane")
     self.width, self.seed, self.words, self.rounds = width, seed, words, rounds
     self.mask = (1 << width) - 1
-    self.pattern = pattern
-    rng = seeded(("arx", width, seed, words, rounds, pattern))
+    self.pattern, self.round_kernel = pattern, round_kernel
+    if round_kernel not in ("mul", "add"): raise ValueError(round_kernel)
+    rng = seeded(("arx", width, seed, words, rounds, pattern, round_kernel))
     if pattern == "mixer":
       if words != 2: raise ValueError("the mixer pattern is defined for two words")
+      # `round_kernel="add"` keeps modular multiplication out of the network.
+      # Addition is still nonlinear over GF(2) through its carry chain, and the
+      # bounded QF_BV queries over such a network stay decidable at the IR
+      # widths, which the multiplying one does not.
+      scale = (("mul", 0, odd_constant(rng, width)) if round_kernel == "mul" else
+               ("addc", 0, rng.getrandbits(width)))
       self.steps = []
       for _ in range(rounds):
         self.steps += [
             ("couple_xor", 0, 1, rot_amount(rng, width), odd_constant(rng, width)),
-            ("mul", 0, odd_constant(rng, width)),
+            scale,
             ("rot", 0, rot_amount(rng, width)),
             ("couple_add", 1, 0, rot_amount(rng, width), odd_constant(rng, width)),
             ("couple_add", 0, 1, rot_amount(rng, width), odd_constant(rng, width)),
@@ -367,6 +375,8 @@ class ArxNetwork:
 
   def _kernel(self, value, rot, mul):
     """The nonlinear round kernel of a coupling step, on traced values."""
+    if self.round_kernel == "add":
+      return rotl(value, rot, self.width) ^ (value + mul)
     return rotl(value, rot, self.width) ^ (value * mul)
 
   def apply(self, words):
@@ -398,6 +408,8 @@ class ArxNetwork:
   # -- independent integer reference ------------------------------------
 
   def ref_kernel(self, value, rot, mul):
+    if self.round_kernel == "add":
+      return ref_rotl(value, rot, self.width) ^ ((value + mul) & self.mask)
     return ref_rotl(value, rot, self.width) ^ ((value * mul) & self.mask)
 
   def ref_apply(self, words):
@@ -774,7 +786,7 @@ class NlCarry(Site):
   """
 
   family, version = "nlcarry", "v1"
-  KERNELS = ("linear", "and", "mul", "arx")
+  KERNELS = ("linear", "and", "mul", "arx", "addrot")
 
   def __init__(self, width, seed, lanes=2, kernel="arx"):
     super().__init__(width, seed, lanes)
@@ -801,8 +813,10 @@ class NlCarry(Site):
       taken.add(pair)
       self.rot.append(pair)
     self.nets = ([ArxNetwork(self.width, ("nlcarry", seed, i), words=2, rounds=2,
-                             pattern="mixer") for i in range(self.carriers)]
-                 if kernel == "arx" else [])
+                             pattern="mixer",
+                             round_kernel="add" if kernel == "addrot" else "mul")
+                  for i in range(self.carriers)]
+                 if kernel in ("arx", "addrot") else [])
 
   @property
   def identifier(self): return f"{self.family}-{self.kernel}-{self.version}"
@@ -1649,7 +1663,7 @@ def kernel_shape_attack(site, lane=0, samples=16, seed=0):
   many parameters for this enumeration and is reported as not attempted.
   """
   if not isinstance(site, NlCarry) or isinstance(site, NlCarryAbstract) \
-      or site.kernel == "arx":
+      or site.kernel in ("arx", "addrot"):
     return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
             "attempted": False, "reason": "search space not enumerated here"}
   rng = seeded(("shape", seed, site.identifier, lane))
@@ -1812,7 +1826,7 @@ def seed_collision_probe(width, kernel, lanes=2, sites=64, seed=0):
     key = tuple(site.carrier(a, b, 0, reference=True) for a, b in masks)
     if key in signatures: collisions += 1
     signatures.setdefault(key, site.seed)
-  space = None if kernel == "arx" else max(1, width - 1) ** 2
+  space = None if kernel in ("arx", "addrot") else max(1, width - 1) ** 2
   return {"width": width, "kernel": kernel, "sites": sites,
           "distinct_lane0_carriers": len(signatures), "collisions": collisions,
           "parameter_space": space,

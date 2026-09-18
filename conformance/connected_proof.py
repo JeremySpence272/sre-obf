@@ -267,15 +267,22 @@ def main():
       family_laws(z3, width, args.milliseconds, results, args.quick)
       print(width, "v04", sum(1 for r in results if r.get("group") == "v04"),
             "results", flush=True)
-  groups = {}
+  groups, per_width = {}, {}
   for record in results:
     bucket = groups.setdefault(record.get("group", "v03"), {})
     bucket[record["status"]] = bucket.get(record["status"], 0) + 1
+    # Raising the per-law cap is a legitimate choice only if its cost is
+    # reported, so the wall time and the outcome mix are recorded per width.
+    slot = per_width.setdefault(record["width"], {"seconds": 0.0})
+    slot["seconds"] = round(slot["seconds"] + record.get("seconds", 0.0), 2)
+    slot[record["status"]] = slot.get(record["status"], 0) + 1
   report = {"schema": "sre-connected-reference-proofs-v2", "z3": z3.get_version_string(),
             "scope": "reference laws only; not LLVM lowering, memory safety, ABI, or hardness",
             "per_law_timeout_ms": args.milliseconds, "groups_run": args.group,
             "widths": list(widths), "quick": bool(args.quick),
-            "summary": groups, "results": results,
+            "summary": groups, "per_width": per_width,
+            "solver_seconds": round(sum(r.get("seconds", 0.0) for r in results), 1),
+            "results": results,
             "recognizable_decodes": [r["law"] for r in results
                                      if r.get("severity") == "recognizable-decode" and
                                      r["status"] == "proved"],
