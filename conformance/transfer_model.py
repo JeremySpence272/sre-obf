@@ -50,7 +50,6 @@ def seeded(parts):
 
 WIDTHS = (1, 2, 4, 8, 16, 32, 64)
 IR_WIDTHS = (8, 16, 32, 64)  # the homogeneous vector widths W1 starts from
-BINARY = ("add", "sub", "mul", "xor", "and", "or")
 SHIFTS = ("shl", "lshr")
 
 
@@ -886,7 +885,7 @@ class NlCarry(Site):
     """A constant carried in the same representation; never a bare literal."""
     return ((carrier ^ (value & self.mask)), carrier)
 
-  def build(self, kind, i=0, j=1, k=0, amount=None, constant=3, lanes=None):
+  def build(self, kind, i=0, j=1, k=0, amount=None, constant=3):
     ops = share_ops(self.width, logical_shift)
     pxor, inv, land, lor, pshl, plshr = ops
     prog, z, carriers, pairs = self._open(kind)
