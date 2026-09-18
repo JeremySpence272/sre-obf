@@ -8,11 +8,11 @@
 //
 // Two rules give the structure its meaning:
 //
-//   1. Everything in the plan describes ORIGINAL source items. Op nodes are
-//      created only while analysing the unexpanded function, and the plan is
-//      sealed before the first generated instruction exists. A generated
-//      instruction can therefore never enter a denominator or present itself
-//      as a new independent dependency.
+//   1. Op nodes describe the graph at entry to connected lowering. They are
+//      sealed before this encoder expands them. Earlier passes may already
+//      have inserted or cloned instructions; instruction-level frontend source
+//      lineage is not implemented. "Original" below means pre-lowering, not
+//      an original C/C++ operation. The input inventory is a separate scope.
 //   2. Every reference is a stable index or an origin string. Nothing is keyed
 //      by a pointer or a hash bucket, so the plan is identical across runs of
 //      one seed and comparable across seeds.
@@ -26,7 +26,7 @@ namespace llvm::obf::plan {
 
 // Version of this plan format. Independent of the report `schema` string: a
 // consumer reads the plan version to know which fields exist.
-constexpr unsigned Version = 1;
+constexpr unsigned Version = 2;
 constexpr unsigned Invalid = ~0u;
 
 // ---------------------------------------------------------------------------
@@ -312,7 +312,8 @@ struct Plan {
   unsigned FormatVersion = Version;
   std::string Function, SeedNamespace;
   uint64_t Seed = 0;
-  // Denominators from the original graph, fixed before expansion.
+  // Denominators from the pre-connected-lowering graph. Earlier passes may
+  // already have inserted support, call interfaces or normalized memory ops.
   unsigned EligibleNodes = 0, EligibleObjects = 0, EligibleMemoryEdges = 0;
 
   SmallVector<Representation, 4> Representations;
@@ -343,7 +344,7 @@ struct Plan {
   // Add one instance of a transfer between two interned representations.
   void transfer(StringRef Origin, TransferKind, unsigned From, unsigned To,
                 Verification, unsigned Count = 1);
-  // Longest chain of original SELECTED operations ending at each op,
+  // DFS acyclic depth of pre-lowering SELECTED operations ending at each op,
   // inclusive: the source work carried in a representation up to that point.
   // One O(nodes + edges) pass for the whole function; a caller that needs many
   // of these computes the vector once rather than asking per site.

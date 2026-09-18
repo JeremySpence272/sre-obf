@@ -1081,7 +1081,10 @@ class Encoder {
       const JointGroup &G = JointGroups[K];
       Pair X = Encoded.lookup(G.First), Y = Encoded.lookup(G.Second);
       if (!X.E || !Y.E) {
-        if (O.Plan) ThePlan.Bundles[K].RejectReason = "no-encoded-pair";
+        if (O.Plan) {
+          ThePlan.Bundles[K].Status = "rejected";
+          ThePlan.Bundles[K].RejectReason = "no-encoded-pair";
+        }
         continue;
       }
       bool Affine = Regions[RegionOf.lookup(G.First)].Affine;
@@ -1632,8 +1635,8 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
     Snapshot.reset();
     Item["instructions_before"] = Before;
     Item["instructions_after"] = F->getInstructionCount();
-    // The plan is published after the rollback decision, so its actual costs
-    // describe the body that was kept, not the one that was undone.
+    // The plan keeps attempted selections/boundaries on rollback, explicitly
+    // labelled as such; only instructions_after describes the restored body.
     if (Local.Plan) Item["plan"] = Encode.planJSON(Before, F->getInstructionCount(), RolledBack);
     Item["bounded_growth"] = O.BoundedGrowth;
     if (O.BoundedGrowth) Item["growth_allocation"] = Local.GrowthBudget;

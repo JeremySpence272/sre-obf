@@ -78,6 +78,10 @@ def source_ledger(report):
     planner = {row["function"]: row for row in report.get("connected_regions", []) or []}
     final = {row["function"] for row in (report.get("final_inventory", {}).get("functions") or [])}
     owners = merge_owners(report)
+    encoded = {row["function"]: row["encoded_function"]
+               for row in report.get("encoded_calls", []) or []
+               if row.get("status") == "encoded" and row.get("encoded_function")}
+    absorbed = {row["function"]: row for row in report.get("fusion_absorbed", []) or []}
     flattened = {row["function"] for row in report.get("flattening_state", []) or []}
     counts = dict.fromkeys(SOURCE_DISPOSITIONS, 0)
     weights = dict.fromkeys(SOURCE_DISPOSITIONS, 0)
@@ -87,16 +91,17 @@ def source_ledger(report):
     for row in source:
         name, cost = row["function"], row.get("instructions", 0)
         owner = owners.get(name, name)
+        owner = encoded.get(owner, owner)
         plan = planner.get(owner)
         if name in selection and not selection[name].get("selected", True):
             state = "not-selected"
         elif plan is None:
             if name in selection or name in owners:
                 state = "not-planned"
-            elif name in final:
-                state = "unaccounted"
-            else:
+            elif name in absorbed:
                 state = "absorbed-before-selection"
+            else:
+                state = "unaccounted"
         elif plan["status"] == "encoded":
             state = "encoded"
         elif plan.get("reason") == "connected-growth-rollback":
@@ -114,7 +119,7 @@ def source_ledger(report):
         # from two separate tables that a reader would have to intersect.
         if owner in flattened:
             also_flattened[state] += 1
-        elif state != "encoded":
+        elif state not in ("encoded", "absorbed-before-selection", "unaccounted"):
             untouched += 1
             untouched_weight += cost
     return {"source_functions": len(source),
@@ -127,13 +132,21 @@ def source_ledger(report):
             "planner_skip_reasons": skips, "planner_skip_instructions": skip_weights,
             "merged_origins": sum(1 for row in source if row["function"] in owners),
             "merge_owners": len(set(owners.values())),
+            "encoded_interface_origins": sum(1 for row in source
+                if owners.get(row["function"], row["function"]) in encoded),
+            "absorption": list(absorbed.values()),
+            "coverage_unknown_functions": counts["absorbed-before-selection"] + counts["unaccounted"],
             "generated_functions_in_source_inventory":
                 sum(1 for row in rows if row.get("generated_helper")),
             "unaccounted_examples": unaccounted,
             "selection_rows": len(selection), "planner_rows": len(planner),
             "scope": "input IR before fusion, merging and every pass; a merged origin is "
-                     "credited to the disposition of the function that owns its body; "
-                     "generated code is never in this denominator"}
+                     "credited to its current owner, including encoded-interface renames. "
+                     "Instruction weights are whole-function input weights, not counts of "
+                     "protected source instructions. Explicit fusion/dead-code removals "
+                     "remain an absorption bucket with unknown body coverage; an absent "
+                     "function without removal evidence is unaccounted. Generated code "
+                     "is never in this denominator"}
 
 
 def object_ledger(report):
@@ -150,18 +163,20 @@ def object_ledger(report):
     accounted = [row for row in planned if "eligible_memory_objects" in row]
     known = report.get("schema") in MEMORY_DENOMINATORS and bool(accounted)
     source = None if rows is None else [row for row in rows if not row.get("generated_helper")]
-    return {"source_local_objects": None if source is None else sum(r.get("local_objects", 0) for r in source),
-            "source_memory_operations": None if source is None else sum(r.get("loads", 0) + r.get("stores", 0) for r in source),
-            "source_module_globals": None,
+    return {"source_local_objects": (sum(r["local_objects"] for r in source)
+            if source is not None and all("local_objects" in r for r in source) else None),
+            "source_memory_operations": (sum(r["loads"] + r["stores"] for r in source)
+            if source is not None and all("loads" in r and "stores" in r for r in source) else None),
+            "source_module_globals": report.get("input_inventory", {}).get("global_definitions"),
             "eligible_closed_memory_objects": sum(r.get("eligible_memory_objects", 0) for r in accounted) if known else None,
             "eligible_closed_memory_edges": sum(r.get("eligible_memory_edges", 0) for r in accounted) if known else None,
             "encoded_memory_objects": sum(1 for r in selected for o in r.get("objects", []) if o["status"] == "encoded"),
             "encoded_memory_edges": sum(r.get("memory_edges", 0) for r in selected),
             "rows_without_object_denominator": len(planned) - len(accounted),
             "scope": "source_local_objects counts input allocas after clang -O2, so promoted "
-                     "locals are already gone; source_module_globals is null because the "
-                     "boundary inventory does not enumerate module globals, and null is "
-                     "unknown, not zero"}
+                     "locals are already gone; source_module_globals includes all input "
+                     "global definitions (including compiler-owned ones), and stays null "
+                     "for older inventories that did not enumerate them"}
 
 
 def support_charge(report):
@@ -245,11 +260,14 @@ def cap_ledger(report):
                                  "whole-component-only" if rows else None),
                       "derivation": "min(component limit, max(2048, component limit / 4))",
                       **spread("shard_estimated_cost_limit", shard_rows)},
-            "object": {"scope": "memory object", "policy": None, "limit": None,
-                       "missing_compiler_field":
-                           "connected_regions[].object_leaf_limit and object_leaf_depth_limit "
-                           "(the pass enforces MaxLeaves and MaxLeafDepth but publishes neither), "
-                           "so the per-object cap is unknown, not absent"}}
+            "object": {"scope": "memory object",
+                       "policy": "bounded-leaves-and-depth" if any("object_leaf_limit" in r for r in rows) else None,
+                       "limit": spread("object_leaf_limit", rows)["max"],
+                       "leaf_limits": spread("object_leaf_limit", rows),
+                       "depth_limits": spread("object_leaf_depth_limit", rows),
+                       "missing_compiler_field": (None if any("object_leaf_limit" in r for r in rows) else
+                           "connected_regions[].object_leaf_limit and object_leaf_depth_limit; "
+                           "older reports leave these unknown")}}
 
 
 def loss_ledger(report):
@@ -310,8 +328,9 @@ def coverage_views(report, ledger, objects):
     encoded_functions = None if ledger is None else ledger["functions"]["encoded"]
     return {
         "raw_operations": view(nodes, None if ledger is None else ledger["source_instructions"],
-                               "selected connected nodes over every input IR instruction; the "
-                               "widest honest denominator"),
+                               "stage-mixed diagnostic: selected pre-connected-lowering nodes "
+                               "over all input IR instructions. Earlier passes can insert or "
+                               "duplicate nodes; this is not source-instruction coverage"),
         "planner_eligible_operations": view(nodes, eligible_nodes,
                                "selected nodes over nodes the planner deemed eligible; narrow, "
                                "and never a substitute for the raw view"),
@@ -481,6 +500,9 @@ def main():
                         "an unknown accounting then fails instead of passing by omission")
     p.add_argument("--scale-budget", action="store_true", help="Explicit fair growth-allocation experiment; not a promotion flag")
     p.add_argument("--scale-structure", action="store_true")
+    for flag in ("plan", "encoded-calls", "call-policy"):
+        p.add_argument("--" + flag, action="store_true")
+    p.add_argument("--semantic-budget", type=int, default=0)
     p.add_argument("--connected-shards", action="store_true",
                    help="Explicit bounded-shard experiment for oversized connected components; not a promotion flag")
     p.add_argument("--require-flattening", action="store_true")
@@ -491,6 +513,12 @@ def main():
     p.add_argument("--require-aggregate-memory", action="store_true")
     p.add_argument("--post-o2-attack", action="store_true")
     args = p.parse_args()
+    if (args.plan or args.encoded_calls or args.call_policy or args.semantic_budget) and args.variant != "v02":
+        p.error("v04 experiments require the connected v02 base variant")
+    if args.call_policy and not args.encoded_calls:
+        p.error("--call-policy requires --encoded-calls")
+    if not 0 <= args.semantic_budget <= 50:
+        p.error("--semantic-budget must be 0..50")
     if args.scale_budget and args.variant != "v02":
         p.error("--scale-budget requires v02")
     if args.connected_shards and args.variant != "v02":
@@ -520,6 +548,7 @@ def main():
         try:
             lock = corpora.load(args.corpora_lock)
             plan = corpora.resolve(lock, args.corpus, args.purpose, args.seed, args.high_cap)
+            plan["manifest_binding"] = corpora.validate_manifest(lock, args.corpus, spec, args.spec)
         except corpora.CorpusError as exc:
             p.error(str(exc))
         if plan["corpus"] != spec.get("project"):
@@ -562,6 +591,8 @@ def main():
               "module_instruction_limit": module_insts, "compile_timeout": compile_timeout,
               "scale_budget": args.scale_budget,
               "scale_structure": args.scale_structure,
+              "v04_features": {"plan": args.plan, "encoded_calls": args.encoded_calls,
+                               "call_policy": args.call_policy, "semantic_budget": args.semantic_budget},
               "connected_shards": args.connected_shards,
               "connected_aggregates": args.connected_aggregates,
               "post_o2_attack": args.post_o2_attack,
@@ -586,6 +617,9 @@ def main():
             if args.scale_structure: argv += ["--scale-structure"]
             if args.connected_shards: argv += ["--connected-shards"]
             if args.connected_aggregates: argv += ["--connected-aggregates"]
+            for name in ("plan", "encoded_calls", "call_policy"):
+                if getattr(args, name): argv += ["--" + name.replace("_", "-")]
+            argv += ["--semantic-budget", str(args.semantic_budget)]
     phase = "build"
     try:
         manifest = build(build_parser().parse_args(argv))

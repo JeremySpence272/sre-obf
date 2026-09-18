@@ -109,7 +109,8 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             *(f"-native-{name.replace('_', '-')}={int(getattr(args, name, False))}"
               for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions", "scale_budget",
                            "scale_structure", "connected_shards", "connected_aggregates",
-                           "joint_outputs", "encoded_calls", "plan")),
+                           "joint_outputs", "encoded_calls", "call_policy", "plan")),
+            f"-native-semantic-budget={getattr(args, 'semantic_budget', 0)}",
             f"-native-lane-transitions={LANE_TRANSITIONS[getattr(args, 'lane_transitions', 'off')]}",
             f"-native-family={args.family}"]
 
@@ -378,8 +379,9 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--connected-nodes", type=int, default=128)
     for name in ("memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget",
                  "scale-structure", "connected-shards", "connected-aggregates",
-                 "joint-outputs", "encoded-calls", "plan"):
+                 "joint-outputs", "encoded-calls", "call-policy", "plan"):
         p.add_argument("--" + name, action="store_true")
+    p.add_argument("--semantic-budget", type=int, default=0)
     p.add_argument("--lane-transitions", choices=tuple(LANE_TRANSITIONS), default="off",
                    help="P6: key dispatcher transitions on the live encoded-data word")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
@@ -418,8 +420,13 @@ def main(argv=None) -> int:
         raise SystemExit("connected regions require --values --values-wide")
     if (any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
              args.scale_budget, args.connected_shards, args.connected_aggregates, args.joint_outputs,
-             args.encoded_calls, args.plan)) or args.lane_transitions != "off") and args.region_plan != "connected":
+             args.encoded_calls, args.call_policy, args.plan, args.semantic_budget))
+            or args.lane_transitions != "off") and args.region_plan != "connected":
         raise SystemExit("connected subfeatures require --region-plan connected")
+    if args.call_policy and not args.encoded_calls:
+        raise SystemExit("--call-policy requires --encoded-calls")
+    if not 0 <= args.semantic_budget <= 50:
+        raise SystemExit("--semantic-budget must be 0..50")
     if args.memory_ssa and not args.memory:
         raise SystemExit("--memory-ssa requires --memory")
     if args.connected_aggregates and not args.memory_ssa:

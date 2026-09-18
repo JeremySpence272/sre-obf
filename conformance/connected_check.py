@@ -14,7 +14,7 @@ INTERFACE_ACCOUNTING = ("sre-native-v5", "sre-native-v6")
 # other reason is a reporting bug, not coverage.
 CALL_SKIPS = ("not-original", "exported-or-address-taken", "varargs", "eh-or-personality",
               "recursive", "unsupported-signature", "unsupported-call-site", "function-budget",
-              "no-callers", "musttail-body", "returns-twice", "no-return")
+              "no-callers", "musttail-body", "returns-twice", "no-return", "call-policy-owner")
 
 
 def cost_accounting(report):
@@ -61,9 +61,12 @@ def plan_violations(report):
     for row in report.get("connected_regions", []):
         plan = row.get("plan")
         if plan is None:
+            if (report.get("features", {}).get("plan") and
+                    row.get("reason") != "structure-or-size"):
+                violations.append(f"{row['function']}: requested typed plan is missing")
             continue
         where = f"{row['function']} plan"
-        if plan.get("plan_version") != 1:
+        if plan.get("plan_version") not in (1, 2):
             violations.append(f"{where}: unsupported plan version {plan.get('plan_version')!r}")
             continue
         if not plan.get("sealed"):
@@ -75,10 +78,17 @@ def plan_violations(report):
         if plan.get("eligible_nodes") != row.get("eligible_nodes"):
             violations.append(f"{where}: eligible nodes disagree with the row")
         costs = plan.get("costs", {})
+        rolled_back = row.get("reason") == "connected-growth-rollback"
+        if bool(costs.get("rolled_back")) != rolled_back:
+            violations.append(f"{where}: rollback status disagrees with the row")
         for field, key in (("eligible_estimated", "eligible_estimated_cost"),
                            ("selected_estimated", "selected_estimated_cost"),
                            ("skipped_estimated", "skipped_estimated_cost"),
                            ("lost_estimated", "shard_lost_estimated_cost")):
+            if rolled_back:
+                key = {"selected_estimated_cost": "attempted_estimated_cost",
+                       "skipped_estimated_cost": "attempted_skipped_estimated_cost",
+                       "shard_lost_estimated_cost": "attempted_shard_lost_estimated_cost"}.get(key, key)
             if key in row and costs.get(field) != row[key]:
                 violations.append(f"{where}: {field} disagrees with {key}")
         # Generated instructions must never enter a denominator.
@@ -89,6 +99,26 @@ def plan_violations(report):
                 violations.append(f"{where}: {op['origin']} is selected and carries a skip reason")
             if not op["selected"] and op["reason"] not in BOUNDARY_REASONS:
                 violations.append(f"{where}: {op['origin']} was dropped without a known reason")
+        if plan.get("plan_version") == 2:
+            ops, regions = plan.get("operations", []), plan.get("regions", [])
+            for op in ops:
+                edges = op.get("operands")
+                if (not isinstance(edges, list) or op.get("operand_count") != len(edges)
+                        or any(type(i) is not int or not 0 <= i < len(ops) for i in edges)):
+                    violations.append(f"{where}: invalid operand identities at {op['origin']}")
+                if op["selected"] and (type(op.get("region")) is not int
+                                       or not 0 <= op["region"] < len(regions)):
+                    violations.append(f"{where}: selected operation without a valid region")
+            for index, region in enumerate(regions):
+                members = [op for op in ops if op["selected"] and op.get("region") == index]
+                if (len(members) != region["nodes"] or
+                        sum(op["estimated_cost"] for op in members) != region["estimated_cost"]):
+                    violations.append(f"{where}: region membership or cost disagrees with operations")
+            for bundle in plan.get("bundles", []):
+                members = bundle.get("members")
+                if (not isinstance(members, list) or bundle.get("member_count") != len(members)
+                        or any(type(i) is not int or not 0 <= i < len(ops) for i in members)):
+                    violations.append(f"{where}: invalid bundle member identities")
         for rep in plan.get("representations", []):
             if rep["family"] not in PLAN_FAMILIES:
                 violations.append(f"{where}: unknown representation family {rep['family']!r}")

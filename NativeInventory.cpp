@@ -3,7 +3,6 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
-#include "llvm/Analysis/ValueTracking.h"
 
 using namespace llvm;
 namespace llvm::obf {
@@ -72,7 +71,7 @@ json::Object nativeBoundaryInventory(const Module &M, StringRef Stage) {
   // A global with observable linkage, a taken address or unknown accesses is
   // not a closed object; these fields say which, they do not claim coverage.
   json::Array Globals;
-  uint64_t GlobalDefinitions = 0, GlobalBytes = 0;
+  uint64_t GlobalDefinitions = 0, GlobalBytes = 0, UnknownGlobalSizes = 0;
   const DataLayout &DL = M.getDataLayout();
   for (const GlobalVariable &G : M.globals()) {
     if (G.isDeclaration()) continue;
@@ -86,6 +85,7 @@ json::Object nativeBoundaryInventory(const Module &M, StringRef Stage) {
         GlobalBytes += Size.getFixedValue();
       }
     }
+    if (!Bytes.getAsInteger()) ++UnknownGlobalSizes;
     // Conservative: any use that is not a plain load or store of the global
     // itself is treated as taking its address, a GEP included.
     bool AddressTaken = false;
@@ -104,7 +104,9 @@ json::Object nativeBoundaryInventory(const Module &M, StringRef Stage) {
   }
   return json::Object{{"schema", "sre-boundary-inventory-v1"}, {"stage", Stage.str()},
       {"definitions", Definitions}, {"instructions", Instructions},
-      {"global_definitions", GlobalDefinitions}, {"global_bytes", GlobalBytes},
+      {"global_definitions", GlobalDefinitions},
+      {"global_bytes", UnknownGlobalSizes ? json::Value(nullptr) : json::Value(GlobalBytes)},
+      {"known_global_bytes", GlobalBytes}, {"globals_unknown_size", UnknownGlobalSizes},
       {"globals", std::move(Globals)},
       {"selected_definitions", Selected}, {"selected_instructions", SelectedInstructions},
       {"helper_definitions", Helpers}, {"helper_instructions", HelperInstructions},

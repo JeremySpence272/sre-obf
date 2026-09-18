@@ -53,7 +53,8 @@ def validate(lock):
     for name, values in sets.items():
         if not isinstance(values, list) or not values or any(type(v) is not int for v in values):
             violations.append(f"seed set {name} must be a non-empty list of integers")
-    if all(isinstance(values, list) for values in sets.values()):
+    if all(isinstance(values, list) and all(type(v) is int for v in values)
+           for values in sets.values()):
         for left in sets:
             for right in sets:
                 if left < right and set(sets[left]) & set(sets[right]):
@@ -92,9 +93,9 @@ def validate(lock):
     if not any(entry.get("split") == "holdout" for entry in corpora.values()):
         violations.append("the matrix has no held-out corpus")
     holdout_families = {entry["family"] for entry in corpora.values()
-                        if entry.get("split") == "holdout"}
+                        if entry.get("split") == "holdout" and entry.get("family")}
     tuned_families = {entry["family"] for entry in corpora.values()
-                      if entry.get("split") != "holdout"}
+                      if entry.get("split") != "holdout" and entry.get("family")}
     if holdout_families & tuned_families:
         violations.append("a held-out family is also used for tuning: "
                           + ", ".join(sorted(holdout_families & tuned_families)))
@@ -179,6 +180,30 @@ def file_drift(lock, root=None):
             elif digest(path) != expected:
                 drift.append(f"{name}: {relative} no longer matches the lock")
     return drift
+
+
+def validate_manifest(lock, name, manifest, manifest_path):
+    """Bind a named run to its upstream identity and any frozen workload hash.
+
+    Per-file hashes are still checked by the scale runner. An archive identity
+    is provenance, not a claim that a supplied source tree was re-extracted.
+    """
+    record = entry(lock, name)
+    if manifest.get("project") != name or manifest.get("schema") != record.get("spec_schema"):
+        raise CorpusError("scale manifest does not match the locked corpus/schema")
+    acquisition = record["acquisition"]
+    if acquisition.get("kind") == "upstream-archive":
+        for field in ("revision", "archive_sha256"):
+            if not acquisition.get(field) or manifest.get(field) != acquisition[field]:
+                raise CorpusError(f"{name}: manifest {field} differs from the corpus lock")
+    pinned = record.get("manifest_sha256")
+    if record["split"] == "holdout" and not pinned:
+        raise CorpusError(f"{name}: holdout workload manifest hash has not been frozen")
+    if pinned and digest(Path(manifest_path)) != pinned:
+        raise CorpusError(f"{name}: workload manifest differs from its frozen hash")
+    return {"archive_identity_checked": acquisition.get("kind") == "upstream-archive",
+            "workload_manifest_pinned": bool(pinned),
+            "workload_manifest_sha256": digest(Path(manifest_path))}
 
 
 def summary(lock):

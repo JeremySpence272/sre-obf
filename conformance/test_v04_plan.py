@@ -191,6 +191,23 @@ class PlanGate(unittest.TestCase):
         self.assertEqual(len(violations), 1)
         self.assertIn("unsupported plan version", violations[0])
 
+    def test_version_two_preserves_and_checks_operand_identities(self):
+        data = report(plan_version=2)
+        p = data["connected_regions"][0]["plan"]
+        for op, operands in zip(p["operations"], ([], [0], [1])):
+            op.update(operands=operands, operand_count=len(operands))
+        self.assertEqual(plan_violations(data), [])
+        p["operations"][1]["operands"] = [99]
+        self.assertTrue(any("operand identities" in v for v in plan_violations(data)))
+
+    def test_rollback_costs_are_compared_to_attempted_fields(self):
+        data = report()
+        row = data["connected_regions"][0]
+        row.update(status="skipped", reason="connected-growth-rollback",
+                   attempted_estimated_cost=701)
+        row["plan"]["costs"]["rolled_back"] = True
+        self.assertTrue(any("attempted_estimated_cost" in v for v in plan_violations(data)))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -313,6 +313,9 @@ public:
 
       SmallPtrSet<const Function *, 8> Callers;
       std::string Reason = interfaceBlocker(*F, Cyclic, Callers);
+      if (Reason.empty() && F->hasFnAttribute(NativeCallPolicyAttr) &&
+          F->getFnAttribute(NativeCallPolicyAttr).getValueAsString() != NativeCallPolicyInterface)
+        Reason = "call-policy-owner";
       if (Reason.empty() && Encoded >= O.Functions) Reason = "function-budget";
 
       // absorbed_* count pairs a later pass consumed without a scalar decode.

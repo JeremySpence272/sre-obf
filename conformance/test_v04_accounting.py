@@ -82,6 +82,8 @@ class DenominatorTests(unittest.TestCase):
         value = report(sources=("a", "gone"), planner=[planner_row("a")],
                        selection=[{"function": "a", "selected": True, "reason": ""}],
                        final_functions=["a"])
+        value["fusion_absorbed"] = [{"function": "gone", "absorbed_by": "a",
+                                     "reason": "fusion-inlined", "absorbing_callers": 1}]
         ledger = source_ledger(value)
         self.assertEqual(ledger["functions"]["absorbed-before-selection"], 1)
         self.assertEqual(ledger["functions"]["unaccounted"], 0)
@@ -96,6 +98,21 @@ class DenominatorTests(unittest.TestCase):
         self.assertEqual(source_ledger(value)["functions"]["unaccounted"], 1)
         self.assertTrue(any("no later stage record" in v
                             for v in accounting_violations(coverage(value))))
+
+    def test_disappearance_without_provenance_is_not_absorption(self):
+        value = report(sources=("gone",), planner=[], selection=[], final_functions=[])
+        self.assertEqual(source_ledger(value)["functions"]["unaccounted"], 1)
+
+    def test_encoded_interface_rename_preserves_source_ownership(self):
+        value = report(planner=[planner_row("a.sre.encoded.1")])
+        value["encoded_calls"] = [{"function": "a", "encoded_function": "a.sre.encoded.1",
+                                    "status": "encoded"}]
+        self.assertEqual(source_ledger(value)["functions"]["encoded"], 1)
+
+    def test_old_object_inventory_keeps_unknown_fields_unknown(self):
+        value = report()
+        del value["input_inventory"]["functions"][0]["local_objects"]
+        self.assertIsNone(object_ledger(value)["source_local_objects"])
 
     def test_a_merged_origin_is_credited_at_the_function_that_owns_its_body(self):
         value = report(sources=("a", "b"), planner=[planner_row("__obf_merged__auto0")],
@@ -251,6 +268,18 @@ class CapTests(unittest.TestCase):
         caps = cap_ledger(report())
         self.assertIsNone(caps["object"]["limit"])
         self.assertIn("object_leaf_limit", caps["object"]["missing_compiler_field"])
+
+    def test_published_object_caps_are_not_reported_as_missing(self):
+        value = report(planner=[planner_row(object_leaf_limit=128, object_leaf_depth_limit=4)])
+        caps = cap_ledger(value)["object"]
+        self.assertEqual(caps["limit"], 128)
+        self.assertEqual(caps["depth_limits"]["max"], 4)
+        self.assertIsNone(caps["missing_compiler_field"])
+
+    def test_published_module_global_denominator_is_used(self):
+        value = report()
+        value["input_inventory"]["global_definitions"] = 7
+        self.assertEqual(object_ledger(value)["source_module_globals"], 7)
 
     def test_an_absent_growth_cap_is_distinguished_from_an_unknown_one(self):
         rows = [planner_row("a", bounded_growth=False)]

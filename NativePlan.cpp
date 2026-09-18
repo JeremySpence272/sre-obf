@@ -1,8 +1,8 @@
 #include "llvm/Transforms/Obfuscator/NativePlan.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/Twine.h"
-#include <algorithm>
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 
 using namespace llvm;
 namespace llvm::obf::plan {
@@ -23,6 +23,11 @@ json::Value known(bool Measured, unsigned V) {
   return Measured ? json::Value(V) : json::Value(nullptr);
 }
 json::Value index(unsigned V) { return V == Invalid ? json::Value(nullptr) : json::Value(V); }
+json::Array indices(ArrayRef<unsigned> Values) {
+  json::Array Result;
+  for (unsigned V : Values) Result.push_back(V);
+  return Result;
+}
 }  // namespace
 
 StringRef name(Boundary B) { return BoundaryNames[unsigned(B)]; }
@@ -80,13 +85,14 @@ void Plan::transfer(StringRef Origin, TransferKind Kind, unsigned From, unsigned
 }
 
 void Plan::usefulWorkAll(SmallVectorImpl<unsigned> &Out) const {
-  // Longest chain of ORIGINAL SELECTED operations ending at each node,
+  // DFS acyclic depth of pre-connected-lowering SELECTED operations at each node,
   // inclusive: the source work that stayed in a representation up to that
   // point. Only selected nodes are walked, so an eligible-but-skipped
   // operation cannot lengthen a chain, and only original operand edges exist
   // here, so lowering cannot inflate one. A PHI operand can close a cycle, so
   // a node already on the walk contributes nothing rather than looping
-  // forever; the result is then the longest acyclic chain.
+  // forever. Memoizing a cycle-cut walk is deterministic but not an exact
+  // longest simple path in a cyclic graph; report the metric accordingly.
   //
   // Iterative, memoized and computed for every node in one pass: a function
   // with many exposures must not pay a walk per exposure.
@@ -129,14 +135,16 @@ json::Object Plan::toJSON() const {
     Reps.push_back(json::Object{{"family", name(R.Fam)}, {"revision", R.Rev},
         {"name", familyVersion(R.Fam, R.Rev)}, {"lanes", R.Lanes},
         {"logical_width", R.LogicalWidth ? json::Value(R.LogicalWidth) : json::Value(nullptr)},
-        {"lane_width", R.LaneWidth}, {"invariant", R.Invariant},
+        {"lane_width", R.LaneWidth ? json::Value(R.LaneWidth) : json::Value(nullptr)},
+        {"invariant", R.Invariant},
         {"seed_namespace", R.SeedNamespace}, {"verification", name(R.Verified)}});
   json::Array Nodes;
   for (const OpNode &N : Ops)
     Nodes.push_back(json::Object{{"origin", N.Origin}, {"kind", name(N.Kind)},
         {"logical_width", N.LogicalWidth}, {"effects", N.Effects},
         {"region", index(N.Region)}, {"object", index(N.Object)},
-        {"estimated_cost", N.EstimatedCost}, {"operands", N.Operands.size()},
+        {"estimated_cost", N.EstimatedCost}, {"operands", indices(N.Operands)},
+        {"operand_count", N.Operands.size()},
         {"scalar_uses", N.ScalarUses}, {"selected", N.Selected},
         {"reason", N.Reason == Boundary::Count ? json::Value(nullptr) : json::Value(name(N.Reason))}});
   json::Array Objs;
@@ -169,7 +177,8 @@ json::Object Plan::toJSON() const {
         {"nodes", R.Nodes}, {"estimated_cost", R.EstimatedCost}, {"score", R.Score}});
   json::Array Groups;
   for (const Bundle &B : Bundles)
-    Groups.push_back(json::Object{{"origin", B.Origin}, {"members", B.Members.size()},
+    Groups.push_back(json::Object{{"origin", B.Origin}, {"members", indices(B.Members)},
+        {"member_count", B.Members.size()},
         {"representation", index(B.Rep)}, {"phase", B.Phase},
         {"governed_uses", B.GovernedUses}, {"status", B.Status},
         {"reject_reason", B.RejectReason.empty() ? json::Value(nullptr) : json::Value(B.RejectReason)}});
@@ -205,6 +214,7 @@ json::Object Plan::toJSON() const {
       {"exposures", known(Inventory.Measured, Inventory.Exposures)},
       {"useful_work_total", known(Inventory.Measured, Inventory.UsefulWorkTotal)},
       {"useful_work_max", known(Inventory.Measured, Inventory.UsefulWorkMax)},
+      {"useful_work_metric", "dfs-acyclic-depth"},
       {"vocabulary", "origin-and-reason-v1"}};
   json::Object Costs{{"eligible_estimated", Cost.EligibleEstimated},
       {"selected_estimated", Cost.SelectedEstimated},
@@ -222,6 +232,10 @@ json::Object Plan::toJSON() const {
   json::Array Bad;
   for (const std::string &V : Violations) Bad.push_back(V);
   return json::Object{{"plan_version", FormatVersion}, {"function", Function},
+      {"emission_status", Cost.RolledBack ? "rolled-back" : "retained"},
+      {"inventory_scope", Cost.RolledBack ? "attempted-emission" : "retained-emission"},
+      {"graph_scope", "pre-connected-lowering"},
+      {"source_lineage", "function-level-only"},
       {"seed_namespace", SeedNamespace}, {"sealed", Sealed},
       {"eligible_nodes", EligibleNodes}, {"eligible_objects", EligibleObjects},
       {"eligible_memory_edges", EligibleMemoryEdges},
@@ -238,7 +252,8 @@ void Plan::validate(SmallVectorImpl<std::string> &V) const {
   auto fail = [&](const Twine &T) { V.push_back(T.str()); };
   if (FormatVersion != Version) fail("plan version " + Twine(FormatVersion) + " is not " + Twine(Version));
   if (!Sealed) fail("plan was never sealed: original graph analysis did not complete");
-  // A generated instruction must never reach a denominator.
+  // This denominator is fixed before this pass expands the graph; it is not
+  // a claim that instructions inserted by earlier passes have source origins.
   if (Ops.size() > EligibleNodes)
     fail("planned " + Twine(Ops.size()) + " operations from " + Twine(EligibleNodes) + " eligible");
   unsigned Selected = 0;
@@ -256,8 +271,17 @@ void Plan::validate(SmallVectorImpl<std::string> &V) const {
     if (N.Object != Invalid && N.Object >= Objects.size()) fail(N.Origin + ": object index out of range");
   }
   unsigned RegionNodes = 0, RegionCost = 0;
-  for (const RegionDescriptor &R : Regions) {
+  SmallVector<unsigned, 16> ActualNodes(Regions.size(), 0), ActualCosts(Regions.size(), 0);
+  for (const OpNode &N : Ops)
+    if (N.Selected && N.Region < Regions.size()) {
+      ++ActualNodes[N.Region];
+      ActualCosts[N.Region] += N.EstimatedCost;
+    }
+  for (unsigned K = 0; K < Regions.size(); ++K) {
+    const RegionDescriptor &R = Regions[K];
     if (R.Rep >= Representations.size()) fail(R.Origin + ": region without a representation");
+    if (R.Nodes != ActualNodes[K] || R.EstimatedCost != ActualCosts[K])
+      fail(R.Origin + ": region membership or cost disagrees with its operations");
     RegionNodes += R.Nodes;
     RegionCost += R.EstimatedCost;
   }
