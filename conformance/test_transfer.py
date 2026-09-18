@@ -334,6 +334,12 @@ class PreconditionTests(unittest.TestCase):
           report = site.distinct_carriers(trials=256, complete=complete)
           self.assertTrue(report["passed"], report["clashes"])
 
+  def test_tricouple_carriers_must_also_be_three_distinct_functions(self):
+    for width in (4, IR, 32, 64):
+      report = tm.TriCouple(width, 7).distinct_carriers(trials=128)
+      with self.subTest(width):
+        self.assertTrue(report["passed"], report["clashes"])
+
   def test_width_one_cannot_carry_a_data_bundle(self):
     """At width 1 every rotation is zero and every odd multiplier is one, so the
     carriers collapse. The family is simply unavailable there; i1 values belong

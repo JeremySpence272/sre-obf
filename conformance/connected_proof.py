@@ -17,6 +17,12 @@ Two groups run by default.
 `--group` narrows the run for iteration; the selection is recorded in the report
 and `passed` then means only "for the groups that were run". A law that times
 out is `inconclusive` and fails the run, at any width, in either group.
+
+Every verdict is printed as it is decided, and a partial report is written
+beside `--out` after each width, because the report is only useful if it
+survives: an outer timeout that kills the run would otherwise discard every
+completed width along with the unfinished one. A partial report carries
+`complete: false`, lists the widths it reached, and can never say `passed`.
 """
 import argparse
 import json
@@ -53,7 +59,10 @@ def run_claim(z3, milliseconds, claim, expect="proved", **fields):
   solver.add(claim)
   start = time.monotonic()
   answer = solver.check()
-  return judge(z3, solver, answer, expect, time.monotonic() - start, dict(fields))
+  record = judge(z3, solver, answer, expect, time.monotonic() - start, dict(fields))
+  print(record.get("width"), record.get("law"), record["status"],
+        "" if record["ok"] else f"(wanted {record['expect']})", flush=True)
+  return record
 
 
 def v03_cases(z3, width):
@@ -149,11 +158,46 @@ def primitive_laws(z3, width, milliseconds, results):
                            kind="lemma"))
 
 
+# The rejection criterion asks whether an intermediate is a bijection of a
+# logical value. Below this width that question cannot discriminate: at width 1
+# the only bijections of a lane are identity and negation, so every
+# mask-independent bit looks like a decode. The laws are still proved at the
+# small widths, where complete enumeration is affordable; only the criterion is
+# withheld, and the withholding is recorded.
+EXPOSURE_MIN_WIDTH = 4
+
+
 def family_laws(z3, width, milliseconds, results, quick):
   """Encode/decode, every transfer law, and the rejection criterion."""
   backend = tm.Symbolic(width, z3)
   comparisons = SymbolicComparisons(width, z3)
+  if width < EXPOSURE_MIN_WIDTH:
+    results.append({"law": "exposure-criterion", "width": width, "group": "v04",
+                    "kind": "exposure", "status": "not-applicable",
+                    "expect": "not-applicable", "ok": True,
+                    "reason": f"a bijection of a {width}-bit logical value is not a "
+                              "discriminating test; the criterion needs width "
+                              f"{EXPOSURE_MIN_WIDTH} or more"})
   for label, site in family_sites(width):
+    # A family outside its own declared domain is not instantiated. At width 1
+    # every rotation is zero and every odd multiplier is one, so all the
+    # carriers of `nlcarry` collapse to one function and its lanes share a
+    # carrier; the transfers then genuinely do expose logical values, which says
+    # nothing about the family and everything about running it where its
+    # preconditions do not hold. The failure is recorded, never skipped, and i1
+    # values belong to the separately typed predicate representation anyway.
+    precondition = getattr(site, "distinct_carriers", None)
+    if precondition is not None:
+      report = precondition(trials=128)
+      if not report["passed"]:
+        results.append({"law": f"{label}:preconditions", "width": width,
+                        "group": "v04", "kind": "precondition",
+                        "status": "precondition-failed", "expect": "precondition-failed",
+                        "ok": True, "clashes": report["clashes"],
+                        "reason": "carriers are not distinct at this width, so the "
+                                  "family is not instantiable here"})
+        print(width, f"{label}:preconditions", "precondition-failed", flush=True)
+        continue
     lanes = [z3.BitVec(f"x{i}", width) for i in range(site.n)]
     masks = [z3.BitVec(f"m{j}", width) for j in range(len(site.mask_words()))]
     encoded = site.reference_encode(lanes, masks)
@@ -190,6 +234,7 @@ def family_laws(z3, width, milliseconds, results, quick):
       results.append(run_claim(z3, milliseconds, claim, law=f"{label}:{name}",
                                width=width, group="v04", kind="law",
                                implied_by=implied))
+      if width < EXPOSURE_MIN_WIDTH: continue
       if isinstance(site, tm.NlCarryAbstract):
         # Free carriers would assume away exactly the collapse the rejection
         # criterion is looking for, so exposure is only settled on concrete
@@ -260,13 +305,29 @@ def main():
         decoded = pair[0] - pair[1] if representation == "additive" else pair[0] ^ pair[1]
         results.append(run_claim(z3, args.milliseconds, decoded != expected,
                                  law=name, width=width, group="v03", kind="law"))
-        print(width, name, results[-1]["status"], flush=True)
   if args.group in ("all", "v04"):
     for width in widths:
       primitive_laws(z3, width, args.milliseconds, results)
       family_laws(z3, width, args.milliseconds, results, args.quick)
-      print(width, "v04", sum(1 for r in results if r.get("group") == "v04"),
-            "results", flush=True)
+      reached = [w for w in widths if w <= width]
+      partial = args.out.with_suffix(".partial.json")
+      partial.parent.mkdir(parents=True, exist_ok=True)
+      partial.write_text(json.dumps(
+          assemble(results, args, widths, z3, complete=False, reached=reached),
+          indent=2) + "\n")
+  report = assemble(results, args, widths, z3, complete=True)
+  args.out.parent.mkdir(parents=True, exist_ok=True)
+  args.out.write_text(json.dumps(report, indent=2) + "\n")
+  return 0 if report["passed"] else 1
+
+
+def assemble(results, args, widths, z3, complete, reached=None):
+  """Build the report from whatever has been decided so far.
+
+  Called after every width as well as at the end, because the report file is
+  only meaningful if it survives: an outer timeout that kills the container
+  otherwise discards every completed width along with the unfinished one.
+  """
   groups, per_width = {}, {}
   for record in results:
     bucket = groups.setdefault(record.get("group", "v03"), {})
@@ -276,25 +337,23 @@ def main():
     slot = per_width.setdefault(record["width"], {"seconds": 0.0})
     slot["seconds"] = round(slot["seconds"] + record.get("seconds", 0.0), 2)
     slot[record["status"]] = slot.get(record["status"], 0) + 1
-  report = {"schema": "sre-connected-reference-proofs-v2", "z3": z3.get_version_string(),
-            "scope": "reference laws only; not LLVM lowering, memory safety, ABI, or hardness",
-            "per_law_timeout_ms": args.milliseconds, "groups_run": args.group,
-            "widths": list(widths), "quick": bool(args.quick),
-            "summary": groups, "per_width": per_width,
-            "solver_seconds": round(sum(r.get("seconds", 0.0) for r in results), 1),
-            "results": results,
-            "recognizable_decodes": [r["law"] for r in results
-                                     if r.get("severity") == "recognizable-decode" and
-                                     r["status"] == "proved"],
-            "partial_plaintext_intermediates": [r["law"] for r in results
-                                               if r.get("severity") == "partial-plaintext" and
-                                               r["status"] == "proved"],
-            "inconclusive_but_implied": [r["law"] for r in results
-                                         if r["status"] == "inconclusive" and r.get("implied_by")],
-            "passed": all(r["ok"] for r in results)}
-  args.out.parent.mkdir(parents=True, exist_ok=True)
-  args.out.write_text(json.dumps(report, indent=2) + "\n")
-  return 0 if report["passed"] else 1
+  return {"schema": "sre-connected-reference-proofs-v2", "z3": z3.get_version_string(),
+          "scope": "reference laws only; not LLVM lowering, memory safety, ABI, or hardness",
+          "per_law_timeout_ms": args.milliseconds, "groups_run": args.group,
+          "widths": list(widths), "quick": bool(args.quick),
+          "summary": groups, "per_width": per_width,
+          "solver_seconds": round(sum(r.get("seconds", 0.0) for r in results), 1),
+          "results": results,
+          "recognizable_decodes": [r["law"] for r in results
+                                   if r.get("severity") == "recognizable-decode" and
+                                   r["status"] == "proved"],
+          "partial_plaintext_intermediates": [r["law"] for r in results
+                                             if r.get("severity") == "partial-plaintext" and
+                                             r["status"] == "proved"],
+          "inconclusive_but_implied": [r["law"] for r in results
+                                       if r["status"] == "inconclusive" and r.get("implied_by")],
+          "complete": complete, "widths_reached": reached or list(widths),
+          "passed": complete and all(r["ok"] for r in results)}
 
 
 if __name__ == "__main__":

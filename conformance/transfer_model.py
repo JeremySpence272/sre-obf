@@ -1132,6 +1132,29 @@ class TriCouple(Site):
             "mask_word_is_runtime_value": True, "width": self.width,
             "shift_amounts_constant_in_range": True, "role": "candidate"}
 
+  def distinct_carriers(self, trials=256, seed=0, complete=False):
+    """The head, link and spare carriers must be three different functions.
+
+    Same precondition as `NlCarry` and for the same reason: two share pairs that
+    meet in one operation must not share a carrier, or the mask cancels. It
+    fails at width 1, where every rotation is zero and every odd multiplier is
+    one, so the three mixing networks collapse onto each other.
+    """
+    rng = seeded(("distinct", seed, self.identifier))
+    points = ([(a, b) for a in range(1 << self.width) for b in range(1 << self.width)]
+              if complete or self.width <= 4 else
+              [(rng.getrandbits(self.width), rng.getrandbits(self.width))
+               for _ in range(trials)])
+    head = [self.head_carrier(m, reference=True) for _, m in points]
+    link = [self.link_carrier(z0, m, reference=True) for z0, m in points]
+    spare = [self.aux_carrier(m, reference=True) for _, m in points]
+    named = (("head", head), ("link", link), ("spare", spare))
+    clashes = [(a, b) for index, (a, left) in enumerate(named)
+               for b, right in named[index + 1:] if left == right]
+    return {"site": self.identifier, "width": self.width, "points": len(points),
+            "complete": bool(complete or self.width <= 4), "clashes": clashes,
+            "passed": not clashes}
+
   def transfer_names(self): return ("addc0", "cross_add", "combined", "repair_sandwich")
 
   def _open(self, name):
