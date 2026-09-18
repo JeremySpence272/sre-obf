@@ -45,9 +45,9 @@ def judge(z3, solver, answer, expect, seconds, record):
   status = ("proved" if answer == z3.unsat else
             "counterexample" if answer == z3.sat else "inconclusive")
   record.update(status=status, expect=expect, seconds=seconds,
-                ok=status == expect)
+                ok=status != "inconclusive" if expect == "decided" else status == expect)
   if answer == z3.unknown: record["reason"] = solver.reason_unknown()
-  if answer == z3.sat and expect != "counterexample":
+  if answer == z3.sat and expect not in ("counterexample", "decided"):
     record["model"] = str(solver.model())[:2000]
   return record
 
@@ -104,6 +104,7 @@ def family_sites(width):
   return [("nlcarry-abstract", tm.NlCarryAbstract(width, 11, lanes=3, kernel="and")),
           ("nlcarry-and", tm.NlCarry(width, 11, lanes=3, kernel="and")),
           ("nlcarry-arx", tm.NlCarry(width, 11, lanes=3, kernel="arx")),
+          ("nlcarry-addrot", tm.NlCarry(width, 11, lanes=3, kernel="addrot")),
           ("tricouple", tm.TriCouple(width, 7)),
           ("arx-value", tm.ArxValue(width, 3, lanes=2))]
 
@@ -273,10 +274,21 @@ def settle_exposure(z3, width, milliseconds, site, transfer, label, results):
     # plaintext, which is recorded rather than used to reject.
     classified = verdict["verdicts"][name]
     severity = ("recognizable-decode" if classified == "decode" else "partial-plaintext")
-    record = run_claim(z3, milliseconds, a[name] != b[name], expect="proved",
+    record = run_claim(z3, milliseconds, a[name] != b[name], expect="decided",
                        law=f"{label}:{transfer.name}:exposure:{name}", width=width,
                        group="v04", kind="exposure", classified=classified,
                        severity=severity, declared=transfer.expect)
+    # An exposure query has no single wanted answer, so `expect` is "decided".
+    #   proved         unsat: the intermediate never moves when the masks move, so
+    #                  it is a function of the logical values alone. Bad.
+    #   counterexample sat: a witness that it does move, so it carries mask
+    #                  entropy after all and the concrete suspicion was a
+    #                  sampling artifact. Good, and the common case.
+    # Only an undecided query fails the run. The one real failure is a
+    # lane-determined *bijection* of a logical value inside a transfer this
+    # library declares acceptable: that is a recognizable decode, and it fails
+    # the candidate, not the prover.
+    record["ok"] = record["status"] != "inconclusive"
     if record["status"] == "proved" and severity == "recognizable-decode" \
         and transfer.expect != "reject":
       record["finding"] = "recognizable decode inside a transfer declared acceptable"
