@@ -32,6 +32,7 @@ def main():
     workload.add_argument("--tile", action="store_true", help="use a supported tile_run case and all four output cells")
     workload.add_argument("--immutable", action="store_true", help="four-output immutable_run case with matched off arms")
     workload.add_argument("--private-calls", action="store_true", help="recursive_run bundle-input case and matched off arms")
+    workload.add_argument("--predicate", action="store_true", help="predicate_run case with matched off arms and exact positive inputs")
     parser.add_argument("--call-output-ablation", action="store_true", help="private-calls disabled arms turn off outputs, leaving inputs on")
     parser.add_argument("--control-ablation", action="store_true", help="loop disabled arms retain flattening without bundle control")
     parser.add_argument("--out", type=Path, required=True)
@@ -48,7 +49,7 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out, args.case), timeout=180)
     result = {"schema": "sre-bundle-decompiler-v1", "passed": False, "scope": "informed-entry",
-              "workload": "private-calls" if args.private_calls else "immutable" if args.immutable else "tile" if args.tile else "loop" if args.loop else "straight-line",
+              "workload": "predicate" if args.predicate else "private-calls" if args.private_calls else "immutable" if args.immutable else "tile" if args.tile else "loop" if args.loop else "straight-line",
               "hardness_evaluated": False, "semantic_recovery": "not_measured", "arms": {}}
     if args.private_calls: result["private_ablation"] = "outputs" if args.call_output_ablation else "inputs"
     try:
@@ -59,14 +60,17 @@ def main():
                     str(FIXTURES / driver_source), "-o", str(driver)])
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}
-        if args.tile or args.immutable or args.private_calls or args.control_ablation:
-            if args.control_ablation: name = "control"
+        if args.tile or args.immutable or args.private_calls or args.control_ablation or args.predicate:
+            if args.predicate: name = "predicate"
+            elif args.control_ablation: name = "control"
             elif args.private_calls: name = "call-outputs" if args.call_output_ablation else "call-inputs"
             else: name = "immutable" if args.immutable else "tiles"
-            selected[name + "-off"] = args.case / (args.stem + "-disabled.ll")
-            selected[name + "-off-post-o2"] = args.case / (args.stem + "-disabled-post-o2.ll")
+            stem = "disabled" if args.predicate else args.stem + "-disabled"
+            selected[name + "-off"] = args.case / (stem + ".ll")
+            selected[name + "-off-post-o2"] = args.case / (stem + "-post-o2.ll")
         expected = None
         vectors = inputs(args.width, 1024)
+        if args.predicate: vectors += b"19 37\n19 38\n20 37\n20 38\n"
         if args.private_calls:
             y = (1 << (args.width - 2)) - 13
             vectors += f"16 {y}\n{y} 16\n".encode()

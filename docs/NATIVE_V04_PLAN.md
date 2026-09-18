@@ -1,9 +1,16 @@
 # v04: persistent joint representations and resistance to semantic extraction
 
-Status: implementation plan, not implemented or a claim of measured protection.
+Status: active implementation with bounded experimental increments; not complete
+or a claim of measured protection.
 Written 2026-09-17 against compiler `8054e9d`. This is the next implementation
 plan after [v03](NATIVE_V03_STATUS.md), expanding R1–R5 in the
 [native roadmap](STATIC_NATIVE_PLAN.md#8-follow-on-ir-roadmap-the-newer-ideas).
+
+Scheduling override, 2026-09-18: per user direction, large-program conformance
+and scale-coverage issues are deferred engineering, not blockers for remaining
+v04 feature development or crackme iterations. Keep targeted correctness and
+recovery checks, and retain the original gates for later evaluation. See the
+[deferred scale ledger](V04_DEFERRED_SCALE.md); no deferred result is a pass.
 
 ## 1. Objective and scope
 
@@ -319,6 +326,12 @@ If scale coverage remains zero, record it; don't count a scalar-only fixture
 as an improvement in array/object protection.
 
 ### W4 — coupled predicates and distributed native control
+
+Bounded increments now include [actual recurrence/control binding](NATIVE_BUNDLE_CONTROL_V1.md)
+and [exact compound predicates](NATIVE_BUNDLE_PREDICATES_V1.md). The latter consumes
+selected same-block multi-output equality trees without intervening scalar
+projections; it does not implement arbitrary short-circuit loop conversion or
+complete the broader workstream below.
 
 Keep predicates within persistent bundles through their useful consumers.
 Generate combined relation tests over selected pure computations so the

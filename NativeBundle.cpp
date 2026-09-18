@@ -58,6 +58,16 @@ struct Backedge {
   unsigned Block = 0;
   SmallVector<unsigned, 4> Slots;
 };
+struct PredicateTarget {
+  unsigned Output = 0;
+  uint64_t Bits = 0;
+  std::string Origin;
+};
+struct PredicatePlan {
+  bool AnyDifferent = false;
+  std::string Origin;
+  SmallVector<PredicateTarget, 4> Targets;
+};
 struct Program {
   unsigned ID = 0, Width = 0, Lanes = 0, EstimatedCost = 0;
   plan::Representation Rep;
@@ -70,6 +80,7 @@ struct Program {
   SmallVector<unsigned, 4> ScalarInputs;
   bool Phases = false;
   unsigned CallSupplies = 0;
+  SmallVector<PredicatePlan, 4> Predicates;
   Family coordinates() const {
     switch (Rep.Fam) {
     case plan::Family::TriangularXor: return Family::Xor;
@@ -89,7 +100,54 @@ struct Binding {
   SmallVector<BasicBlock *, 4> Latches;
   SmallVector<PHINode *, 4> Recurrences;
   std::string LoopReason = "disabled";
+  // Preorder, root first. The pure plan above contains no LLVM identities.
+  SmallVector<SmallVector<Instruction *, 8>, 4> PredicateTrees;
 };
+
+unsigned predicateReservation(unsigned Lanes) { return 512 + 256 * Lanes; }
+
+void planPredicates(Binding &B) {
+  BasicBlock *BB = B.Nodes.front()->getParent();
+  SmallPtrSet<Instruction *, 32> Claimed;
+  // Prefer complete outer reductions over their smaller nested subexpressions.
+  for (Instruction &Root : llvm::reverse(*BB)) {
+    if (B.P.Predicates.size() == 4) break;
+    if (Root.use_empty() || !Root.getType()->isIntegerTy(1) || Claimed.contains(&Root) ||
+        (Root.getOpcode() != Instruction::And && Root.getOpcode() != Instruction::Or)) continue;
+    PredicatePlan P;
+    P.AnyDifferent = Root.getOpcode() == Instruction::Or;
+    P.Origin = origin(Root);
+    SmallVector<Instruction *, 8> Tree, Work{&Root};
+    SmallPtrSet<Instruction *, 8> Seen;
+    bool Valid = true;
+    while (!Work.empty() && Valid) {
+      Instruction *I = Work.pop_back_val();
+      if (!I || I->getParent() != BB || !B.Nodes.back()->comesBefore(I) ||
+          Claimed.contains(I) || !Seen.insert(I).second || Tree.size() == 7 ||
+          (I != &Root && !I->hasOneUse())) { Valid = false; break; }
+      Tree.push_back(I);
+      if (auto *Cmp = dyn_cast<ICmpInst>(I)) {
+        if (Cmp->getPredicate() != (P.AnyDifferent ? ICmpInst::ICMP_NE : ICmpInst::ICMP_EQ)) { Valid = false; break; }
+        Value *V = Cmp->getOperand(0), *C = Cmp->getOperand(1);
+        if (isa<ConstantInt>(V)) std::swap(V, C);
+        auto *Constant = dyn_cast<ConstantInt>(C);
+        auto It = llvm::find(B.Outputs, V);
+        if (!Constant || It == B.Outputs.end() || Constant->getBitWidth() != B.P.Width) { Valid = false; break; }
+        unsigned Output = It - B.Outputs.begin();
+        if (llvm::any_of(P.Targets, [&](const PredicateTarget &T) { return T.Output == Output; })) { Valid = false; break; }
+        P.Targets.push_back({Output, Constant->getZExtValue(), origin(*Cmp)});
+      } else if (I->getOpcode() == Root.getOpcode() && I->getType()->isIntegerTy(1)) {
+        Work.push_back(dyn_cast<Instruction>(I->getOperand(1)));
+        Work.push_back(dyn_cast<Instruction>(I->getOperand(0)));
+      } else Valid = false;
+    }
+    if (!Valid || P.Targets.size() < 2 || P.Targets.size() > 4) continue;
+    for (Instruction *I : Tree) Claimed.insert(I);
+    B.P.EstimatedCost += predicateReservation(B.P.Lanes);
+    B.P.Predicates.push_back(std::move(P));
+    B.PredicateTrees.push_back(std::move(Tree));
+  }
+}
 
 void planLoop(Binding &B, const NativeBundleOptions &O, const DominatorTree &DT) {
   if (!O.Loops) return;
@@ -238,7 +296,13 @@ bool valid(const Binding &B) {
   const Program &P = B.P;
   if (P.Steps.size() != B.Nodes.size() || P.Steps.size() < MinNodes ||
       P.OutputSlots.size() != B.Outputs.size() || P.Salts.size() != P.Lanes ||
-      P.Rotations.size() != P.Lanes) return false;
+      P.Rotations.size() != P.Lanes || P.Predicates.size() != B.PredicateTrees.size()) return false;
+  for (unsigned N = 0; N < P.Predicates.size(); ++N) {
+    const auto &Predicate = P.Predicates[N];
+    if (Predicate.Targets.size() < 2 || Predicate.Targets.size() > 4 ||
+        B.PredicateTrees[N].size() != 2 * Predicate.Targets.size() - 1) return false;
+    for (const auto &T : Predicate.Targets) if (T.Output >= P.OutputSlots.size()) return false;
+  }
   if ((P.Rep.Fam != plan::Family::TriangularXor && P.Rep.Fam != plan::Family::TriangularAdditive) ||
       P.Rep.Rev != 1 || P.Rep.LogicalWidth != P.Width || P.Rep.LaneWidth != P.Width ||
       P.Rep.Lanes != P.Lanes + 1 || P.Rep.Verified != plan::Verification::Algebraic) return false;
@@ -308,6 +372,41 @@ class Lowering {
   void markRange(Instruction *Prev, Instruction *End) {
     for (Instruction *I = Prev ? Prev->getNextNode() : &End->getParent()->front();
          I != End; I = I->getNextNode()) I->setMetadata(BundleTag, Tag);
+  }
+  void predicates(const Binding &Bound) {
+    for (unsigned N = 0; N < P.Predicates.size(); ++N) {
+      const PredicatePlan &Predicate = P.Predicates[N];
+      SmallVector<Value *, 4> Expected, Residuals;
+      for (unsigned K = 0; K < P.Lanes; ++K) {
+        auto It = llvm::find_if(Predicate.Targets, [&](const PredicateTarget &T) { return P.OutputSlots[T.Output] == K; });
+        Value *NextMask = mask(Expected, K), *Next;
+        if (It != Predicate.Targets.end())
+          Next = P.coordinates() == Family::Xor ? B.CreateXor(c(It->Bits), NextMask)
+                                                 : B.CreateAdd(c(It->Bits), NextMask);
+        else
+          Next = transfer::remask(B, {Z[K], mask(Z, K)}, P.coordinates(), NextMask);
+        Expected.push_back(Next);
+        Residuals.push_back(B.CreateXor(Z[K], Next));
+      }
+      // Invertible triangular residual map, followed by exact full-width OR.
+      // Zero iff every coordinate agrees. No hash collision or scalar decode.
+      Value *Combined = c(0);
+      for (unsigned K = 0; K < P.Lanes; ++K) {
+        if (K) Residuals[K] = B.CreateXor(Residuals[K], rotate(Residuals[K - 1], P.Rotations[K]));
+        Combined = B.CreateOr(Combined, Residuals[K]);
+      }
+      Value *Test = Predicate.AnyDifferent ? B.CreateICmpNE(Combined, c(0)) : B.CreateICmpEQ(Combined, c(0));
+      auto *Root = new FreezeInst(Test, "sre.bundle.predicate", B.GetInsertPoint());
+      Root->setMetadata("sre.native.bundle.predicate", MDNode::get(F.getContext(), {
+          Tag->getOperand(0).get(), ConstantAsMetadata::get(B.getInt32(N)),
+          ConstantAsMetadata::get(B.getInt32(Predicate.Targets.size()))}));
+      Bound.PredicateTrees[N].front()->replaceAllUsesWith(Root);
+      // Preorder removal drops each parent use before deleting its children.
+      for (Instruction *I : Bound.PredicateTrees[N]) {
+        assert(I->use_empty() && "predicate tree has an unowned user");
+        I->eraseFromParent();
+      }
+    }
   }
   void enter(ArrayRef<Value *> Values) {
     if (llvm::any_of(Values, [&](Value *V) { return bundle::inputPair(V, CallInputs) != nullptr; })) {
@@ -427,6 +526,7 @@ public:
       }
     }
     if (!Bound.Preheader) pin();
+    predicates(Bound);
     SmallPtrSet<Instruction *, 32> Members(Bound.Nodes.begin(), Bound.Nodes.end());
     for (PHINode *Phi : Bound.Recurrences) Members.insert(Phi);
     SmallVector<Value *, 4> Outputs;
@@ -476,7 +576,20 @@ public:
 
 json::Object report(const Binding &B) {
   const Program &P = B.P;
-  json::Array Steps, Outputs, Salts, Rotations, NextSlots, Edges, ScalarInputs;
+  json::Array Steps, Outputs, Salts, Rotations, NextSlots, Edges, ScalarInputs, Predicates;
+  unsigned PredicateUses = 0;
+  for (unsigned N = 0; N < P.Predicates.size(); ++N) {
+    const auto &Predicate = P.Predicates[N];
+    json::Array Targets;
+    for (const auto &T : Predicate.Targets) Targets.push_back(json::Object{
+        {"output", T.Output}, {"slot", P.OutputSlots[T.Output]}, {"constant_hex", utohexstr(T.Bits)},
+        {"input_origin", T.Origin.empty() ? json::Value(nullptr) : json::Value(T.Origin)}});
+    PredicateUses += Predicate.Targets.size();
+    Predicates.push_back(json::Object{{"id", N}, {"mode", Predicate.AnyDifferent ? "any-different" : "all-equal"},
+        {"input_origin", Predicate.Origin.empty() ? json::Value(nullptr) : json::Value(Predicate.Origin)},
+        {"targets", std::move(Targets)}, {"source_operand_uses", Predicate.Targets.size()},
+        {"tree_instructions", B.PredicateTrees[N].size()}, {"law", "exact-tuple-replacement-v1"}});
+  }
   auto operand = [](const Operand &O) {
     return O.Constant ? json::Object{{"constant_hex", utohexstr(O.Bits)}}
                       : json::Object{{"slot", O.Slot}};
@@ -507,6 +620,8 @@ json::Object report(const Binding &B) {
       {"useful_operations", P.Steps.size()}, {"inputs", B.Inputs.size()},
       {"outputs", B.Outputs.size()}, {"scalar_output_uses", B.BoundaryUses},
       {"call_supply_uses", P.CallSupplies}, {"call_supply_reservation", P.CallSupplies * 384},
+      {"predicates", std::move(Predicates)}, {"predicate_operand_uses", PredicateUses},
+      {"predicate_reservation", P.Predicates.size() * predicateReservation(P.Lanes)},
       {"loop", json::Object{{"status", B.Preheader ? "encoded" : "straight-line"},
           {"contract", "sre-bundle-loop-v2"}, {"graph_scope", "dominated-header-recurrence"},
           {"reason", B.LoopReason}, {"law", "triangular-recurrence-rebase-v1"},
@@ -577,6 +692,7 @@ FunctionPlan planFunction(Function &F, uint64_t Seed, const NativeBundleOptions 
           if (256 + N * 1200 > FunctionCostLimit - Estimated ||
               !schedule(ArrayRef<Instruction *>(Run).slice(Start, N), O.Values, B)) continue;
           planLoop(B, O, DT);
+          if (O.Predicates) planPredicates(B);
           if (O.CallOutputs) {
             for (Instruction *Output : B.Outputs) for (User *U : Output->users())
               if (auto *I = dyn_cast<Instruction>(U); I && isNativeBundleCallSupply(*I, Output)) ++B.P.CallSupplies;
@@ -643,6 +759,20 @@ void allocate(SmallVectorImpl<FunctionPlan> &Plans, unsigned Budget) {
     Best->Reserved += Cost; Remaining -= Cost;
   }
 }
+
+} // namespace
+
+json::Array nativeBundlePredicateInventory(Module &M) {
+  json::Array Rows;
+  for (Function &F : M) if (!F.isDeclaration())
+    for (Instruction &I : instructions(F)) if (auto *MD = I.getMetadata("sre.native.bundle.predicate"))
+      Rows.push_back(json::Object{{"function", F.getName().str()},
+          {"origin", cast<MDString>(MD->getOperand(0))->getString().str()},
+          {"id", mdconst::extract<ConstantInt>(MD->getOperand(1))->getZExtValue()},
+          {"source_operand_uses", mdconst::extract<ConstantInt>(MD->getOperand(2))->getZExtValue()},
+          {"live_consumers", I.getNumUses()}, {"contract", "joint-predicate-v1"},
+          {"stage", "after-bundles-before-regions"}, {"hardness_evaluated", false}});
+  return Rows;
 }
 
 json::Array encodeNativeBundles(Module &M, uint64_t Seed, const NativeBundleOptions &O) {

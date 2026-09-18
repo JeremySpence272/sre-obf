@@ -101,6 +101,8 @@ cl::opt<bool> NativeBundleCallInputs("native-bundle-call-inputs",
     cl::desc("Import private encoded arguments directly into persistent bundles"), cl::init(false));
 cl::opt<bool> NativeBundleCallOutputs("native-bundle-call-outputs",
     cl::desc("Supply private interfaces directly from persistent bundle coordinates"), cl::init(false));
+cl::opt<bool> NativeBundlePredicates("native-bundle-predicates",
+    cl::desc("Consume compound equalities directly from joint native bundle coordinates"), cl::init(false));
 cl::opt<bool> NativeObjectBundles("native-object-bundles",
     cl::desc("Experimental closed, initialized local integer tiles"), cl::init(false));
 cl::opt<bool> NativeObjectPhases("native-object-phases",
@@ -255,6 +257,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-bundles requires native-region-plan=connected");
   if (obf::nativeBundleControl() && (!NativeBundles || !NativeBundleLoops || !NativeMultiState))
     report_fatal_error("native-bundle-control requires bundles, bundle loops and multi-state flattening");
+  if (NativeBundlePredicates && !NativeBundles)
+    report_fatal_error("native-bundle-predicates requires native-bundles");
   if (NativeBundleCallInputs && (!NativeBundles || !NativeEncodedCalls))
     report_fatal_error("native-bundle-call-inputs requires native-bundles and native-encoded-calls");
   if (NativeBundleCallOutputs && (!NativeBundles || !NativeEncodedCalls))
@@ -435,6 +439,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   json::Array GrowthCoverage, BundleCoverage, ObjectBundleCoverage, ImmutableContinuity, ImmutableConnected;
   json::Array BundleCallInputs;
   json::Array BundleCallOutputs;
+  json::Array BundlePredicates;
   StringMap<obf::NativeCallAbsorption> BundleSupplies;
   if (NativeBundles) {
     checkModuleBudget(M, "before-bundle-allocation");
@@ -449,6 +454,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.ObjectPhases = NativeObjectPhases;
     Options.CallInputs = NativeBundleCallInputs;
     Options.CallOutputs = NativeBundleCallOutputs;
+    Options.Predicates = NativeBundlePredicates;
     // One bounded share of remaining headroom. Connected/CFF/helper passes
     // allocate against the remaining module, never the pre-bundle total.
     Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
@@ -470,6 +476,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     if (verifyModule(M, &errs())) report_fatal_error("native bundles produced invalid IR");
     checkModuleBudget(M, "after-bundles");
     saveNativeStage(M, "bundles.ll");
+    if (NativeBundlePredicates) BundlePredicates = obf::nativeBundlePredicateInventory(M);
   }
   if (NativeImmutableBundles) ImmutableContinuity = obf::nativeImmutableContinuity(
       M, "after-bundles-before-legacy-lowering", false);
@@ -767,6 +774,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"immutable_bundles", NativeImmutableBundles.getValue()},
                             {"bundle_call_inputs", NativeBundleCallInputs.getValue()},
                             {"bundle_call_outputs", NativeBundleCallOutputs.getValue()},
+                            {"bundle_predicates", NativeBundlePredicates.getValue()},
                             {"bundle_control", obf::nativeBundleControl()},
                             {"continuity_priority", NativeContinuityPriority.getValue()},
                             {"immutable_continuity_contract", 2},
@@ -804,6 +812,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Result["encoded_calls"] = std::move(CallCoverage);
     if (NativeBundles) {
       if (obf::nativeBundleControl()) Result["bundle_control"] = obf::nativeBundleControlInventory(M, BundleCoverage);
+      if (NativeBundlePredicates) Result["bundle_predicates"] = std::move(BundlePredicates);
       Result["bundle_input_inventory"] = std::move(BundleOrigins);
       Result["bundles"] = std::move(BundleCoverage);
       if (NativeBundleCallInputs) Result["bundle_call_inputs"] = std::move(BundleCallInputs);

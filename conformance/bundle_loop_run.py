@@ -26,7 +26,7 @@ FALLBACKS = {
     "five-backedges": "backedge-count-limit",
     "unreachable-edge": "unreachable-header-predecessor",
 }
-SHAPES = ("supported", "multi-exit", "multi-latch", *FALLBACKS)
+SHAPES = ("supported", "multi-exit", "multi-latch", "predicate-exit", *FALLBACKS)
 EXPOSED = ("external-user", "phi-user", "earlier-region")
 
 
@@ -39,13 +39,17 @@ def fixture(width, shape="supported"):
         source = source.replace("pre:\n  br label %loop", "pre:\n  %guard = icmp ult i32 %count, 4096\n  br i1 %guard, label %loop, label %exit")
         source = source.replace("[ %a, %entry ], [ %result0", "[ %a, %entry ], [ %a, %pre ], [ %result0")
         source = source.replace("[ %b, %entry ], [ %b5", "[ %b, %entry ], [ %b, %pre ], [ %b5")
-    elif shape == "multi-exit":
+    elif shape in ("multi-exit", "predicate-exit"):
         source = source.replace("[ %b5, %loop ]", "[ %b5, %latch ]", 1)
         source = source.replace("[ %a5, %loop ]", "[ %a5, %latch ]", 1)
         source = source.replace("[ %next, %loop ]", "[ %next, %latch ]", 1)
         source = source.replace("  br i1 %again, label %loop, label %exit", "  %early_bits = and iWIDTH %b5, 7\n  %early = icmp eq iWIDTH %early_bits, 0\n  br i1 %early, label %exit, label %latch\nlatch:\n  br i1 %again, label %loop, label %exit")
         source = source.replace("[ %result0, %loop ]", "[ %result0, %loop ], [ %result0, %latch ]")
         source = source.replace("[ %b5, %loop ]", "[ %b5, %loop ], [ %b5, %latch ]")
+        if shape == "predicate-exit":
+            a, b = scalar_trace(19, 37, 1, width)[0]
+            source = source.replace("  %early_bits = and iWIDTH %b5, 7\n  %early = icmp eq iWIDTH %early_bits, 0",
+                                    f"  %early_a = icmp eq iWIDTH %a5, {a}\n  %early_b = icmp eq iWIDTH %b5, {b}\n  %early = and i1 %early_a, %early_b")
     elif shape == "constant-backedge":
         source = source.replace("[ %b5, %loop ]", "[ 7, %loop ]", 1)
     elif shape == "phi-user":
@@ -127,6 +131,7 @@ def scalar_trace(a, b, count, width, shape="supported"):
         edge = int(not (b5 & 1)) if shape == "multi-latch" else 0
         edges.append(edge)
         if shape == "multi-exit" and (b5 & 7) == 0: break
+        if shape == "predicate-exit" and (a5, b5) == step(19, 37): break
         a, b = (a5, b5) if edge else (b5, a5)
         if shape == "constant-backedge": a = 7
     return out, raw, edges
@@ -158,6 +163,7 @@ def main():
     parser.add_argument("--shapes", nargs="+", choices=SHAPES, default=list(SHAPES))
     parser.add_argument("--bundle-loop-boundaries", action="store_true")
     parser.add_argument("--bundle-control", action="store_true")
+    parser.add_argument("--bundle-predicates", action="store_true")
     parser.add_argument("--control-ablation", action="store_true", help="matched control-off arm, retaining flattening")
     parser.add_argument("--control-profile", choices=("smoke", "max"), default="smoke")
     parser.add_argument("--control-passes", default="flattening", help="application pass filter; all uses the full profile")
@@ -188,11 +194,14 @@ def main():
         flags = [f for f in flags if f not in ("-native-passes=constenc", "-native-level=smoke")]
         flags += [f"-native-level={args.control_profile}", "-native-bundle-control=1"]
         if args.control_passes != "all": flags.append(f"-native-passes={args.control_passes}")
+    if args.bundle_predicates: flags.append("-native-bundle-predicates=1")
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "bundle_loop_driver.c"), "-o", str(driver)])
         for width in args.widths:
             values = vectors(width, args.exhaustive_byte_pairs)
+            if "predicate-exit" in args.shapes:
+                values += [(19, 37, n) for n in (0, 1, 2, 3, 7)] + [(19, 38, 7), (20, 37, 7)]
             stdin = "".join(f"{a} {b} {n}\n" for a, b, n in values).encode()
             for shape in args.shapes:
                 case = out / f"i{width}-{shape}"
@@ -218,6 +227,9 @@ def main():
                                 data = json.loads(report.read_text())
                                 errors = report_violations(data)
                                 if errors: raise ToolFailure("; ".join(errors))
+                                if args.bundle_predicates:
+                                    if len(data["bundle_predicates"]) != int(shape == "predicate-exit"):
+                                        raise ToolFailure("compound loop-predicate coverage differs")
                                 row = next(r for r in data["bundles"] if r["function"] == "kernel")
                                 if row["retained_operations"] != (24 if shape == "earlier-region" else 12):
                                     raise ToolFailure("unexpected retained recurrence operations")

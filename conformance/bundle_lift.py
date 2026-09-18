@@ -64,6 +64,16 @@ def lift(text, function, arguments, z3):
             # Only already-defined integer arguments/operations are admitted;
             # no undef/poison input is accepted by word().
             values[result] = word(m[2], int(m[1]))
+        elif m := re.fullmatch(r"icmp (eq|ne) i(\d+) (" + VALUE + r"), (" + VALUE + r")", rhs):
+            equal = word(m[3], int(m[2])) == word(m[4], int(m[2]))
+            condition = equal if m[1] == "eq" else z3.Not(equal)
+            values[result] = z3.If(condition, z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+        elif m := re.fullmatch(r"(zext|trunc) i(\d+) (" + VALUE + r") to i(\d+)", rhs):
+            before, after = int(m[2]), int(m[4])
+            value = word(m[3], before)
+            if m[1] == "zext" and after > before: values[result] = z3.ZeroExt(after - before, value)
+            elif m[1] == "trunc" and after < before: values[result] = z3.Extract(after - 1, 0, value)
+            else: raise ValueError("invalid integer conversion")
         elif m := re.fullmatch(r"alloca \[(\d+) x i(\d+)\](?:, align \d+)?", rhs):
             if not owned: raise ValueError("unowned allocation")
             sizes[result] = (int(m[1]), int(m[2]))

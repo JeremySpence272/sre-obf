@@ -5,6 +5,7 @@ from pathlib import Path
 from conformance.call_policy import policy_violations
 from conformance.bundle_check import bundle_violations
 from conformance.bundle_control import bundle_control_violations
+from conformance.bundle_predicates import predicate_violations
 from conformance.call_bundle_check import call_bundle_violations, call_supply_violations
 from conformance.tile_check import tile_violations
 from conformance.immutable_check import immutable_violations
@@ -41,7 +42,7 @@ def report_violations(report):
     violations = []
     for check in (invariants, call_violations, policy_violations, plan_violations,
                   bundle_violations, tile_violations, immutable_violations, continuity_violations, call_bundle_violations,
-                  call_supply_violations, bundle_control_violations):
+                  call_supply_violations, bundle_control_violations, predicate_violations):
         try:
             violations.extend(check(report))
         except (KeyError, TypeError, ValueError) as exc:
