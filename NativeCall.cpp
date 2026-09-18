@@ -3,6 +3,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 
@@ -88,6 +89,38 @@ void findCycles(Module &M, SmallPtrSetImpl<const Function *> &Cyclic) {
         for (const Function *X : Members) Cyclic.insert(X);
     }
   }
+}
+
+// Every reason encodeNativeCalls refuses an interface for, in the order that
+// pass checks them, over a function that has not been merged yet. Shared with
+// the arbitration so a policy can never promise an interface the pass would
+// then refuse. function-budget is the pass's own running state and stays there.
+std::string interfaceBlocker(const Function &F,
+                             const SmallPtrSetImpl<const Function *> &Cyclic,
+                             SmallPtrSetImpl<const Function *> &Callers) {
+  bool Direct = true;
+  for (const Use &U : F.uses()) {
+    const auto *C = dyn_cast<CallInst>(U.getUser());
+    if (!C || !C->isCallee(&U) || C->hasOperandBundles() || C->isMustTailCall() ||
+        C->getFunctionType() != F.getFunctionType()) { Direct = false; break; }
+    Callers.insert(C->getFunction());
+  }
+  Type *Ret = F.getReturnType();
+  // An interface with no pair to carry is not encoded coverage: a void
+  // function of no arguments is reported as an unsupported signature.
+  bool Signature = (Ret->isVoidTy() || supported(Ret)) &&
+      (F.arg_size() || !Ret->isVoidTy()) &&
+      llvm::all_of(F.args(), [](const Argument &A) { return supported(A.getType()); });
+  if (!F.hasFnAttribute("sre.native.original")) return "not-original";
+  if (!F.hasLocalLinkage() || F.hasAddressTaken()) return "exported-or-address-taken";
+  if (F.isVarArg()) return "varargs";
+  if (unwinds(F)) return "eh-or-personality";
+  if (StringRef Blocker = bodyBlocker(F); !Blocker.empty()) return Blocker.str();
+  if (Cyclic.count(&F)) return "recursive";
+  if (!Signature) return "unsupported-signature";
+  if (!Direct) return "unsupported-call-site";
+  if (Callers.empty()) return "no-callers";
+  return "";
 }
 
 class Interfaces {
@@ -278,30 +311,9 @@ public:
       llvm::sort(Seen);
       for (unsigned Bits : Seen) Widths.push_back(int64_t(Bits));
 
-      // An interface with no pair to carry is not encoded coverage: a void
-      // function of no arguments is reported as an unsupported signature.
-      bool Signature = (Ret->isVoidTy() || supported(Ret)) &&
-          (F->arg_size() || !Ret->isVoidTy()) &&
-          llvm::all_of(F->args(), [](const Argument &A) { return supported(A.getType()); });
       SmallPtrSet<const Function *, 8> Callers;
-      bool Direct = true;
-      for (const Use &U : F->uses()) {
-        const auto *C = dyn_cast<CallInst>(U.getUser());
-        if (!C || !C->isCallee(&U) || C->hasOperandBundles() || C->isMustTailCall() ||
-            C->getFunctionType() != F->getFunctionType()) { Direct = false; break; }
-        Callers.insert(C->getFunction());
-      }
-      std::string Reason;
-      if (!F->hasFnAttribute("sre.native.original")) Reason = "not-original";
-      else if (!F->hasLocalLinkage() || F->hasAddressTaken()) Reason = "exported-or-address-taken";
-      else if (F->isVarArg()) Reason = "varargs";
-      else if (unwinds(*F)) Reason = "eh-or-personality";
-      else if (StringRef Blocker = bodyBlocker(*F); !Blocker.empty()) Reason = Blocker.str();
-      else if (Cyclic.count(F)) Reason = "recursive";
-      else if (!Signature) Reason = "unsupported-signature";
-      else if (!Direct) Reason = "unsupported-call-site";
-      else if (Callers.empty()) Reason = "no-callers";
-      else if (Encoded >= O.Functions) Reason = "function-budget";
+      std::string Reason = interfaceBlocker(*F, Cyclic, Callers);
+      if (Reason.empty() && Encoded >= O.Functions) Reason = "function-budget";
 
       // absorbed_* count pairs a later pass consumed without a scalar decode.
       // They stay zero here: on its own this interface only moves the decode
@@ -320,7 +332,268 @@ public:
     return Report;
   }
 };
+// Which source-owned functions bounded merging may still fold. FunctionMerging
+// only considers a function the driver gave an `fmerge` clause, so reading the
+// driver's own recorded spec avoids re-deriving that pass's eligibility. It
+// over-approximates on purpose: a function merging would reject anyway is only
+// ever contracted too eagerly, which can cost an interface but can never
+// promise one that merging then destroys.
+bool mergeCandidate(const Function &F) {
+  return F.hasFnAttribute("sre.native.original") &&
+      F.getFnAttribute("sre.native.spec").getValueAsString().contains("fmerge(");
+}
+// The label FunctionMerging would bucket this candidate under. The native
+// profile emits no explicit group, and that pass calls an unlabelled bucket
+// `_auto`; an explicit `group=` in the spec is read back here.
+std::string mergeGroupLabel(const Function &F) {
+  if (!mergeCandidate(F)) return "";
+  StringRef Spec = F.getFnAttribute("sre.native.spec").getValueAsString();
+  StringRef Clause = Spec.substr(Spec.find("fmerge("));
+  Clause = Clause.substr(0, Clause.find(')'));
+  size_t At = Clause.find("group=");
+  if (At == StringRef::npos) return "_auto";
+  StringRef Label = Clause.substr(At + 6);
+  return Label.substr(0, Label.find(',')).str();
+}
+
+// The call graph as it will look once merging has run: every candidate this
+// arbitration did not reserve is contracted into one node per merge group, so
+// a call into a group and a call back out of it close exactly the cycle the
+// call pass would later refuse as `recursive`. Contracting whole groups rather
+// than merging's actual chunks can only add edges, so a function this reports
+// as acyclic stays acyclic whatever chunking merging picks.
+void buildMergeView(Module &M, const SmallPtrSetImpl<Function *> &Reserved,
+                    DenseMap<const Function *, unsigned> &Node,
+                    SmallVectorImpl<SmallVector<unsigned, 4>> &Edges) {
+  // Module order throughout: no pointer or use-list order reaches a node id.
+  StringMap<unsigned> Groups;
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    if (mergeCandidate(F) && !Reserved.count(&F)) {
+      std::string Label = mergeGroupLabel(F);
+      auto It = Groups.find(Label);
+      if (It == Groups.end()) {
+        It = Groups.insert({Label, unsigned(Edges.size())}).first;
+        Edges.emplace_back();
+      }
+      Node[&F] = It->second;
+      continue;
+    }
+    Node[&F] = Edges.size();
+    Edges.emplace_back();
+  }
+  for (Function &F : M) {
+    if (F.isDeclaration()) continue;
+    unsigned From = Node.find(&F)->second;
+    for (Instruction &I : instructions(F))
+      if (auto *C = dyn_cast<CallBase>(&I))
+        if (Function *G = C->getCalledFunction())
+          if (auto It = Node.find(G);
+              It != Node.end() && !llvm::is_contained(Edges[From], It->second))
+            Edges[From].push_back(It->second);
+  }
+}
+
+// Nodes on a cycle: an SCC with more than one member, or a self edge. Same
+// iterative Tarjan as findCycles, over the contracted node ids.
+void cyclicNodes(ArrayRef<SmallVector<unsigned, 4>> Edges, SmallVectorImpl<bool> &OnCycle) {
+  unsigned N = Edges.size();
+  OnCycle.assign(N, false);
+  SmallVector<unsigned, 64> Index(N, 0), Low(N, 0), Component;
+  SmallVector<bool, 64> Open(N, false);
+  struct Frame { unsigned V, Child; };
+  unsigned Next = 1;                       // index 0 means unvisited
+  for (unsigned Root = 0; Root < N; ++Root) {
+    if (Index[Root]) continue;
+    Index[Root] = Low[Root] = Next++;
+    Component.push_back(Root); Open[Root] = true;
+    SmallVector<Frame, 32> Work{{Root, 0}};
+    while (!Work.empty()) {
+      unsigned V = Work.back().V;
+      if (Work.back().Child < Edges[V].size()) {
+        unsigned W = Edges[V][Work.back().Child++];
+        if (!Index[W]) {
+          Index[W] = Low[W] = Next++;
+          Component.push_back(W); Open[W] = true;
+          Work.push_back({W, 0});
+        } else if (Open[W])
+          Low[V] = std::min(Low[V], Index[W]);
+        continue;
+      }
+      Work.pop_back();
+      if (!Work.empty()) Low[Work.back().V] = std::min(Low[Work.back().V], Low[V]);
+      if (Low[V] != Index[V]) continue;
+      SmallVector<unsigned, 8> Members;
+      unsigned Member = 0;
+      do {
+        Member = Component.pop_back_val(); Open[Member] = false; Members.push_back(Member);
+      } while (Member != V);
+      if (Members.size() > 1 || llvm::is_contained(Edges[V], V))
+        for (unsigned X : Members) OnCycle[X] = true;
+    }
+  }
+}
 } // namespace
+
+std::vector<std::string> nativeFusionCandidates(const Module &M) {
+  // Module order. Declarations cannot be absorbed and are not tracked.
+  std::vector<std::string> Names;
+  for (const Function &F : M)
+    if (!F.isDeclaration()) Names.push_back(F.getName().str());
+  return Names;
+}
+
+json::Array nativeFusionAbsorption(ArrayRef<std::string> Before, const Module &After,
+                                   const json::Array &Fused) {
+  // Which callers fusion inlined each callee into, from its own rows. A callee
+  // inlined at one site but still called from another has not been absorbed,
+  // so presence in the module, not this map, decides.
+  StringMap<SmallVector<std::string, 2>> Inlined;
+  for (const json::Value &Value : Fused) {
+    const json::Object *Row = Value.getAsObject();
+    if (!Row) continue;
+    auto Status = Row->getString("status"), Callee = Row->getString("callee"),
+         Caller = Row->getString("caller");
+    if (!Status || *Status != "fused" || !Callee || !Caller || Callee->empty()) continue;
+    auto &Callers = Inlined[*Callee];
+    if (!llvm::is_contained(Callers, Caller->str())) Callers.push_back(Caller->str());
+  }
+  json::Array Rows;
+  for (StringRef Name : Before) {
+    const Function *F = After.getFunction(Name);
+    if (F && !F->isDeclaration()) continue;
+    auto Found = Inlined.find(Name);
+    // The caller named here is where fusion put the body. Fusion can afterwards
+    // erase that caller too, so a name recorded here is the origin of the
+    // absorption, not a promise that the absorbing function still exists.
+    std::string By;
+    if (Found != Inlined.end())
+      for (const std::string &Caller : Found->second) {
+        if (!By.empty()) By += ",";
+        By += Caller;
+      }
+    // Absent from fusion's own record, the function was erased as an unused
+    // local definition. That is reported as such and credited to no caller,
+    // never guessed at.
+    Rows.push_back(json::Object{{"function", Name.str()}, {"absorbed_by", By},
+        {"reason", By.empty() ? "dead-after-fusion" : "fusion-inlined"},
+        {"absorbing_callers",
+         Found == Inlined.end() ? 0 : int64_t(Found->second.size())}});
+  }
+  return Rows;
+}
+
+json::Array planNativeCallPolicy(Module &M, const NativeCallPolicyOptions &O) {
+  SmallPtrSet<const Function *, 16> Cyclic;
+  findCycles(M, Cyclic);
+  // Module order. Source-owned is the denominator the driver stamped before
+  // any obfuscation pass ran, so a function neither pass takes still gets a row.
+  SmallVector<Function *, 64> Source;
+  for (Function &F : M)
+    if (!F.isDeclaration() && F.hasFnAttribute("sre.native.source")) Source.push_back(&F);
+
+  // The contest is decided in favour of the encoded interface, because merging
+  // can still take everything the interface does not win, while the reverse is
+  // false: a merged super-function has no per-width interface left to encode.
+  DenseMap<const Function *, std::string> Blocker;
+  SmallPtrSet<Function *, 16> Reserved;
+  unsigned Budget = 0;
+  for (Function *F : Source) {
+    SmallPtrSet<const Function *, 8> Callers;
+    Blocker[F] = interfaceBlocker(*F, Cyclic, Callers);
+    if (!Blocker[F].empty() || Budget >= O.Interfaces) continue;
+    Reserved.insert(F);
+    ++Budget;
+  }
+
+  // Reserving a function pulls it out of its merge group, which can close a
+  // cycle for another reservation, so repeat until the reserved set stops
+  // shrinking. It only ever shrinks, so this terminates.
+  SmallPtrSet<const Function *, 16> Induced;
+  for (bool Changed = true; Changed;) {
+    Changed = false;
+    DenseMap<const Function *, unsigned> Node;
+    SmallVector<SmallVector<unsigned, 4>, 64> Edges;
+    buildMergeView(M, Reserved, Node, Edges);
+    SmallVector<bool, 64> OnCycle;
+    cyclicNodes(Edges, OnCycle);
+    for (Function *F : Source)
+      if (Reserved.count(F) && OnCycle[Node.find(F)->second]) {
+        Reserved.erase(F);
+        Induced.insert(F);
+        Changed = true;
+      }
+  }
+
+  json::Array Rows;
+  for (Function *F : Source) {
+    const bool Merge = mergeCandidate(*F);
+    // Exactly one owner. The interface wins what it can take; merging keeps
+    // what the driver gave it an fmerge clause for; anything neither pass can
+    // take stays a recorded plaintext boundary. `fused` and `scalar-boundary`
+    // are decisions about who may act, never claims that either one did: the
+    // reconciled outcome below is the measurement.
+    StringRef Policy = Reserved.count(F) ? NativeCallPolicyInterface
+        : Merge ? NativeCallPolicyFused : NativeCallPolicyScalar;
+    // Why the encoded interface did or did not win this function.
+    StringRef Why = "interface-preferred";
+    if (!Reserved.count(F)) {
+      if (Induced.count(F))
+        // Eligible on its own, but merging would close a cycle through it and
+        // the call pass refuses a cyclic callee.
+        Why = "merge-induced-recursion";
+      else if (Blocker[F].empty()) Why = "interface-budget";
+      else if (!F->hasFnAttribute("sre.native.original")) Why = "not-selected";
+      // interface_blocker names which of the call pass's own refusals applied.
+      else Why = "interface-ineligible";
+    }
+    // The decision goes on the function so merging reads one recorded fact.
+    F->addFnAttr(NativeCallPolicyAttr, Policy);
+    Rows.push_back(json::Object{{"function", F->getName().str()},
+        {"policy", Policy.str()}, {"reason", Why.str()},
+        {"merge_group", mergeGroupLabel(*F)}, {"merge_candidate", Merge},
+        {"selected", F->hasFnAttribute("sre.native.original")},
+        {"interface_blocker", Blocker[F]}, {"outcome", "unknown"}});
+  }
+  return Rows;
+}
+
+void reconcileNativeCallPolicy(Module &M, json::Array &Policy, const json::Array &Calls) {
+  StringSet<> Encoded;
+  for (const json::Value &V : Calls) {
+    const json::Object *Row = V.getAsObject();
+    if (!Row) continue;
+    auto Name = Row->getString("function"), Status = Row->getString("status");
+    if (Name && Status && *Status == "encoded") Encoded.insert(*Name);
+  }
+  // Every origin a super-function absorbed, named by the merge pass itself
+  // rather than guessed from what went missing.
+  StringSet<> Folded;
+  for (Function &F : M) {
+    if (!F.hasFnAttribute("sre.native.merged")) continue;
+    StringRef Origins = F.getFnAttribute("sre.native.merged").getValueAsString();
+    while (!Origins.empty()) {
+      auto [Head, Tail] = Origins.split(',');
+      if (!Head.empty()) Folded.insert(Head);
+      Origins = Tail;
+    }
+  }
+  for (json::Value &V : Policy) {
+    json::Object *Row = V.getAsObject();
+    if (!Row) continue;
+    auto Name = Row->getString("function");
+    if (!Name) continue;
+    const Function *F = M.getFunction(*Name);
+    const bool Live = F && !F->isDeclaration();
+    // unclaimed is the load-bearing one: the function is still its source self,
+    // so neither pass took it and no protection may be credited for it.
+    StringRef Outcome = "absent";
+    if (Encoded.count(*Name)) Outcome = "encoded";
+    else if (Folded.count(*Name)) Outcome = Live ? "thunked" : "merged";
+    else if (Live) Outcome = "unclaimed";
+    (*Row)["outcome"] = Outcome.str();
+  }
+}
 
 json::Array encodeNativeCalls(Module &M, uint64_t Seed, const NativeCallOptions &O) {
   return Interfaces(M, Seed, O).run();
