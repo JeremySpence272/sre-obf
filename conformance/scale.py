@@ -17,6 +17,7 @@ from conformance.run import ROOT
 from conformance.connected_check import SHARD_ACCOUNTING, cost_accounting, report_violations
 from conformance.bundle_check import bundle_summary
 from conformance.tile_check import tile_summary
+from conformance.immutable_check import immutable_summary
 
 
 # Reports that actually emit connected planning denominators. An older report
@@ -446,6 +447,7 @@ def coverage(report):
     measured = {"source_ledger": ledger, "object_ledger": objects,
             "bundles": bundle_summary(report),
             "object_bundles": tile_summary(report),
+            "immutable_bundles": immutable_summary(report),
             "support_charge": support_charge(report), "cap_ledger": cap_ledger(report),
             "loss_ledger": loss_ledger(report),
             "coverage_views": coverage_views(report, ledger, objects),

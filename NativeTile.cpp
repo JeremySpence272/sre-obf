@@ -65,6 +65,7 @@ struct Step { unsigned Opcode; std::string Origin; };
 struct Plan {
   unsigned ID = 0, Width = 0, Cells = 0, Cost = 0;
   Family Coordinates = Family::Xor;
+  bool Phases = false;
   SmallVector<uint64_t, 4> Salts;
   SmallVector<unsigned, 4> Rotations, Physical;
   SmallVector<Access, 16> Accesses;
@@ -284,7 +285,9 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
     }
     B.BoundaryValues += Uses != 0; B.BoundaryUses += Uses;
   }
+  B.P.Phases = O.ObjectPhases;
   B.P.Cost = 512 + B.Nodes.size() * 1200 + B.Memory.size() * B.P.Cells * 192;
+  if (B.P.Phases) B.P.Cost += 64 * B.Memory.size() * (B.P.Cells + 2);
   if (B.P.Cost > 65536) return fail("function-cost-limit");
   return true;
 }
@@ -299,23 +302,40 @@ class Lowering {
   DenseMap<Value *, Pair> Pairs;
   SmallPtrSet<Instruction *, 32> Members;
   ConstantInt *c(uint64_t X) { return ConstantInt::get(B.getIntNTy(P.Width), X); }
+  Value *pointer(Value *K) {
+    return B.CreateInBoundsGEP(StorageType, Storage, {B.getInt32(0), K});
+  }
   Value *pointer(unsigned K) {
-    return B.CreateInBoundsGEP(StorageType, Storage, {B.getInt32(0), B.getInt32(K)});
+    return pointer(B.getInt32(K));
+  }
+  Value *slot(unsigned K, Value *Phase) {
+    if (!P.Phases) return pointer(P.Physical[K]);
+    // Phase one rotates the seeded physical permutation by one. Each phase
+    // is a bijection over exactly N slots, even when N is not a power of two.
+    Value *Index = B.CreateSelect(B.CreateICmpNE(Phase, c(0)),
+        B.getInt32(P.Physical[(K + 1) % P.Cells]), B.getInt32(P.Physical[K]));
+    return pointer(Index);
   }
   Value *mask(ArrayRef<Value *> Z, Value *M, unsigned K) {
     return bundle::mask(B, Z, M, K, P.Salts[K], P.Rotations[K]);
   }
-  SmallVector<Value *, 4> load(Value *&M) {
+  SmallVector<Value *, 4> load(Value *&M, Value *&Phase) {
     SmallVector<Value *, 4> Z;
-    for (unsigned K : P.Physical) {
-      auto *L = B.CreateLoad(B.getIntNTy(P.Width), pointer(K)); L->setVolatile(Pin); Z.push_back(L);
+    Phase = c(0);
+    if (P.Phases) {
+      auto *L = B.CreateLoad(B.getIntNTy(P.Width), pointer(P.Cells + 1));
+      L->setVolatile(Pin); Phase = L;
+    }
+    for (unsigned K = 0; K < P.Cells; ++K) {
+      auto *L = B.CreateLoad(B.getIntNTy(P.Width), slot(K, Phase)); L->setVolatile(Pin); Z.push_back(L);
     }
     auto *L = B.CreateLoad(B.getIntNTy(P.Width), pointer(P.Cells)); L->setVolatile(Pin); M = L;
     return Z;
   }
-  void store(ArrayRef<Value *> Z, Value *M) {
-    for (unsigned K = 0; K < P.Cells; ++K) B.CreateStore(Z[K], pointer(P.Physical[K]))->setVolatile(Pin);
+  void store(ArrayRef<Value *> Z, Value *M, Value *Phase) {
+    for (unsigned K = 0; K < P.Cells; ++K) B.CreateStore(Z[K], slot(K, Phase))->setVolatile(Pin);
     B.CreateStore(M, pointer(P.Cells))->setVolatile(Pin);
+    if (P.Phases) B.CreateStore(Phase, pointer(P.Cells + 1))->setVolatile(Pin);
   }
   Value *matches(unsigned Access, unsigned K) {
     if (P.Accesses[Access].Constant) return B.getInt1(*P.Accesses[Access].Constant == K);
@@ -329,7 +349,7 @@ class Lowering {
   Pair read(Value *V) {
     if (auto It = Pairs.find(V); It != Pairs.end()) return It->second;
     auto *I = dyn_cast<Instruction>(V);
-    if (!I || !Members.contains(I)) return {B.CreateFreeze(V), c(0)};
+    if (!I || !Members.contains(I)) return bundle::importPair(B, V, P.Coordinates);
     IRBuilderBase::InsertPointGuard Guard(B);
     B.SetInsertPoint(I);
     Pair X = read(I->getOperand(0)), Y = read(I->getOperand(1));
@@ -346,7 +366,7 @@ public:
     for (Instruction &I : instructions(F)) Original.insert(&I);
     MDNode *Tag = MDNode::get(F.getContext(), MDString::get(F.getContext(), "native-object-bundle-v1"));
     IRBuilder<> Entry(getAllocaIP(F));
-    StorageType = ArrayType::get(B.getIntNTy(P.Width), P.Cells + 1);
+    StorageType = ArrayType::get(B.getIntNTy(P.Width), P.Cells + 1 + unsigned(P.Phases));
     Storage = Entry.CreateAlloca(StorageType, nullptr, "sre.tile.tuple");
     // Retargeted lifetime argument attributes may promise the original
     // alignment. Preserve that promise on the larger private allocation.
@@ -360,13 +380,14 @@ public:
     Value *M = B.CreateAdd(bundle::rotate(B, Initial[0], P.Rotations[0]), B.CreateXor(Initial[1], c(P.Salts[0])));
     for (unsigned K = 0; K < P.Cells; ++K)
       Z.push_back(transfer::remask(B, {Initial[K], c(0)}, P.Coordinates, mask(Z, M, K)));
-    store(Z, M);
+    Value *Phase = c(0);
+    store(Z, M, Phase);
     for (Instruction *I : Bound.Nodes) Members.insert(I);
     for (unsigned K = 0; K < Bound.Memory.size(); ++K) {
       auto *L = dyn_cast<LoadInst>(Bound.Memory[K]);
       if (!L) continue;
       B.SetInsertPoint(L);
-      Z = load(M);
+      Z = load(M, Phase);
       if (auto *V = dyn_cast<FixedVectorType>(L->getType())) {
         Value *Out = PoisonValue::get(V);
         unsigned First = *P.Accesses[K].Constant;
@@ -400,14 +421,26 @@ public:
       if (!S || P.Accesses[K].Initializer) continue;
       B.SetInsertPoint(S);
       Pair V = read(S->getValueOperand());
-      Z = load(M);
+      Z = load(M, Phase);
+      Value *NextM = M, *NextPhase = Phase;
+      if (P.Phases) {
+        NextPhase = B.CreateXor(Phase, c(1));
+        // The carrier depends on prior stored coordinates and the actual
+        // encoded update. All old masks use the OLD tuple/carrier; every new
+        // mask uses the completed prefix and NEW carrier. No scalar decode
+        // or phase-reset mirror is emitted, including for untouched cells.
+        Value *History = bundle::rotate(B, B.CreateXor(M, Z.back()), P.Rotations.back());
+        Value *Update = B.CreateAdd(B.CreateXor(V.E, Z.front()), V.R);
+        NextM = B.CreateXor(B.CreateAdd(History, Update),
+            B.CreateMul(NextPhase, c(P.Salts[0] | 1)));
+      }
       SmallVector<Value *, 4> Next;
       for (unsigned J = 0; J < P.Cells; ++J) {
         Value *C = matches(K, J);
         Pair Selected{B.CreateSelect(C, V.E, Z[J]), B.CreateSelect(C, V.R, mask(Z, M, J))};
-        Next.push_back(transfer::remask(B, Selected, P.Coordinates, mask(Next, M, J)));
+        Next.push_back(transfer::remask(B, Selected, P.Coordinates, mask(Next, NextM, J)));
       }
-      store(Next, M);
+      store(Next, NextM, NextPhase);
     }
     // Indices are also scalar boundaries: generated comparisons still refer
     // to their original SSA value and are rewritten here before it is erased.
@@ -453,12 +486,18 @@ json::Object describe(const Binding &B) {
       {"opcode", Instruction::getOpcodeName(S.Opcode)}, {"input_origin", S.Origin}});
   return json::Object{{"width", P.Width}, {"cells", P.Cells},
       {"family", P.Coordinates == Family::Xor ? "triangular-xor-v1" : "triangular-additive-v1"},
-      {"law", "closed-initialized-tile-v1"}, {"phase_mode", "static"},
+      {"law", "closed-initialized-tile-v1"}, {"phase_mode", P.Phases ? "store-toggle-v1" : "static"},
+      {"phase_contract", json::Object{{"states", P.Phases ? 2 : 1}, {"entry", 0},
+          {"transition", P.Phases ? "toggle-after-update" : "identity"},
+          {"carrier", P.Phases ? "history-and-encoded-update-v1" : "entry-only"},
+          {"layout", P.Phases ? "rotate-logical-slots-by-phase" : "seeded-permutation"},
+          {"static_update_sites", P.Phases ? Stores - P.Cells : 0},
+          {"bytes_reencoded_per_update", P.Phases ? (P.Cells + 2) * P.Width / 8 : 0}}},
       {"ownership", "closed-entry-alloca"}, {"initialization", "complete-entry-stores-dominate-accesses"},
       {"physical_slots", std::move(Physical)}, {"salts_hex", std::move(Salts)}, {"rotations", std::move(Rotations)},
       {"source_loads", Loads}, {"source_stores", Stores}, {"dynamic_accesses", Dynamic},
-      {"physical_loads", (Loads + Stores - P.Cells) * (P.Cells + 1)},
-      {"physical_stores", (1 + Stores - P.Cells) * (P.Cells + 1)},
+      {"physical_loads", (Loads + Stores - P.Cells) * (P.Cells + 1 + unsigned(P.Phases))},
+      {"physical_stores", (1 + Stores - P.Cells) * (P.Cells + 1 + unsigned(P.Phases))},
       {"scalar_input_values", B.ScalarInputs}, {"scalar_output_values", B.BoundaryValues},
       {"scalar_output_uses", B.BoundaryUses}, {"scalar_address_uses", B.AddressUses},
       {"vector_output_values", B.VectorOutputs}, {"vector_output_uses", B.VectorUses},

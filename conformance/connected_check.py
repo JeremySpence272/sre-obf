@@ -5,6 +5,7 @@ from pathlib import Path
 from conformance.call_policy import policy_violations
 from conformance.bundle_check import bundle_violations
 from conformance.tile_check import tile_violations
+from conformance.immutable_check import immutable_violations
 from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, test_inputs
 
@@ -35,7 +36,8 @@ def cost_accounting(report):
 def report_violations(report):
     """Validate before computing coverage; malformed reports fail explicitly."""
     violations = []
-    for check in (invariants, call_violations, policy_violations, plan_violations, bundle_violations, tile_violations):
+    for check in (invariants, call_violations, policy_violations, plan_violations,
+                  bundle_violations, tile_violations, immutable_violations):
         try:
             violations.extend(check(report))
         except (KeyError, TypeError, ValueError) as exc:

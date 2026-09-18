@@ -37,7 +37,8 @@ FALLBACKS = {
     "vector-dynamic": "partial-volatile-or-atomic-access",
 }
 SUPPORTED = ("supported", "address", "many-loads", "lifetime", "lifetime-open",
-             "lifetime-joins", "lifetime-aligned", "byte-offset", "vector-exit", "narrow-index", "narrow-constant")
+             "lifetime-joins", "lifetime-aligned", "byte-offset", "vector-exit", "narrow-index", "narrow-constant",
+             "phase-joins")
 
 
 def fixture(width, cells, shape="supported"):
@@ -134,6 +135,17 @@ def fixture(width, cells, shape="supported"):
         source = source.replace(f"  store {ty} %v5, ptr %p", f"  %nextidx = and {ty} %v5, 1\n"
                                 f"  %q = getelementptr inbounds {array}, ptr %tile, i32 0, {ty} %nextidx\n"
                                 f"  %v6 = xor {ty} %nextidx, %v5\n  store {ty} %v6, ptr %q")
+    elif shape == "phase-joins":
+        # The zero path keeps the entry representation; the optional second
+        # store gives the merge two possible phases/carriers. No speculative
+        # load/store is added to the path which skips the loop or extra update.
+        source = source.replace("  br label %loop\nloop:",
+            f"  %zero = icmp eq {ty} %b, 0\n  br i1 %zero, label %exit, label %loop\nloop:", 1)
+        source = source.replace("[ %next, %loop ]", "[ %next, %join ]")
+        source = source.replace(f"  store {ty} %v5, ptr %p\n",
+            f"  store {ty} %v5, ptr %p\n  %odd = and {ty} %v5, %a\n"
+            f"  %take = icmp ne {ty} %odd, 0\n  br i1 %take, label %extra, label %join\n"
+            f"extra:\n  store {ty} %v0, ptr %p{cells - 1}\n  br label %join\njoin:\n", 1)
     elif shape == "many-loads":
         # Stress membership spilling beyond SmallPtrSet's inline storage. The
         # later final-output stores overwrite these intentionally redundant
@@ -148,13 +160,15 @@ def oracle(a, b, width, cells, shape="supported"):
     mask = (1 << width) - 1
     a, b = a & mask, b & mask
     tile = [(a + k) & mask for k in range(cells)]
-    for _ in range(4):
+    for _ in range(0 if shape == "phase-joins" and b == 0 else 4):
         idx = 0 if shape.startswith("narrow-") else b & (3 if cells == 4 else 1)
+        v0 = (tile[idx] + b) & mask
         x = (((tile[idx] + b) & mask) ^ tile[-1]) * 3 & mask
         signed = x - (1 << width) if x >> (width - 1) else x
         x = (((signed >> 1) - a) & mask) | 1
         if shape == "address": idx, x = x & 1, (x & 1) ^ x
         tile[idx] = x
+        if shape == "phase-joins" and x & a: tile[-1] = v0
     return tile + [0] * (4 - cells)
 
 
@@ -180,6 +194,7 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[1])
     parser.add_argument("--random-inputs", type=int, default=512)
     parser.add_argument("--ablation", action="store_true", help="also emit/test matched tile-disabled and normalized controls")
+    parser.add_argument("--object-phases", action="store_true", help="rekey and permute after each tile update")
     parser.add_argument("--c-o2", action="store_true", help="ordinary optimized C; requires widths 32/64, cells 2, shape supported")
     args = parser.parse_args()
     if args.c_o2 and (set(args.widths) - {32, 64} or args.cells != [2] or args.shapes != ["supported"]):
@@ -205,6 +220,7 @@ def main():
              "-native-plan=1", "-native-scale-budget=1", "-native-bundles=1", "-native-object-bundles=1",
              "-obf-deterministic", "-obf-verify"]
     if args.c_o2: flags.append("-native-transfer-nodes=32")
+    if args.object_phases: flags.append("-native-object-phases=1")
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
@@ -251,6 +267,8 @@ def main():
                                         raise ToolFailure(f"unexpected fallback: {row}")
                                 else:
                                     if row["status"] != "encoded": raise ToolFailure(f"no tile retained: {row}")
+                                    if (row["plan"]["phase_mode"] != "static") != args.object_phases:
+                                        raise ToolFailure("object phase option did not reach the emitter")
                                     if shape == "address" and row["plan"]["scalar_address_uses"] == 0:
                                         raise ToolFailure("address projection not accounted")
                                     if (shape.startswith("lifetime") or args.c_o2) and row["plan"]["lifetime"]["mode"] != "single-entry":
@@ -273,6 +291,7 @@ def main():
                                         disabled = case / (name + "-disabled.ll")
                                         disabled_report = case / (name + "-disabled.json")
                                         substitutions = {"-native-object-bundles=1": "-native-object-bundles=0",
+                                            "-native-object-phases=1": "-native-object-phases=0",
                                             str(protected): str(disabled),
                                             f"-native-report-json={report}": f"-native-report-json={disabled_report}",
                                             f"-native-stage-dir={stage}": f"-native-stage-dir={stage}-disabled"}

@@ -307,6 +307,18 @@ class Lowering {
          I != End; I = I->getNextNode()) I->setMetadata(BundleTag, Tag);
   }
   void enter(ArrayRef<Value *> Values) {
+    if (llvm::any_of(Values, [](Value *V) { return bundle::immutablePair(V) != nullptr; })) {
+      SmallVector<Pair, 4> Inputs;
+      for (Value *V : Values) Inputs.push_back(bundle::importPair(B, V, P.coordinates()));
+      M = B.CreateAdd(rotate(Inputs[0].E, P.Rotations[0]),
+          B.CreateXor(B.CreateAdd(Inputs[1].E, Inputs[1].R), c(P.Salts[0])));
+      for (unsigned K = 0; K < P.Lanes; ++K) {
+        Pair X = K < Inputs.size() ? Inputs[K] : Pair{c(0), c(0)};
+        Z.push_back(transfer::remask(B, X, P.coordinates(), mask(Z, K)));
+      }
+      pin();
+      return;
+    }
     SmallVector<Value *, 4> Inputs;
     for (Value *V : Values) Inputs.push_back(B.CreateFreeze(V));
     M = B.CreateAdd(rotate(Inputs[0], P.Rotations[0]),

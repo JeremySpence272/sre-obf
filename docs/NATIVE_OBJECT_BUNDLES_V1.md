@@ -95,8 +95,10 @@ record that exposure separately; those decodes are not credited as useful
 encoded arithmetic. This permits ordinary O2-coalesced output reads without
 pretending the vector stays protected at the interface.
 
-The layout and carrier are **static for the activation** in v1. The loop-phase
-option does not imply object rekeying. Each call owns an independent stack
+Without `-native-object-phases=1`, the layout and carrier are **static for the
+activation**. The pure loop-phase option does not imply object rekeying.
+The shared harness exposes the separate `--object-phases` switch.
+Each call owns an independent stack
 allocation, so no process-global state or recursion/thread state stack is needed.
 Pinning makes only the private tile accesses volatile. The unpinned arm is a
 mandatory control for experiments, not an alternate correctness contract.
@@ -114,6 +116,9 @@ density, with lexical function/object ties, at most one per owner. Cost is:
 
     512 + 1200 * useful_operations + 192 * memory_accesses * cells
 
+Object phases add `64 * memory_accesses * (cells + 2)` to that reservation;
+the per-object and module limits do not change.
+
 The per-object cap is 65,536. Every selected owner has a body-only transaction;
 invalid IR is fatal, and actual growth above its reservation restores the body.
 No new global or callee escapes that transaction. New code/storage is tagged
@@ -121,8 +126,9 @@ bundle-owned so the later bundle, connected and legacy memory paths do not
 count or re-encode it as new source work.
 
 The native-v6 report adds `object_bundles` rows using `sre-object-bundle-v1`.
-Feature `object_bundle_contract=2` requires lifetime, access-span and vector
-boundary accounting. Older contract-1 artifacts remain readable.
+Feature `object_bundle_contract=3` additionally requires a finite phase/layout
+contract and complete phase traffic accounting. Contract 2 introduced lifetime,
+access-span and vector boundary accounting. Both older contracts remain readable.
 The shared accounting gate checks dispositions, ownership/initialization and
 bounds declarations, layout bijection, useful operations, original ancestry,
 growth, extra physical reads/writes and scalar exposures. Counts are static
@@ -269,12 +275,59 @@ Pinned LLVM 22.1.8 build passes. The full pinned-solver Python suite passes
 No paid agent run, protected holdout evaluation or crackme repackaging was
 performed. Generality and resistance remain unestablished for this increment.
 
+## Finite object phases (September 18 continuation)
+
+`native-object-phases` requires object bundles. Entry stores phase zero; every
+non-initializing source store toggles it. The tuple contains N coordinates, a
+carrier and the phase word. Phase zero uses the seeded physical permutation;
+phase one rotates its logical-slot mapping by one. Both mappings are bijections
+over exactly N cells, including N=3. Loads use the stored phase, not a compile-time
+guess about which predecessor executed.
+
+For an update pair `(E,R)`, the next carrier combines a rotation of the old
+carrier XOR the final coordinate, `(E XOR first_coordinate) + R`, and a seeded
+odd multiple of the next phase. The emitter first loads the complete old tuple,
+computes every next coordinate in SSA, then writes the complete new tuple.
+Every old mask uses the old carrier/prefix; every new mask uses the new
+carrier/prefix. Selected and untouched cells use the same remasking law, without
+a decoded shadow. This establishes the store law for any new carrier; the
+specific carrier recurrence is not assumed cryptographically difficult.
+
+No accesses are hoisted across source guards. Memory owns the current phase at
+joins, so a zero-iteration path and predecessors with different store counts
+remain valid without cloning CFG blocks or resetting the representation.
+The private allocation still belongs to one activation and the same lifetime
+proof applies. Static reports count update sites and bytes rewritten per update,
+not an invented dynamic traffic estimate.
+
+Evidence before the immutable continuation:
+
+- `out/tile-phases-joins-20260918`: 24 cases, i8/i32, N=2/3/4, both families
+  and pin modes; all-output native/post-O2/disabled controls, determinism and
+  threads pass. Byte inputs are exhaustive. Includes skipped loops and
+  conditional extra stores which give joins different phases.
+- `out/tile-phases-c-o2-20260918`: eight unchanged optimized-C cases, i32/i64,
+  seed 3, both families/pin modes; lifetime and packed-read boundaries plus
+  all matched controls pass.
+- These two matrices used plugin
+  `9763167e82e7b24627c85fae5e6ee158ed33ee352caeb7e2127704a042e8ee5c`.
+- `conformance/tile_model.py` independently checks remasking and physical
+  layouts, exhaustively at reduced width and across production widths/history.
+  This is a model check plus emitted differentials, not whole-program proof.
+- `out/v04-phase-final-reemit-20260918`: all 32 matrix cases re-emitted with
+  final integrated plugin `15b643dd74dab7c8233be3e0731743a4129a0366851d7bfab8e39912e0c7b45b`
+  have byte-identical protected IR and pass current report gates.
+
+[Immutable numeric tiles](NATIVE_IMMUTABLE_BUNDLES_V1.md) now provide a separate
+closed-global backing-to-consumer path. Neither feature establishes resistance
+to phase/layout recovery; both remain default-off experiments.
+
 ## Remaining W3 work
 
-Still deferred: immutable/global backing, aggregates and derived aliases,
+Still deferred: mutable global ownership, aggregates and derived aliases,
 restarted/nested lifetimes, initialized-subobject and memory-intrinsic support,
-ownership propagation through direct calls, multiple tiles/owners, object-phase
-joins/rekeying and phase-dependent permutations, richer operation scheduling,
+ownership propagation through direct calls, multiple tiles/owners, larger or
+lazy per-tile phase graphs, richer operation scheduling,
 and informed index/storage-recovery baselines. Escaping/heap ownership remains
 separate research. Generality and promotion gates remain unchanged; protected
 holdouts must not be used to tune this prototype.

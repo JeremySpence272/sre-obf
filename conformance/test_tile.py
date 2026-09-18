@@ -249,5 +249,73 @@ class TileAlgebra(unittest.TestCase):
                                  rng.randrange(n), rng.getrandbits(width), rng.getrandbits(width))
 
 
+class TilePhases(unittest.TestCase):
+    def test_exhaustive_small_phase_transfer(self):
+        from conformance.tile_model import store
+        for family in FAMILIES:
+            d = Descriptor(2, family, (1, 3), (1, 1))
+            for values in itertools.product(range(4), repeat=2):
+                for m, phase, slot, value, key in itertools.product(range(4), range(2), range(2), range(4), range(4)):
+                    pair = ((value + key) & 3, key) if d.additive else (value ^ key, key)
+                    new, carrier, next_phase = store(d, d.encode(values, m), m, phase, slot, pair)
+                    expected = list(values)
+                    expected[slot] = value
+                    self.assertEqual(d.decode(new, carrier), tuple(expected))
+                    self.assertEqual(next_phase, phase ^ 1)
+
+    def test_layouts_and_history_all_production_widths(self):
+        from conformance.tile_model import layout, store
+        rng = random.Random(314159)
+        for width, n, family in itertools.product((8, 16, 32, 64), (2, 3, 4), FAMILIES):
+            physical = rng.sample(range(n), n)
+            for p in (0, 1): self.assertEqual(sorted(layout(physical, p)), list(range(n)))
+            self.assertNotEqual(layout(physical, 0), layout(physical, 1))
+            d = Descriptor(width, family, tuple(rng.getrandbits(width) for _ in range(n)),
+                           tuple(rng.randrange(1, width) for _ in range(n)))
+            values = [rng.getrandbits(width) for _ in range(n)]
+            carrier, phase = rng.getrandbits(width), 0
+            state = d.encode(values, carrier)
+            for _ in range(64):
+                slot, value, key = rng.randrange(n), rng.getrandbits(width), rng.getrandbits(width)
+                pair = ((value + key) & d.bits, key) if d.additive else (value ^ key, key)
+                state, carrier, phase = store(d, state, carrier, phase, slot, pair)
+                values[slot] = value
+                self.assertEqual(d.decode(state, carrier), tuple(values))
+                memory = [0] * n
+                for k, physical_slot in enumerate(layout(physical, phase)): memory[physical_slot] = state[k]
+                loaded = tuple(memory[j] for j in layout(physical, phase))
+                self.assertEqual(d.decode(loaded, carrier), tuple(values))
+
+    def test_phase_report_fails_closed(self):
+        data = lifetime_report()
+        data["features"].update(object_bundle_contract=3, object_phases=True)
+        row = data["object_bundles"][0]
+        plan = row["plan"]
+        plan.update(phase_mode="store-toggle-v1", physical_loads=20, physical_stores=8,
+                    phase_contract={"states": 2, "entry": 0, "transition": "toggle-after-update",
+                        "carrier": "history-and-encoded-update-v1", "layout": "rotate-logical-slots-by-phase",
+                        "static_update_sites": 1, "bytes_reencoded_per_update": 4})
+        row["growth_allocation"] += 64 * 7 * 4
+        row["module_growth_limit"] = 20000
+        self.assertEqual(tile_violations(data), [])
+        self.assertEqual(tile_summary(data)["phase_update_sites"], 1)
+        for key, value in (("entry", 1), ("static_update_sites", 2), ("bytes_reencoded_per_update", 2)):
+            bad = copy.deepcopy(data)
+            bad["object_bundles"][0]["plan"]["phase_contract"][key] = value
+            self.assertTrue(tile_violations(bad))
+        data["features"]["object_phases"] = False
+        self.assertTrue(tile_violations(data))
+
+    def test_phase_option_dependency_and_roundtrip(self):
+        parser = argparse.ArgumentParser()
+        bundle_options.add_options(parser)
+        with self.assertRaises(ValueError):
+            bundle_options.validate(parser.parse_args(["--bundles", "--object-phases"]), True)
+        args = parser.parse_args(["--bundles", "--object-bundles", "--object-phases"])
+        bundle_options.validate(args, True)
+        self.assertIn("-native-object-phases=1", bundle_options.flags(args))
+        self.assertEqual(bundle_options.flags(args), bundle_options.flags(parser.parse_args(bundle_options.argv(args))))
+
+
 if __name__ == "__main__":
     unittest.main()

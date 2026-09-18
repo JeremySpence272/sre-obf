@@ -1,9 +1,13 @@
 #include "llvm/Transforms/Obfuscator/NativeEncoding.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleMath.h"
+#include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/IR/Verifier.h"
 #include "llvm/Support/CommandLine.h"
 
 using namespace llvm;
@@ -152,7 +156,164 @@ Value *materializeNative(IRBuilder<> &B, const APInt &Bits, Rng &Root,
   return Decoded;
 }
 
-json::Array encodeNativeData(Module &M, uint64_t Seed) {
+namespace {
+json::Object encodeJointData(GlobalVariable &G, ArrayRef<APInt> Plain,
+                              ArrayRef<LoadInst *> UnorderedLoads, uint64_t Seed,
+                              bool Pin, unsigned &Remaining) {
+  Module &M = *G.getParent();
+  auto *AT = cast<ArrayType>(G.getValueType());
+  unsigned W = AT->getElementType()->getIntegerBitWidth();
+  // Keep all pointer and load bindings in stable module/instruction order.
+  SmallPtrSet<LoadInst *, 32> Set(UnorderedLoads.begin(), UnorderedLoads.end());
+  SmallVector<LoadInst *, 16> Loads;
+  SmallVector<Function *, 8> Owners;
+  for (Function &F : M) {
+    bool Owns = false;
+    for (Instruction &I : instructions(F))
+      if (auto *L = dyn_cast<LoadInst>(&I); L && Set.contains(L)) { Loads.push_back(L); Owns = true; }
+    if (Owns) Owners.push_back(&F);
+  }
+  uint64_t Cost = 192 * uint64_t(Loads.size());
+  json::Object Row{{"object", G.getName().str()}, {"status", "skipped"},
+      {"contract", "sre-immutable-tile-v1"}, {"read_sites", Loads.size()},
+      {"growth_estimate", Cost}, {"growth_available", Remaining}, {"growth_retained", 0}, {"pins", Pin}};
+  if (Cost > Remaining) { Row["reason"] = "immutable-growth-budget"; return Row; }
+  Rng R = Rng(Seed).fork("native-immutable-tiles-v1").fork(G.getName());
+  bool Additive = R.u64() & 1;
+  APInt K0(W, R.u64(), false, true), K1(W, R.u64() | 1, false, true);
+  SmallVector<APInt, 4> Salts;
+  SmallVector<unsigned, 4> Rotations;
+  for (unsigned K = 0; K < 4; ++K) {
+    Salts.emplace_back(W, R.u64(), false, true); Rotations.push_back(1 + R.range(W - 1));
+  }
+  SmallVector<Constant *, 32> Encoded;
+  APInt Carrier(W, 0), Previous(W, 0);
+  for (unsigned I = 0; I < Plain.size(); ++I) {
+    unsigned K = I % 4;
+    if (!K) { Carrier = K0 + APInt(W, I, false, true) * K1; Previous = Carrier; }
+    APInt Mask = ((Previous ^ Salts[K]) + Carrier).rotl(Rotations[K]);
+    Mask ^= Previous * (Salts[K] | APInt(W, 1));
+    Previous = Additive ? Plain[I] + Mask : Plain[I] ^ Mask;
+    Encoded.push_back(ConstantInt::get(M.getContext(), Previous));
+  }
+  Constant *OldInitializer = G.getInitializer();
+  bool OldConstant = G.isConstant();
+  SmallVector<std::unique_ptr<FunctionSnapshot>, 8> Snapshots;
+  unsigned Before = 0;
+  for (Function *F : Owners) {
+    Before += F->getInstructionCount();
+    Snapshots.push_back(std::make_unique<FunctionSnapshot>(*F));
+  }
+  G.setInitializer(ConstantArray::get(AT, Encoded));
+  G.setConstant(false); // No runtime writes; pinning is a separate ablation.
+  unsigned Site = 0;
+  for (LoadInst *L : Loads) {
+    Function &F = *L->getFunction();
+    F.setMemoryEffects(MemoryEffects::unknown());
+    F.removeFnAttr(Attribute::Speculatable);
+    IRBuilder<> B(L);
+    Instruction *Prev = L->getPrevNode();
+    Value *Index = B.CreatePtrDiff(AT->getElementType(), L->getPointerOperand(), &G);
+    auto *IT = cast<IntegerType>(Index->getType());
+    Value *Base = B.CreateAnd(Index, ConstantInt::get(IT, ~uint64_t(3)));
+    Value *Slot = B.CreateAnd(Index, ConstantInt::get(IT, 3));
+    Value *C = B.CreateAdd(ConstantInt::get(M.getContext(), K0),
+        B.CreateMul(B.CreateZExtOrTrunc(Base, AT->getElementType()), ConstantInt::get(M.getContext(), K1)));
+    SmallVector<Value *, 4> Z, Masks;
+    for (unsigned K = 0; K < 4; ++K) {
+      Value *Offset = B.CreateAdd(Base, ConstantInt::get(IT, K));
+      Value *Last = ConstantInt::get(IT, Plain.size() - 1);
+      // A tail's nonexistent cells are NOT read. Duplicate the last legal
+      // coordinate for unused candidate slots; a defined source index can
+      // never select them. This adds no access outside the original object.
+      Offset = B.CreateSelect(B.CreateICmpULT(Offset, Last), Offset, Last);
+      auto *E = B.CreateLoad(AT->getElementType(),
+          B.CreateInBoundsGEP(AT, &G, {B.getInt32(0), Offset}));
+      // The original selected load can promise stronger alignment than its
+      // neighbours. Conversely, a deliberately under-aligned global need not
+      // satisfy the element ABI alignment. Prove the new full-tile reads from
+      // the base and element stride, not from the selected source load.
+      E->setAlignment(commonAlignment(G.getAlign().value_or(M.getDataLayout().getABITypeAlign(AT)), W / 8));
+      E->setVolatile(Pin);
+      Masks.push_back(bundle::mask(B, Z, C, K, Salts[K].getZExtValue(), Rotations[K]));
+      Z.push_back(E);
+    }
+    Value *E = Z[0], *Key = Masks[0];
+    for (unsigned K = 1; K < 4; ++K) {
+      Value *Selected = B.CreateICmpEQ(Slot, ConstantInt::get(IT, K));
+      E = B.CreateSelect(Selected, Z[K], E); Key = B.CreateSelect(Selected, Masks[K], Key);
+    }
+    Value *Decoded = Additive ? B.CreateSub(E, Key, "sre.immutable.boundary")
+                              : B.CreateXor(E, Key, "sre.immutable.boundary");
+    auto *I = cast<Instruction>(Decoded);
+    I->setMetadata("sre.native.immutable.pair", MDNode::get(M.getContext(), {
+        MDString::get(M.getContext(), G.getName()), MDString::get(M.getContext(), F.getName()),
+        ConstantAsMetadata::get(B.getInt32(Site++)), ConstantAsMetadata::get(B.getInt32(L->getNumUses()))}));
+    auto *Tag = MDNode::get(M.getContext(), MDString::get(M.getContext(), "native-immutable-tile-v1"));
+    for (Instruction *New = Prev ? Prev->getNextNode() : &L->getParent()->front(); New != L; New = New->getNextNode())
+      New->setMetadata("sre.native.bundle", Tag);
+    L->replaceAllUsesWith(Decoded);
+    L->eraseFromParent();
+  }
+  unsigned After = 0;
+  for (Function *F : Owners) {
+    if (verifyFunction(*F, &errs())) report_fatal_error("immutable bundle emitted invalid IR");
+    After += F->getInstructionCount();
+  }
+  Row["growth_attempted"] = After > Before ? After - Before : 0;
+  if (After > uint64_t(Before) + Cost) {
+    G.setInitializer(OldInitializer); G.setConstant(OldConstant);
+    for (auto &Snapshot : Snapshots) Snapshot->restore();
+    Row["status"] = "rolled-back"; Row["reason"] = "immutable-growth-budget";
+    return Row;
+  }
+  unsigned Growth = After > Before ? After - Before : 0;
+  Remaining -= Growth;
+  G.setMetadata("sre.native.encoding", tag(M.getContext(), G.getName(), "immutable-triangular-v1"));
+  Row["status"] = "encoded"; Row["reason"] = "";
+  Row["family"] = Additive ? "triangular-additive-v1" : "triangular-xor-v1";
+  Row["width"] = W; Row["cells"] = Plain.size(); Row["tile_cells"] = 4;
+  Row["bytes"] = Plain.size() * (W / 8); Row["physical_reads_per_site"] = 4;
+  Row["storage"] = "immutable-closed-initialized-array";
+  Row["tail"] = "duplicate-last-valid-coordinate";
+  json::Array SaltValues, RotationValues;
+  for (unsigned K = 0; K < 4; ++K) {
+    SaltValues.push_back(utohexstr(Salts[K].getZExtValue())); RotationValues.push_back(Rotations[K]);
+  }
+  Row["salts_hex"] = std::move(SaltValues); Row["rotations"] = std::move(RotationValues);
+  Row["carrier_base_hex"] = utohexstr(K0.getZExtValue());
+  Row["carrier_step_hex"] = utohexstr(K1.getZExtValue());
+  Row["growth_retained"] = Growth;
+  return Row;
+}
+} // namespace
+
+json::Array nativeImmutableContinuity(Module &M, StringRef Stage, bool EraseDead) {
+  json::Array Rows;
+  SmallVector<Instruction *, 32> Dead;
+  for (Function &F : M) for (Instruction &I : instructions(F)) {
+    auto *MD = I.getMetadata("sre.native.immutable.pair");
+    if (!MD || MD->getNumOperands() != 4 || !isa<MDString>(MD->getOperand(0)) ||
+        !isa<MDString>(MD->getOperand(1)) || !mdconst::dyn_extract<ConstantInt>(MD->getOperand(2)) ||
+        !mdconst::dyn_extract<ConstantInt>(MD->getOperand(3))) continue;
+    unsigned Original = mdconst::extract<ConstantInt>(MD->getOperand(3))->getZExtValue();
+    unsigned Remaining = I.getNumUses();
+    Rows.push_back(json::Object{{"schema", "sre-immutable-continuity-v1"},
+        {"object", cast<MDString>(MD->getOperand(0))->getString().str()},
+        {"reader_at_encoding", cast<MDString>(MD->getOperand(1))->getString().str()},
+        {"current_reader", F.getName().str()},
+        {"site", mdconst::extract<ConstantInt>(MD->getOperand(2))->getZExtValue()},
+        {"original_scalar_uses", Original}, {"remaining_scalar_uses", Remaining},
+        {"eliminated_scalar_uses", Original > Remaining ? Original - Remaining : 0},
+        {"added_scalar_uses", Remaining > Original ? Remaining - Original : 0},
+        {"scope", Stage.str()}, {"hardness_evaluated", false}});
+    if (EraseDead && I.use_empty()) Dead.push_back(&I);
+  }
+  for (Instruction *I : Dead) I->eraseFromParent();
+  return Rows;
+}
+
+json::Array encodeNativeData(Module &M, uint64_t Seed, bool Joint, bool Pin, unsigned GrowthBudget) {
   json::Array Records;
   SmallVector<GlobalVariable *, 32> Originals;
   for (GlobalVariable &G : M.globals())
@@ -168,10 +329,12 @@ json::Array encodeNativeData(Module &M, uint64_t Seed) {
     SmallVector<LoadInst *, 16> Loads;
     uint64_t Size = M.getDataLayout().getTypeAllocSize(AT).getFixedValue();
     if (!G->hasLocalLinkage() || !G->isConstant() || !G->hasInitializer() ||
-        G->isThreadLocal() || G->getAddressSpace() != 0 || G->hasSection())
+        G->isThreadLocal() || G->getAddressSpace() != 0 || G->hasSection() || G->isExternallyInitialized())
       Reason = "linkage-mutability-or-storage";
     else if (W != 8 && W != 16 && W != 32 && W != 64)
       Reason = "unsupported-width";
+    else if (Joint && AT->getNumElements() == 0)
+      Reason = "no-initialized-cells";
     else if (Size > MaxDataBytes || Bytes > MaxDataBytes - Size)
       Reason = "module-data-byte-cap";
     else if (!findLoads(G, AT, Seen, Loads, Reason)) {}
@@ -187,6 +350,12 @@ json::Array encodeNativeData(Module &M, uint64_t Seed) {
     if (!Reason.empty()) {
       Records.push_back(json::Object{{"object", G->getName().str()},
           {"status", "skipped"}, {"reason", Reason}});
+      continue;
+    }
+    if (Joint) {
+      auto Row = encodeJointData(*G, Plain, Loads, Seed, Pin, GrowthBudget);
+      if (Row.getString("status") == "encoded") Bytes += Size;
+      Records.push_back(std::move(Row));
       continue;
     }
     Rng ObjectR = Rng(Seed).fork("native-data-v1").fork(G->getName());

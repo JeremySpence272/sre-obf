@@ -25,11 +25,14 @@ def tile_violations(report):
     errors = []
     enabled = report.get("features", {}).get("object_bundles", False)
     if not enabled:
+        if report.get("features", {}).get("object_phases"): return ["object phases require object bundles"]
         return ["tile rows exist with feature disabled"] if report.get("object_bundles") else []
     if not report.get("features", {}).get("bundles") or "object_bundles" not in report:
         return ["enabled tiles require bundles and an object inventory"]
     contract = report.get("features", {}).get("object_bundle_contract", 1)
-    if type(contract) is not int or contract not in (1, 2): return ["unsupported object bundle contract"]
+    if type(contract) is not int or contract not in (1, 2, 3): return ["unsupported object bundle contract"]
+    phases = report.get("features", {}).get("object_phases", False)
+    if type(phases) is not bool or (phases and contract < 3): return ["invalid object phase feature"]
     rows = report["object_bundles"]
     sources = {r["function"]: r["instructions"] for r in report.get("bundle_input_inventory", [])}
     seen, owners, limits, allocated = set(), set(), set(), 0
@@ -63,11 +66,12 @@ def tile_violations(report):
         n = plan["cells"]
         require(desc.width in (8, 16, 32, 64) and 2 <= n <= 4 and len(desc.salts) == n, "invalid shape")
         require(sorted(plan["physical_slots"]) == list(range(n)), "non-bijective layout")
-        require(plan["law"] == "closed-initialized-tile-v1" and plan["phase_mode"] == "static", "unknown law")
+        require(plan["law"] == "closed-initialized-tile-v1" and
+                plan["phase_mode"] == ("store-toggle-v1" if phases else "static"), "unknown law")
         require(plan["ownership"] == "closed-entry-alloca" and
                 plan["initialization"] == "complete-entry-stores-dominate-accesses", "missing ownership proof")
         accesses = plan["accesses"]
-        modern = contract == 2
+        modern = contract >= 2
         if modern:
             require("lifetime" in plan, "missing lifetime contract")
             require(all("elements" in a for a in accesses), "missing access spans")
@@ -107,8 +111,18 @@ def tile_violations(report):
         require(loads > 0 and stores > n and len(accesses) <= 64, "no bounded useful memory update")
         require(plan["source_loads"] == loads and plan["source_stores"] == stores, "memory denominator mismatch")
         require(plan["dynamic_accesses"] == sum(a["index"] is None for a in accesses), "dynamic count mismatch")
-        require(plan["physical_loads"] == (loads + stores - n) * (n + 1), "extra-read accounting mismatch")
-        require(plan["physical_stores"] == (1 + stores - n) * (n + 1), "write accounting mismatch")
+        lanes = n + 1 + int(phases)
+        require(plan["physical_loads"] == (loads + stores - n) * lanes, "extra-read accounting mismatch")
+        require(plan["physical_stores"] == (1 + stores - n) * lanes, "write accounting mismatch")
+        if contract >= 3:
+            require(plan.get("phase_contract") == {
+                "states": 2 if phases else 1, "entry": 0,
+                "transition": "toggle-after-update" if phases else "identity",
+                "carrier": "history-and-encoded-update-v1" if phases else "entry-only",
+                "layout": "rotate-logical-slots-by-phase" if phases else "seeded-permutation",
+                "static_update_sites": stores - n if phases else 0,
+                "bytes_reencoded_per_update": lanes * desc.width // 8 if phases else 0},
+                "missing or inconsistent phase contract")
         for key in ("scalar_input_values", "scalar_output_values", "scalar_output_uses", "scalar_address_uses"):
             require(type(plan[key]) is int and plan[key] >= 0, f"invalid {key}")
         require(plan["scalar_output_uses"] >= plan["scalar_output_values"] and
@@ -125,7 +139,8 @@ def tile_violations(report):
             if item["input_origin"]:
                 owner, number = item["input_origin"].rsplit("/input-op/", 1)
                 require(owner in sources and 0 <= int(number) < sources[owner], "invented input lineage")
-        require(row["growth_allocation"] == 512 + attempted * 1200 + len(accesses) * n * 192,
+        phase_cost = 64 * len(accesses) * (n + 2) if phases else 0
+        require(row["growth_allocation"] == 512 + attempted * 1200 + len(accesses) * n * 192 + phase_cost,
                 "cost estimate mismatch")
         require(row["growth_allocation"] <= 65536, "function cap exceeded")
         before, after = row["instructions_before"], row["instructions_after"]
@@ -159,5 +174,7 @@ def tile_summary(report):
             "decoded_vector_lanes": sum(r["plan"].get("decoded_vector_lanes", 0) for r in retained),
             "lifetime_owned_objects": sum(r["plan"].get("lifetime", {}).get("mode") == "single-entry" for r in retained),
             "translated_lifetime_markers": sum(r["plan"].get("lifetime", {}).get("translated_markers", 0) for r in retained),
+            "phase_objects": sum(r["plan"]["phase_mode"] != "static" for r in retained),
+            "phase_update_sites": sum(r["plan"].get("phase_contract", {}).get("static_update_sites", 0) for r in retained),
             "skip_reasons": dict(Counter(r["reason"] for r in rows if r["status"] == "skipped")),
             "final_surviving_semantic_coverage": None, "hardness_evaluated": False}

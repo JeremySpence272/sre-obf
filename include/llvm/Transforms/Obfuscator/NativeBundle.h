@@ -13,6 +13,7 @@ struct NativeBundleOptions {
   bool Pin = true;
   bool Loops = false, Phases = false;
   bool LoopBoundaries = false;
+  bool ObjectPhases = false;
 };
 // Stamp once, before fusion/merging; clones retain lineage, generated operations
 // without lineage remain explicitly unknown. This does not count clones as new

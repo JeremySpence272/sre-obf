@@ -1,6 +1,7 @@
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
 #include "llvm/Transforms/Obfuscator/NativePlan.h"
 #include "llvm/Transforms/Obfuscator/NativeTransfer.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleMath.h"
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
 #include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
@@ -452,6 +453,16 @@ class Encoder {
     if (auto *I = dyn_cast<Instruction>(V); I && I->getMetadata("sre.native.call.arg")) {
       AbsorbedParameters.insert(I);
       return convertFamily(B, Pair{I->getOperand(0), I->getOperand(1)}, false,
+                           Regions[RegionID].Affine);
+    }
+    if (auto *I = bundle::immutablePair(V)) {
+      bool Additive = I->getOpcode() == Instruction::Sub;
+      if (O.Plan) {
+        ThePlan.transfer(ThePlan.Regions[RegionID].Origin, plan::TransferKind::Storage,
+            representation(Additive), ThePlan.Regions[RegionID].Rep, plan::Verification::Algebraic);
+        ++ThePlan.Inventory.AbsorbedEdges;
+      }
+      return convertFamily(B, Pair{I->getOperand(0), I->getOperand(1)}, Additive,
                            Regions[RegionID].Affine);
     }
     ++Inputs;

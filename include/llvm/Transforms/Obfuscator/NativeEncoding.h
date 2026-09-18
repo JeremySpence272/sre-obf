@@ -17,6 +17,10 @@ Value *decodeNative(IRBuilder<> &B, Value *Encoded, Value *Key,
 // their legacy representation and the native report records that fallback.
 Value *materializeNative(IRBuilder<> &B, const APInt &Bits, Rng &Root,
                          StringRef Role, unsigned Site);
-json::Array encodeNativeData(Module &M, uint64_t Seed);
+json::Array encodeNativeData(Module &M, uint64_t Seed, bool Joint = false,
+                             bool Pin = true, unsigned GrowthBudget = 0);
+// Capture stage-local scalar-use edges after bundle consumers have imported
+// coordinates, before later scalar lowering can obscure that boundary count.
+json::Array nativeImmutableContinuity(Module &M, StringRef Stage, bool EraseDead);
 json::Object nativeEncodingInventory(Module &M);
 } // namespace llvm::obf

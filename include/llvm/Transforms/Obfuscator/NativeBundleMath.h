@@ -3,6 +3,24 @@
 #include "llvm/Transforms/Obfuscator/NativeTransfer.h"
 
 namespace llvm::obf::bundle {
+// Validated scalar fallback for an immutable read. Its two operands are the
+// actual encoded coordinates; importing them does not call a scalar accessor.
+inline BinaryOperator *immutablePair(Value *V) {
+  auto *I = dyn_cast<BinaryOperator>(V);
+  return I && I->getMetadata("sre.native.immutable.pair") &&
+         (I->getOpcode() == Instruction::Xor || I->getOpcode() == Instruction::Sub) ? I : nullptr;
+}
+inline transfer::Pair importPair(IRBuilder<> &B, Value *V, transfer::Family Family) {
+  if (auto *I = immutablePair(V)) {
+    transfer::Pair P{B.CreateFreeze(I->getOperand(0)), B.CreateFreeze(I->getOperand(1))};
+    if (I->getOpcode() == Instruction::Xor && Family == transfer::Family::Additive)
+      return transfer::toAdditive(B, P, P.R);
+    if (I->getOpcode() == Instruction::Sub && Family == transfer::Family::Xor)
+      return transfer::toXor(B, P, P.R);
+    return P;
+  }
+  return {B.CreateFreeze(V), ConstantInt::get(V->getType(), 0)};
+}
 inline bool operationSupported(const Instruction &I) {
   if (!I.getType()->isIntegerTy()) return false;
   unsigned W = I.getType()->getIntegerBitWidth();

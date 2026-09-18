@@ -266,8 +266,9 @@ automatically create one scalar decoder that becomes a reusable accessor.
 Prioritize numeric arrays and useful state alongside strings.
 
 Implementation status: the default-off [closed local tile prototype](NATIVE_OBJECT_BUNDLES_V1.md)
-is a first bounded increment only. It does not yet handle immutable backing,
-object phases, direct-call ownership propagation, or the wider layout/lifetime
+is a bounded increment only. It now has opt-in finite store phases and a separate
+[immutable numeric continuity path](NATIVE_IMMUTABLE_BUNDLES_V1.md), but does not
+yet handle direct-call ownership propagation or the wider layout/lifetime
 contracts below. W3 remains incomplete and is not promoted.
 It now preserves proved single-entry root lifetimes and supports exact constant
 byte offsets and decoded packed-read boundaries, including ordinary O2 C

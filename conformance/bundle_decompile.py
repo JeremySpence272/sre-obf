@@ -21,6 +21,7 @@ def main():
     workload = parser.add_mutually_exclusive_group()
     workload.add_argument("--loop", action="store_true", help="use a supported bundle_loop_run case and full two-output workload")
     workload.add_argument("--tile", action="store_true", help="use a supported tile_run case and all four output cells")
+    workload.add_argument("--immutable", action="store_true", help="four-output immutable_run case with matched off arms")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
     parser.add_argument("--ghidra-image", required=True)
@@ -31,19 +32,20 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out, args.case), timeout=180)
     result = {"schema": "sre-bundle-decompiler-v1", "passed": False, "scope": "informed-entry",
-              "workload": "tile" if args.tile else "loop" if args.loop else "straight-line",
+              "workload": "immutable" if args.immutable else "tile" if args.tile else "loop" if args.loop else "straight-line",
               "hardness_evaluated": False, "semantic_recovery": "not_measured", "arms": {}}
     try:
         driver = out / "driver.o"
-        driver_source = "tile_driver.c" if args.tile else "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
-        threaded = args.loop or args.tile
+        driver_source = "tile_driver.c" if args.tile or args.immutable else "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
+        threaded = args.loop or args.tile or args.immutable
         runner.run(["clang", "-O2", *(["-pthread"] if threaded else []), "-c",
                     str(FIXTURES / driver_source), "-o", str(driver)])
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}
-        if args.tile:
-            selected["tiles-off"] = args.case / (args.stem + "-disabled.ll")
-            selected["tiles-off-post-o2"] = args.case / (args.stem + "-disabled-post-o2.ll")
+        if args.tile or args.immutable:
+            name = "immutable" if args.immutable else "tiles"
+            selected[name + "-off"] = args.case / (args.stem + "-disabled.ll")
+            selected[name + "-off-post-o2"] = args.case / (args.stem + "-disabled-post-o2.ll")
         expected = None
         vectors = inputs(args.width, 1024)
         if args.loop:
