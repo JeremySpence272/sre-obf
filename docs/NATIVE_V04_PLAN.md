@@ -2,6 +2,8 @@
 
 Status: active implementation with bounded experimental increments; not complete
 or a claim of measured protection.
+The [current implementation and prepared-candidate ledger](NATIVE_V04_STATUS.md)
+distinguishes supported features from unmet empirical acceptance targets.
 Written 2026-09-17 against compiler `8054e9d`. This is the next implementation
 plan after [v03](NATIVE_V03_STATUS.md), expanding R1–R5 in the
 [native roadmap](STATIC_NATIVE_PLAN.md#8-follow-on-ir-roadmap-the-newer-ideas).
