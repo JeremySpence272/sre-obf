@@ -656,9 +656,10 @@ comparison. Large static libc must not hide application-level cost regressions.
 
 Implementation checkpoint: [experimental native bundles](NATIVE_BUNDLE_V1.md)
 documents the first descriptor-driven, bounded M2 emitter and its controls.
-The continuation adds a narrow single-block recurrence with encoded backedge
-rebasing and static/two-phase carrier controls. This is not completion of M0–M6;
-general loop/join, memory, predicate and private-call bundle integration and
+The continuation adds dominated-header recurrences with one to four encoded
+backedges, edge-specific tuple joins, static/two-phase carrier controls and an
+opt-in, explicitly accounted scalar projection mode. This is not completion of M0–M6;
+arbitrary cross-region joins, memory, predicate and private-call bundle integration and
 cost-matched recovery evaluation remain outstanding.
 
 Implement medium milestones with independently reviewable code and evidence.

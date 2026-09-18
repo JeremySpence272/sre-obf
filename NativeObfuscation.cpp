@@ -99,9 +99,11 @@ cl::opt<unsigned> NativeTransferNodes("native-transfer-nodes",
 cl::opt<bool> NativeBundlePins("native-bundle-pins",
     cl::desc("Pin whole tuples at entry/exit; off is the forwarding ablation"), cl::init(true));
 cl::opt<bool> NativeBundleLoops("native-bundle-loops",
-    cl::desc("Carry joint tuples through supported single-block recurrences"), cl::init(false));
+    cl::desc("Carry joint tuples through supported dominated-header recurrences"), cl::init(false));
 cl::opt<bool> NativeBundlePhases("native-bundle-phases",
     cl::desc("Rekey recurrence tuples with a two-phase activation carrier"), cl::init(false));
+cl::opt<bool> NativeBundleLoopBoundaries("native-bundle-loop-boundaries",
+    cl::desc("Allow and account for scalar header-input projections outside the bundle"), cl::init(false));
 
 void saveNativeStage(const Module &M, StringRef Stage) {
   if (NativeStageDir.empty()) return;
@@ -238,10 +240,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-bundles requires native-region-plan=connected");
   if (!NativeBundles && (NativeTransferFamily.getNumOccurrences() || NativeBundleValues.getNumOccurrences() ||
                          NativeTransferNodes.getNumOccurrences() || NativeBundlePins.getNumOccurrences() ||
-                         NativeBundleLoops.getNumOccurrences() || NativeBundlePhases.getNumOccurrences()))
+                         NativeBundleLoops.getNumOccurrences() || NativeBundlePhases.getNumOccurrences() ||
+                         NativeBundleLoopBoundaries.getNumOccurrences()))
     report_fatal_error("native bundle options require native-bundles");
   if (NativeBundlePhases && !NativeBundleLoops)
     report_fatal_error("native-bundle-phases requires native-bundle-loops");
+  if (NativeBundleLoopBoundaries && !NativeBundleLoops)
+    report_fatal_error("native-bundle-loop-boundaries requires native-bundle-loops");
   if ((NativePlan || NativeSemanticBudget) && NativeRegionPlan != "connected")
     report_fatal_error("native-plan and native-semantic-budget require native-region-plan=connected");
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
@@ -402,6 +407,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.Pin = NativeBundlePins;
     Options.Loops = NativeBundleLoops;
     Options.Phases = NativeBundlePhases;
+    Options.LoopBoundaries = NativeBundleLoopBoundaries;
     // One bounded share of remaining headroom. Connected/CFF/helper passes
     // allocate against the remaining module, never the pre-bundle total.
     Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
@@ -701,6 +707,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"bundle_pins", NativeBundlePins.getValue()},
                             {"bundle_loops", NativeBundleLoops.getValue()},
                             {"bundle_phases", NativeBundlePhases.getValue()},
+                            {"bundle_loop_boundaries", NativeBundleLoopBoundaries.getValue()},
                             {"semantic_budget", NativeSemanticBudget.getValue()},
                             {"memory_ssa", NativeMemorySSA.getValue()}, {"predicate_regions", NativePredicateRegions.getValue()},
                             {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},

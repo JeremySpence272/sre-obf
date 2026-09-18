@@ -2,6 +2,12 @@
 from conformance.bundle_model import Descriptor, OPCODES
 
 
+def loop_edges(loop):
+    if loop["status"] != "encoded": return []
+    if loop.get("contract") == "sre-bundle-loop-v2": return loop["backedges"]
+    return [{"id": 0, "next_input_slots": loop["next_input_slots"]}]
+
+
 def bundle_summary(report):
     """Stage-local work and unique input ancestry, never whole-program protection."""
     if not report.get("features", {}).get("bundles"):
@@ -22,9 +28,13 @@ def bundle_summary(report):
             "retained_steps_without_input_ancestry": sum(s["input_origin"] is None for s in steps),
             "rolled_back_step_instances": sum(r.get("rolled_back_operations", 0) for r in rows),
             "reserved_growth": sum(r["growth_allocation"] for r in rows),
-            "persistent_backedges": len(loops),
+            "persistent_loop_regions": len(loops),
+            "persistent_backedges": sum(len(loop_edges(loop)) for loop in loops),
+            "multi_backedge_joins": sum(len(loop_edges(loop)) > 1 for loop in loops),
             "encoded_recurrence_uses": sum(loop["backedge_uses"] for loop in loops),
-            "two_phase_backedges": sum(loop["phase_mode"] == "two-phase" for loop in loops),
+            "two_phase_backedges": sum(len(loop_edges(loop)) for loop in loops if loop["phase_mode"] == "two-phase"),
+            "scalar_header_input_uses": sum(loop["scalar_input_uses"] for loop in loops),
+            "loop_regions_with_scalar_projections": sum(loop["scalar_input_uses"] > 0 for loop in loops),
             "actual_growth": sum(max(0, r["instructions_after"] - r["instructions_before"]) for r in rows),
             "final_surviving_semantic_coverage": None,
             "scope": "pre-bundle operation instances and deduplicated input-IR ancestry; "
@@ -127,29 +137,56 @@ def loop_violations(region, row, features, name):
     loop = region.get("loop")
     enabled = features.get("bundle_loops", False)
     phases = features.get("bundle_phases", False)
+    boundaries = features.get("bundle_loop_boundaries", False)
     errors = []
     if phases and not enabled:
         errors.append(f"{name}: phases enabled without loops")
+    if boundaries and not enabled:
+        errors.append(f"{name}: scalar loop boundaries enabled without loops")
     if loop is None:
         return errors + ([f"{name}: missing recurrence report"] if enabled else [])
-    if row.get("loops", False) != enabled or row.get("phases", False) != phases:
+    if (row.get("loops", False) != enabled or row.get("phases", False) != phases or
+            row.get("loop_boundaries", False) != boundaries):
         errors.append(f"{name}: recurrence options disagree with feature report")
+    contract = loop.get("contract")
+    if contract not in (None, "sre-bundle-loop-v2"):
+        return errors + [f"{name}: unknown loop contract"]
+    if contract and loop.get("graph_scope") != "dominated-header-recurrence":
+        errors.append(f"{name}: unknown loop ownership scope")
     if loop["status"] == "encoded":
-        mapping = loop["next_input_slots"]
+        edges = loop_edges(loop)
+        mappings = [edge["next_input_slots"] for edge in edges]
         if (not enabled or loop["reason"] or loop["law"] != "triangular-recurrence-rebase-v1" or
-                len(mapping) != region["inputs"] or loop["backedge_uses"] != len(mapping) or
-                any(k not in region["output_slots"] for k in mapping) or loop["scalar_input_uses"] != 0):
+                not 1 <= len(edges) <= 4 or loop["backedge_uses"] != region["inputs"] * len(edges) or
+                any(len(mapping) != region["inputs"] or any(k not in region["output_slots"] for k in mapping)
+                    for mapping in mappings)):
             errors.append(f"{name}: invalid persistent recurrence contract")
+        if contract:
+            if ([e["id"] for e in edges] != list(range(len(edges))) or
+                    len({e["predecessor_block"] for e in edges}) != len(edges) or
+                    any(type(e["predecessor_block"]) is not int or e["predecessor_block"] < 0 for e in edges) or
+                    loop["next_input_slots"] != (mappings[0] if len(edges) == 1 else [])):
+                errors.append(f"{name}: ambiguous backedge ownership")
+            slots, uses = loop["scalar_input_slots"], loop["scalar_input_uses"]
+            if (len(set(slots)) != len(slots) or any(type(k) is not int or not 0 <= k < region["inputs"] for k in slots) or
+                    type(uses) is not int or uses < len(slots) or bool(uses) != bool(slots) or
+                    (uses and not boundaries)):
+                errors.append(f"{name}: scalar projection exposure is not accounted")
+        elif loop["scalar_input_uses"]:
+            errors.append(f"{name}: legacy loop contract cannot expose scalar inputs")
         if (loop["phase_mode"] != ("two-phase" if phases else "static") or
                 loop["phase_count"] != (2 if phases else 1) or loop["initial_phase"] != 0):
             errors.append(f"{name}: finite phase graph disagrees with lowering options")
     elif loop["status"] == "straight-line":
         reasons = {"disabled", "not-single-block-self-loop", "requires-unconditional-preheader",
                    "input-is-not-header-recurrence", "recurrence-has-external-users",
-                   "backedge-is-not-region-output"}
+                   "backedge-is-not-region-output", "not-natural-loop-header", "duplicate-header-edges",
+                   "unsupported-backedge-terminator", "backedge-count-limit",
+                   "unreachable-header-predecessor"}
         if (loop["next_input_slots"] or loop["backedge_uses"] or not loop["reason"] or
                 loop["phase_mode"] != "static" or loop["phase_count"] != 1 or
                 loop["initial_phase"] != 0 or loop["scalar_input_uses"] != 0 or
+                loop.get("backedges") or loop.get("scalar_input_slots") or
                 loop["reason"] not in reasons or (loop["reason"] == "disabled") == enabled):
             errors.append(f"{name}: fallback claims persistent state")
     else:

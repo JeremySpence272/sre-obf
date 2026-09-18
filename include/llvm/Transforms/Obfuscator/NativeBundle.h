@@ -12,6 +12,7 @@ struct NativeBundleOptions {
   unsigned Values = 4, Nodes = 16, GrowthBudget = 0;
   bool Pin = true;
   bool Loops = false, Phases = false;
+  bool LoopBoundaries = false;
 };
 // Stamp once, before fusion/merging; clones retain lineage, generated operations
 // without lineage remain explicitly unknown. This does not count clones as new

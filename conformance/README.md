@@ -285,6 +285,14 @@ reentry, concurrent calls and post-O2 checks are always part of the loop fixture
 `bundle_decompile --loop` exports matched stripped informed-entry controls;
 successful export does not establish semantic recovery or protection strength.
 
+The v2 loop contract adds dominated multi-block/multi-backedge header joins and
+edge-specific input mappings. `--bundle-loop-boundaries` explicitly permits and
+accounts for scalar header projections; it is off by default and requires loops.
+`test_bundle_joins` checks path choices, exposure accounting and negative reports.
+The loop compiler runner includes earlier-region binding replacement, outside
+PHI uses, actual early exits and negative CFG shapes; these are still correctness
+and coverage controls, not demonstrated resistance to semantic recovery.
+
 Corpus-lock revision `m0-3` freezes bzip2/cJSON IO manifests under ignored
 `out/v04-frozen-holdouts-20260918/`. Existing seeds and resource caps are unchanged.
 Only unobfuscated reference programs were built during preparation; their

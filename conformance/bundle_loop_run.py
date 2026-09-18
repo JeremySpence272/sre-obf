@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 import random
+import re
 import shutil
 
 from conformance.bundle_model import replay_loop
@@ -17,9 +18,16 @@ from conformance.run import ROOT, FIXTURES, opt_command
 FALLBACKS = {
     "external-user": "recurrence-has-external-users",
     "guarded-preheader": "requires-unconditional-preheader",
-    "multi-exit": "not-single-block-self-loop",
     "constant-backedge": "backedge-is-not-region-output",
+    "phi-user": "recurrence-has-external-users",
+    "earlier-region": "recurrence-has-external-users",
+    "duplicate-edges": "duplicate-header-edges",
+    "switch-backedge": "unsupported-backedge-terminator",
+    "five-backedges": "backedge-count-limit",
+    "unreachable-edge": "unreachable-header-predecessor",
 }
+SHAPES = ("supported", "multi-exit", "multi-latch", *FALLBACKS)
+EXPOSED = ("external-user", "phi-user", "earlier-region")
 
 
 def fixture(width, shape="supported"):
@@ -35,11 +43,46 @@ def fixture(width, shape="supported"):
         source = source.replace("[ %b5, %loop ]", "[ %b5, %latch ]", 1)
         source = source.replace("[ %a5, %loop ]", "[ %a5, %latch ]", 1)
         source = source.replace("[ %next, %loop ]", "[ %next, %latch ]", 1)
-        source = source.replace("  br i1 %again, label %loop, label %exit", "  %early = icmp eq iWIDTH %b5, 0\n  br i1 %early, label %exit, label %latch\nlatch:\n  br i1 %again, label %loop, label %exit")
+        source = source.replace("  br i1 %again, label %loop, label %exit", "  %early_bits = and iWIDTH %b5, 7\n  %early = icmp eq iWIDTH %early_bits, 0\n  br i1 %early, label %exit, label %latch\nlatch:\n  br i1 %again, label %loop, label %exit")
         source = source.replace("[ %result0, %loop ]", "[ %result0, %loop ], [ %result0, %latch ]")
         source = source.replace("[ %b5, %loop ]", "[ %b5, %loop ], [ %b5, %latch ]")
     elif shape == "constant-backedge":
         source = source.replace("[ %b5, %loop ]", "[ 7, %loop ]", 1)
+    elif shape == "phi-user":
+        source = source.replace("[ %result0, %loop ]", "[ %x, %loop ]")
+    elif shape == "earlier-region":
+        body = "  %a0 =" + source.split("  %a0 =", 1)[1].split("  %result0 =", 1)[0]
+        earlier = re.sub(r"%([ab][0-5])", r"%p_\1", body).replace(", 91", ", 37")
+        source = source.replace("  %a0 =", earlier + "  %a0 =", 1)
+        source = source.replace("  br i1 %again", "  %mixed0 = xor iWIDTH %result0, %p_a5\n  %mixed1 = xor iWIDTH %b5, %p_b5\n  br i1 %again")
+        source = source.replace("[ %result0, %loop ]", "[ %mixed0, %loop ]")
+        source = source.replace("  %out1 = phi iWIDTH [ %b, %entry ], [ %b5, %loop ]", "  %out1 = phi iWIDTH [ %b, %entry ], [ %mixed1, %loop ]")
+    elif shape in ("multi-latch", "five-backedges"):
+        count = 2 if shape == "multi-latch" else 5
+        for value in ("b5", "a5", "next"):
+            incoming = []
+            for k in range(count):
+                mapped = ({"b5": "a5", "a5": "b5"}.get(value, value)
+                          if shape == "multi-latch" and k == 1 else value)
+                incoming.append(f"[ %{mapped}, %latch{k} ]")
+            source = source.replace(f"[ %{value}, %loop ]", ", ".join(incoming), 1)
+        if count == 2:
+            choice = "  %bit = and iWIDTH %b5, 1\n  %pick = icmp ne iWIDTH %bit, 0\n  br i1 %pick, label %latch0, label %latch1\n"
+        else:
+            cases = " ".join(f"i32 {k}, label %latch{k}" for k in range(1, count))
+            choice = f"  %choice = urem i32 %next, 5\n  switch i32 %choice, label %latch0 [ {cases} ]\n"
+        latches = "".join(f"latch{k}:\n  br label %loop\n" for k in range(count))
+        source = source.replace("  br i1 %again, label %loop, label %exit", "  br i1 %again, label %fork, label %exit\nfork:\n" + choice + latches.rstrip())
+    elif shape == "duplicate-edges":
+        for value in ("b5", "a5", "next"):
+            source = source.replace(f"[ %{value}, %loop ]", f"[ %{value}, %loop ], [ %{value}, %loop ]", 1)
+        source = source.replace("  br i1 %again, label %loop, label %exit", "  switch i32 %next, label %exit [ i32 1, label %loop i32 2, label %loop ]")
+    elif shape == "switch-backedge":
+        source = source.replace("  br i1 %again, label %loop, label %exit", "  switch i1 %again, label %exit [ i1 true, label %loop ]")
+    elif shape == "unreachable-edge":
+        for value in ("b5", "a5", "next"):
+            source = source.replace(f"[ %{value}, %loop ]", f"[ %{value}, %loop ], [ %{value}, %dead ]", 1)
+        source = source.replace("exit:\n", "dead:\n  br label %loop\nexit:\n")
     elif shape != "supported":
         raise ValueError("unknown shape")
     source = source.replace("WIDTH", str(width))
@@ -54,14 +97,17 @@ def fixture(width, shape="supported"):
             f"  store i64 {a}, ptr %out0\n  store i64 {b}, ptr %out1\n  ret void\n}}\n")
 
 
-def scalar_loop(a, b, count, width):
-    """Independent source oracle, including signed shift and swapped backedge."""
+def scalar_trace(a, b, count, width, shape="supported"):
+    """Independent source and edge oracle, not derived from the compiler plan."""
     mask = (1 << width) - 1
     a, b = a & mask, b & mask
     out = a, b
-    for _ in range(count):
+    raw, edges = out, []
+    if shape == "guarded-preheader" and count >= 4096: count = 0
+    if shape == "duplicate-edges" and count: count = 3
+    def step(a, b, salt=91):
         a0 = (a + b) & mask
-        b0 = b ^ 91
+        b0 = b ^ salt
         a1 = (a0 * 13) & mask
         b1 = (b0 - a0) & mask
         a2, b2 = a1 >> 3, (b1 << 2) & mask
@@ -69,9 +115,25 @@ def scalar_loop(a, b, count, width):
         a4, b4 = (a3 + b3) & mask, b3 & 127
         signed = a4 - ((1 << width) if a4 >> (width - 1) else 0)
         a5, b5 = (signed >> 1) & mask, b4 ^ a4
-        out = a5, b5
-        a, b = b5, a5
-    return out
+        return a5, b5
+    for _ in range(count):
+        a5, b5 = raw = step(a, b)
+        out = raw
+        if shape == "external-user": out = (a5 if a == 0 else b5), b5
+        elif shape == "phi-user": out = a, b5
+        elif shape == "earlier-region":
+            p, q = step(a, b, 37)
+            out = a5 ^ p, b5 ^ q
+        edge = int(not (b5 & 1)) if shape == "multi-latch" else 0
+        edges.append(edge)
+        if shape == "multi-exit" and (b5 & 7) == 0: break
+        a, b = (a5, b5) if edge else (b5, a5)
+        if shape == "constant-backedge": a = 7
+    return out, raw, edges
+
+
+def scalar_loop(a, b, count, width):
+    return scalar_trace(a, b, count, width)[0]
 
 
 def vectors(width, exhaustive=False):
@@ -93,7 +155,8 @@ def main():
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 3, 4])
     parser.add_argument("--families", nargs="+", choices=("xor", "additive", "seeded"), default=["xor", "additive"])
     parser.add_argument("--pins", type=int, nargs="+", choices=(0, 1), default=[0, 1])
-    parser.add_argument("--shapes", nargs="+", choices=("supported", *FALLBACKS), default=["supported", *FALLBACKS])
+    parser.add_argument("--shapes", nargs="+", choices=SHAPES, default=list(SHAPES))
+    parser.add_argument("--bundle-loop-boundaries", action="store_true")
     parser.add_argument("--exhaustive-byte-pairs", action="store_true")
     args = parser.parse_args()
     out = args.out.resolve()
@@ -103,13 +166,15 @@ def main():
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out,), timeout=180)
     summary = {"schema": "sre-bundle-loop-conformance-v1", "passed": False, "complete": False,
                "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False,
-               "exhaustive_byte_pairs_trip_count": 2 if args.exhaustive_byte_pairs else None}
+               "scalar_input_boundaries": args.bundle_loop_boundaries,
+               "exhaustive_byte_pairs_requested_trip_count": 2 if args.exhaustive_byte_pairs else None}
     flags = ["-passes=native-obfuscation", "-native-level=smoke", "-native-passes=constenc",
              "-native-strings=0", "-native-data=0", "-native-helper-hardening=0",
              "-native-late-constants=0", "-native-merge=0", "-native-values=1", "-native-values-wide=1",
              "-native-region-plan=connected", "-native-connected-nodes=2", "-native-functions=kernel",
              "-native-plan=1", "-native-scale-budget=1", "-native-bundles=1", "-native-transfer-nodes=12",
-             "-native-bundle-loops=1", "-obf-deterministic", "-obf-verify"]
+             "-native-bundle-loops=1", f"-native-bundle-loop-boundaries={int(args.bundle_loop_boundaries)}",
+             "-obf-deterministic", "-obf-verify"]
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "bundle_loop_driver.c"), "-o", str(driver)])
@@ -124,9 +189,8 @@ def main():
                 binary = case / "clean.bin"
                 runner.run(["clang", "-pthread", str(clean), str(driver), "-o", str(binary)])
                 expected = runner.run([str(binary)], stdin=stdin)
-                if shape == "supported":
-                    oracle = "".join("%d %d\n" % scalar_loop(a, b, n, width) for a, b, n in values).encode()
-                    if expected != oracle: raise ToolFailure("clean compiler differs from independent source oracle")
+                oracle = "".join("%d %d\n" % scalar_trace(a, b, n, width, shape)[0] for a, b, n in values).encode()
+                if expected != oracle: raise ToolFailure("clean compiler differs from independent source oracle")
                 for family in args.families:
                     for seed in args.seeds:
                         for pins in args.pins:
@@ -142,13 +206,20 @@ def main():
                                 errors = report_violations(data)
                                 if errors: raise ToolFailure("; ".join(errors))
                                 row = next(r for r in data["bundles"] if r["function"] == "kernel")
-                                if row["retained_operations"] != 12: raise ToolFailure("expected twelve retained recurrence operations")
-                                region = row["regions"][0]
+                                if row["retained_operations"] != (24 if shape == "earlier-region" else 12):
+                                    raise ToolFailure("unexpected retained recurrence operations")
+                                region = row["regions"][-1]
                                 loop = region["loop"]
-                                if shape == "supported":
+                                encoded = shape not in FALLBACKS or (shape in EXPOSED and args.bundle_loop_boundaries)
+                                if encoded:
                                     if loop["status"] != "encoded": raise ToolFailure("recurrence fell back: " + loop["reason"])
+                                    if len(loop["backedges"]) != (2 if shape == "multi-latch" else 1):
+                                        raise ToolFailure("missing edge-specific tuple join")
+                                    if bool(loop["scalar_input_uses"]) != (shape in EXPOSED):
+                                        raise ToolFailure("scalar projection exposure was not reported")
                                     for a, b, n in values[:28]:
-                                        if replay_loop(region, [a, b], n) != scalar_loop(a, b, n, width):
+                                        _, raw, edges = scalar_trace(a, b, n, width, shape)
+                                        if replay_loop(region, [a, b], len(edges), edges) != raw:
                                             raise ToolFailure("plan replay differs from independent loop oracle")
                                 elif loop["status"] != "straight-line" or loop["reason"] != FALLBACKS[shape]:
                                     raise ToolFailure("unsupported shape lacks exact fallback reason")

@@ -9,6 +9,7 @@ def add_options(parser):
     parser.add_argument("--no-bundle-pins", action="store_true")
     parser.add_argument("--bundle-loops", action="store_true")
     parser.add_argument("--bundle-phases", action="store_true")
+    parser.add_argument("--bundle-loop-boundaries", action="store_true")
 
 
 def validate(args, connected):
@@ -16,11 +17,13 @@ def validate(args, connected):
     choices = any(getattr(args, key, None) is not None
                   for key in ("transfer_family", "bundle_values", "transfer_nodes"))
     switches = any(getattr(args, key, False) for key in
-                   ("no_bundle_pins", "bundle_loops", "bundle_phases"))
+                   ("no_bundle_pins", "bundle_loops", "bundle_phases", "bundle_loop_boundaries"))
     if not enabled and (choices or switches):
         raise ValueError("bundle options require --bundles")
     if getattr(args, "bundle_phases", False) and not getattr(args, "bundle_loops", False):
         raise ValueError("--bundle-phases requires --bundle-loops")
+    if getattr(args, "bundle_loop_boundaries", False) and not getattr(args, "bundle_loops", False):
+        raise ValueError("--bundle-loop-boundaries requires --bundle-loops")
     if enabled and not connected:
         raise ValueError("--bundles requires the connected planner")
 
@@ -32,7 +35,8 @@ def flags(args):
             f"-native-bundle-values={getattr(args, 'bundle_values', None) or 4}",
             f"-native-transfer-nodes={getattr(args, 'transfer_nodes', None) or 16}",
             f"-native-bundle-pins={int(not getattr(args, 'no_bundle_pins', False))}"] + [
-            "-native-" + key.replace("_", "-") + "=1" for key in ("bundle_loops", "bundle_phases")
+            "-native-" + key.replace("_", "-") + "=1"
+            for key in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries")
             if getattr(args, key, False)]
 
 
@@ -43,6 +47,6 @@ def argv(args):
         if getattr(args, name, None) is not None:
             out += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     if getattr(args, "no_bundle_pins", False): out.append("--no-bundle-pins")
-    for name in ("bundle_loops", "bundle_phases"):
+    for name in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries"):
         if getattr(args, name, False): out.append("--" + name.replace("_", "-"))
     return out

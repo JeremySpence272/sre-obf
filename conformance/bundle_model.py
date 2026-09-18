@@ -172,10 +172,10 @@ def replay(region, inputs):
     return tuple(values[k] for k in region["output_slots"])
 
 
-def replay_loop(region, inputs, iterations):
+def replay_loop(region, inputs, iterations, edge_choices=None):
     """Informed recurrence control: every transfer/rebase vs scalar semantics.
 
-    Iteration count is supplied, not inferred from a branch. Zero returns entry
+    Iteration count and edge choices are supplied, not inferred from branches. Zero returns entry
     inputs; positive counts return all scheduled outputs of the last iteration.
     """
     if region["loop"]["status"] != "encoded" or iterations < 0:
@@ -189,7 +189,13 @@ def replay_loop(region, inputs, iterations):
                (inputs[1] ^ d.salts[0])) & d.bits
     state, phase = d.encode(values, carrier), 0
     result = tuple(inputs)
-    for _ in range(iterations):
+    edges = region["loop"].get("backedges", [{"next_input_slots": region["loop"]["next_input_slots"]}])
+    if edge_choices is None:
+        if len(edges) != 1 and iterations: raise ValueError("multi-backedge replay needs explicit choices")
+        edge_choices = [0] * iterations
+    if len(edge_choices) != iterations or any(type(e) is not int or not 0 <= e < len(edges) for e in edge_choices):
+        raise ValueError("invalid supplied backedge choices")
+    for edge in edge_choices:
         for step in region["steps"]:
             def read(op):
                 return int(op["constant_hex"], 16) & d.bits if "constant_hex" in op else values[op["slot"]]
@@ -198,7 +204,7 @@ def replay_loop(region, inputs, iterations):
             if d.decode(state, carrier) != tuple(values):
                 raise AssertionError("recurrence transfer differs from scalar semantics")
         result = tuple(values[k] for k in region["output_slots"])
-        mapping = region["loop"]["next_input_slots"]
+        mapping = edges[edge]["next_input_slots"]
         new_carrier = carrier
         if region["loop"]["phase_mode"] == "two-phase":
             new_carrier = d.next_carrier(state, carrier, phase)

@@ -9,6 +9,8 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/IR/Verifier.h"
 #include <algorithm>
 
@@ -59,6 +61,10 @@ struct Step {
   Operand X, Y;
   std::string Origin;
 };
+struct Backedge {
+  unsigned Block = 0;
+  SmallVector<unsigned, 4> Slots;
+};
 struct Program {
   unsigned ID = 0, Width = 0, Lanes = 0, EstimatedCost = 0;
   plan::Representation Rep;
@@ -66,9 +72,9 @@ struct Program {
   SmallVector<unsigned, 4> OutputSlots;
   SmallVector<uint64_t, 4> Salts;
   SmallVector<unsigned, 4> Rotations;
-  // Canonical next-iteration input slots, expressed in the completed schedule.
-  // Empty means an ordinary straight-line region, including explicit fallback.
-  SmallVector<unsigned, 4> NextSlots;
+  // Each edge maps completed output slots to canonical header input slots.
+  SmallVector<Backedge, 4> Backedges;
+  SmallVector<unsigned, 4> ScalarInputs;
   bool Phases = false;
   Family coordinates() const {
     switch (Rep.Fam) {
@@ -81,50 +87,85 @@ struct Program {
 struct Binding {
   Program P;
   SmallVector<Instruction *, 32> Nodes, Outputs;
-  SmallVector<Value *, 4> Inputs;
-  unsigned BoundaryUses = 0;
+  // Header scalar projections may replace a PHI before another region lowers.
+  // Follow RAUW even when block order differs from dominance order.
+  SmallVector<WeakTrackingVH, 4> Inputs;
+  unsigned BoundaryUses = 0, InputBoundaryUses = 0;
   BasicBlock *Preheader = nullptr;
+  SmallVector<BasicBlock *, 4> Latches;
   SmallVector<PHINode *, 4> Recurrences;
   std::string LoopReason = "disabled";
 };
 
-void planLoop(Binding &B, const NativeBundleOptions &O) {
+void planLoop(Binding &B, const NativeBundleOptions &O, const DominatorTree &DT) {
   if (!O.Loops) return;
-  B.LoopReason = "not-single-block-self-loop";
+  B.LoopReason = "not-natural-loop-header";
   BasicBlock *Header = B.Nodes.front()->getParent();
-  auto *Br = dyn_cast<BranchInst>(Header->getTerminator());
-  if (!Br || !Br->isConditional() ||
-      (Br->getSuccessor(0) == Header) == (Br->getSuccessor(1) == Header)) return;
-  B.LoopReason = "requires-unconditional-preheader";
+  if (!DT.isReachableFromEntry(Header)) return;
   SmallVector<BasicBlock *, 4> Preds(predecessors(Header));
-  if (Preds.size() != 2) return;
-  BasicBlock *Pre = Preds[0] == Header ? Preds[1] : Preds[0];
+  SmallPtrSet<BasicBlock *, 8> Unique(Preds.begin(), Preds.end());
+  B.LoopReason = "duplicate-header-edges";
+  if (Unique.size() != Preds.size()) return;
+  B.LoopReason = "unreachable-header-predecessor";
+  if (llvm::any_of(Preds, [&](BasicBlock *BB) { return !DT.isReachableFromEntry(BB); })) return;
+  BasicBlock *Pre = nullptr;
+  SmallVector<BasicBlock *, 4> Latches;
+  SmallVector<Backedge, 4> Edges;
+  // Function order, not use-list order, gives the edge IDs a stable meaning.
+  unsigned Block = 0;
+  for (BasicBlock &BB : *Header->getParent()) {
+    unsigned ID = Block++;
+    if (!Unique.contains(&BB)) continue;
+    if (DT.dominates(Header, &BB)) {
+      B.LoopReason = "unsupported-backedge-terminator";
+      if (!isa<BranchInst>(BB.getTerminator())) return;
+      Latches.push_back(&BB); Edges.push_back({ID, {}});
+    } else {
+      B.LoopReason = "requires-unconditional-preheader";
+      if (Pre) return;
+      Pre = &BB;
+    }
+  }
+  B.LoopReason = "not-natural-loop-header";
+  if (Latches.empty()) return;
+  B.LoopReason = "backedge-count-limit";
+  if (Latches.size() > 4) return;
+  B.LoopReason = "requires-unconditional-preheader";
+  if (!Pre) return;
   auto *Entry = dyn_cast<BranchInst>(Pre->getTerminator());
   if (!Entry || !Entry->isUnconditional() || Entry->getSuccessor(0) != Header) return;
   SmallPtrSet<Instruction *, 32> Members(B.Nodes.begin(), B.Nodes.end());
   SmallVector<PHINode *, 4> Phis;
-  SmallVector<unsigned, 4> Next;
+  SmallVector<unsigned, 4> ScalarInputs;
+  unsigned ScalarUses = 0;
   for (Value *V : B.Inputs) {
     B.LoopReason = "input-is-not-header-recurrence";
     auto *Phi = dyn_cast<PHINode>(V);
-    if (!Phi || Phi->getParent() != Header || Phi->getNumIncomingValues() != 2) return;
-    // This first contract never reconstructs a header scalar for other users.
-    // It also prevents dangling cross-region input bindings when PHIs go away.
+    if (!Phi || Phi->getParent() != Header || Phi->getNumIncomingValues() != Preds.size()) return;
     B.LoopReason = "recurrence-has-external-users";
+    unsigned Uses = 0;
     for (User *U : Phi->users())
-      if (!Members.contains(dyn_cast<Instruction>(U))) return;
+      Uses += !Members.contains(dyn_cast<Instruction>(U));
+    if (Uses && !O.LoopBoundaries) return;
+    if (Uses) ScalarInputs.push_back(Phis.size());
+    ScalarUses += Uses;
     B.LoopReason = "backedge-is-not-region-output";
-    auto It = llvm::find(B.Outputs, Phi->getIncomingValueForBlock(Header));
-    if (It == B.Outputs.end()) return;
+    for (unsigned E = 0; E < Latches.size(); ++E) {
+      auto It = llvm::find(B.Outputs, Phi->getIncomingValueForBlock(Latches[E]));
+      if (It == B.Outputs.end()) return;
+      Edges[E].Slots.push_back(B.P.OutputSlots[It - B.Outputs.begin()]);
+    }
     Phis.push_back(Phi);
-    Next.push_back(B.P.OutputSlots[It - B.Outputs.begin()]);
   }
   B.Preheader = Pre;
   B.Recurrences = std::move(Phis);
-  B.P.NextSlots = std::move(Next);
+  B.Latches = std::move(Latches);
+  B.P.Backedges = std::move(Edges);
+  B.P.ScalarInputs = std::move(ScalarInputs);
+  B.InputBoundaryUses = ScalarUses;
   B.P.Phases = O.Phases;
-  B.BoundaryUses -= B.Recurrences.size(); // These uses are now encoded edges.
-  B.P.EstimatedCost += 2048; // Entry, PHIs, phase law and whole-tuple rebase.
+  B.BoundaryUses -= B.Recurrences.size() * B.Latches.size();
+  B.P.EstimatedCost += 2048 * B.Latches.size() + 64 * B.P.ScalarInputs.size();
   B.LoopReason.clear();
 }
 
@@ -215,11 +256,14 @@ bool valid(const Binding &B) {
   }
   for (unsigned K : P.OutputSlots) if (K >= P.Lanes) return false;
   for (unsigned R : P.Rotations) if (!R || R >= P.Width) return false;
-  if (!P.NextSlots.empty()) {
+  if (!P.Backedges.empty()) {
     if (!B.Preheader || B.Recurrences.size() != B.Inputs.size() ||
-        P.NextSlots.size() != B.Inputs.size()) return false;
-    for (unsigned K : P.NextSlots)
-      if (!llvm::is_contained(P.OutputSlots, K)) return false;
+        P.Backedges.size() != B.Latches.size() || P.Backedges.size() > 4) return false;
+    for (const Backedge &E : P.Backedges) {
+      if (E.Slots.size() != B.Inputs.size()) return false;
+      for (unsigned K : E.Slots) if (!llvm::is_contained(P.OutputSlots, K)) return false;
+    }
+    for (unsigned K : P.ScalarInputs) if (K >= B.Inputs.size()) return false;
   }
   return true;
 }
@@ -297,7 +341,7 @@ class Lowering {
     markRange(Prev, Term);
     BasicBlock *Header = Bound.Nodes.front()->getParent();
     auto phi = [&](Value *Initial, StringRef Name) {
-      auto *Phi = PHINode::Create(B.getIntNTy(P.Width), 2, Name, Header->begin());
+      auto *Phi = PHINode::Create(B.getIntNTy(P.Width), Bound.Latches.size() + 1, Name, Header->begin());
       Phi->addIncoming(Initial, Bound.Preheader);
       Phi->setMetadata(BundleTag, Tag);
       return Phi;
@@ -308,18 +352,34 @@ class Lowering {
     }
     CarrierPhi = phi(M, "sre.bundle.loop.carrier"); M = CarrierPhi;
     if (P.Phases) PhasePhi = phi(c(0), "sre.bundle.loop.phase");
+    if (!P.ScalarInputs.empty()) {
+      // Header placement dominates ordinary users and the incoming edge of
+      // outside PHI users. These plaintext projections are deliberately exposed
+      // in the plan, not counted as entirely encoded input lifetimes.
+      Instruction *End = &*Header->getFirstInsertionPt(), *Before = End->getPrevNode();
+      B.SetInsertPoint(End);
+      for (unsigned K : P.ScalarInputs) {
+        Value *R = mask(Z, K);
+        Value *X = P.coordinates() == Family::Xor ? B.CreateXor(Z[K], R, "sre.bundle.loop.input")
+                                                 : B.CreateSub(Z[K], R, "sre.bundle.loop.input");
+        cast<Instruction>(X)->setMetadata("sre.native.boundary", MDNode::get(F.getContext(),
+            MDString::get(F.getContext(), "bundle-loop-input")));
+        Bound.Recurrences[K]->replaceAllUsesWith(X);
+      }
+      markRange(Before, End);
+    }
     B.SetInsertPoint(Bound.Nodes.front());
   }
-  void backedge(const Binding &Bound) {
+  void backedge(const Binding &Bound, unsigned Edge) {
     // Capture source pairs BEFORE replacing the carrier or predecessor slots.
     SmallVector<Pair, 4> Old;
-    for (unsigned K : P.NextSlots) Old.push_back({Z[K], mask(Z, K)});
+    for (unsigned K : P.Backedges[Edge].Slots) Old.push_back({Z[K], mask(Z, K)});
     if (P.Phases) {
       Value *NextPhase = B.CreateXor(PhasePhi, c(1));
       Value *History = B.CreateAdd(rotate(B.CreateXor(M, Z.back()), P.Rotations.back()),
                                   B.CreateXor(Z.front(), c(P.Salts.back())));
       M = B.CreateXor(History, B.CreateMul(NextPhase, c(P.Salts[0] | 1)));
-      PhasePhi->addIncoming(NextPhase, Bound.Nodes.front()->getParent());
+      PhasePhi->addIncoming(NextPhase, Bound.Latches[Edge]);
     }
     // Reorder/rekey directly in encoded coordinates, with no reconstructed
     // recurrence scalar. Unused logical slots reset to zero, not fake entropy.
@@ -329,9 +389,8 @@ class Lowering {
       Z.push_back(transfer::remask(B, V, P.coordinates(), mask(Z, K)));
     }
     pin();
-    BasicBlock *Header = Bound.Nodes.front()->getParent();
-    for (unsigned K = 0; K < P.Lanes; ++K) StatePhis[K]->addIncoming(Z[K], Header);
-    CarrierPhi->addIncoming(M, Header);
+    for (unsigned K = 0; K < P.Lanes; ++K) StatePhis[K]->addIncoming(Z[K], Bound.Latches[Edge]);
+    CarrierPhi->addIncoming(M, Bound.Latches[Edge]);
   }
 public:
   Lowering(Function &F, const Binding &Bound, bool Pin)
@@ -340,7 +399,11 @@ public:
             plan::originId(F.getName(), "native-bundle", P.ID)))), Pin(Pin) {}
   void run(const Binding &Bound) {
     Instruction *First = Bound.Nodes.front(), *Prev = First->getPrevNode();
-    if (Bound.Preheader) enterLoop(Bound); else enter(Bound.Inputs);
+    if (Bound.Preheader) enterLoop(Bound);
+    else {
+      SmallVector<Value *, 4> Inputs(Bound.Inputs.begin(), Bound.Inputs.end());
+      enter(Inputs);
+    }
     for (const Step &S : P.Steps) {
       Pair X = read(S.X), Y = read(S.Y), Out = X;
       Value *Fresh = B.CreateXor(M, Z.back());
@@ -373,7 +436,21 @@ public:
         I->setMetadata("sre.native.boundary", MDNode::get(F.getContext(), MDString::get(F.getContext(), "bundle-exit")));
       Outputs.push_back(X);
     }
-    if (Bound.Preheader) backedge(Bound);
+    if (Bound.Preheader) {
+      SmallVector<Value *, 4> Completed = Z;
+      Value *Carrier = M;
+      for (unsigned E = 0; E < Bound.Latches.size(); ++E) {
+        // Every edge starts from the SAME completed region, never from the
+        // tuple just emitted for another mutually exclusive predecessor.
+        Z = Completed; M = Carrier;
+        Instruction *End = Bound.Latches[E] == First->getParent() ? First
+                                                                 : Bound.Latches[E]->getTerminator();
+        Instruction *Before = End->getPrevNode();
+        B.SetInsertPoint(End);
+        backedge(Bound, E);
+        markRange(Before, End);
+      }
+    }
     markRange(Prev, First);
     for (unsigned K = 0; K < Bound.Outputs.size(); ++K)
       if (Outputs[K]) Bound.Outputs[K]->replaceUsesWithIf(Outputs[K], [&](Use &U) {
@@ -388,7 +465,7 @@ public:
 
 json::Object report(const Binding &B) {
   const Program &P = B.P;
-  json::Array Steps, Outputs, Salts, Rotations, NextSlots;
+  json::Array Steps, Outputs, Salts, Rotations, NextSlots, Edges, ScalarInputs;
   auto operand = [](const Operand &O) {
     return O.Constant ? json::Object{{"constant_hex", utohexstr(O.Bits)}}
                       : json::Object{{"slot", O.Slot}};
@@ -400,7 +477,15 @@ json::Object report(const Binding &B) {
   for (unsigned K : P.OutputSlots) Outputs.push_back(K);
   for (uint64_t S : P.Salts) Salts.push_back(utohexstr(S));
   for (unsigned R : P.Rotations) Rotations.push_back(R);
-  for (unsigned K : P.NextSlots) NextSlots.push_back(K);
+  for (unsigned E = 0; E < P.Backedges.size(); ++E) {
+    json::Array Slots;
+    for (unsigned K : P.Backedges[E].Slots) Slots.push_back(K);
+    Edges.push_back(json::Object{{"id", E}, {"predecessor_block", P.Backedges[E].Block},
+                                {"next_input_slots", std::move(Slots)}});
+  }
+  if (P.Backedges.size() == 1)
+    for (unsigned K : P.Backedges.front().Slots) NextSlots.push_back(K);
+  for (unsigned K : P.ScalarInputs) ScalarInputs.push_back(K);
   return json::Object{{"id", P.ID}, {"width", P.Width}, {"lanes", P.Lanes},
       {"family", plan::familyVersion(P.Rep.Fam, P.Rep.Rev)},
       {"representation", json::Object{{"family", plan::name(P.Rep.Fam)}, {"revision", P.Rep.Rev},
@@ -411,10 +496,13 @@ json::Object report(const Binding &B) {
       {"useful_operations", P.Steps.size()}, {"inputs", B.Inputs.size()},
       {"outputs", B.Outputs.size()}, {"scalar_output_uses", B.BoundaryUses},
       {"loop", json::Object{{"status", B.Preheader ? "encoded" : "straight-line"},
+          {"contract", "sre-bundle-loop-v2"}, {"graph_scope", "dominated-header-recurrence"},
           {"reason", B.LoopReason}, {"law", "triangular-recurrence-rebase-v1"},
           {"phase_mode", P.Phases ? "two-phase" : "static"},
           {"phase_count", P.Phases ? 2 : 1}, {"initial_phase", 0},
-          {"backedge_uses", B.Recurrences.size()}, {"scalar_input_uses", 0},
+          {"backedge_uses", B.Recurrences.size() * B.Latches.size()},
+          {"scalar_input_uses", B.InputBoundaryUses}, {"scalar_input_slots", std::move(ScalarInputs)},
+          {"backedges", std::move(Edges)},
           {"next_input_slots", std::move(NextSlots)}}},
       {"estimated_cost", P.EstimatedCost}, {"steps", std::move(Steps)},
       {"output_slots", std::move(Outputs)}, {"salts_hex", std::move(Salts)},
@@ -459,6 +547,8 @@ FunctionPlan planFunction(Function &F, uint64_t Seed, const NativeBundleOptions 
   Result.Blocked = F.isVarArg() || F.hasPersonalityFn() || Result.Before > 12000 ||
                    F.hasFnAttribute(Attribute::Naked);
   if (Result.Blocked) return Result;
+  DominatorTree DT;
+  if (O.Loops) DT.recalculate(F);
   auto &Plans = Result.Candidates;
   unsigned Estimated = 0;
   // Stable block/instruction order, bounded windows. Effects, width changes,
@@ -474,7 +564,7 @@ FunctionPlan planFunction(Function &F, uint64_t Seed, const NativeBundleOptions 
           Binding B;
           if (256 + N * 1200 > FunctionCostLimit - Estimated ||
               !schedule(ArrayRef<Instruction *>(Run).slice(Start, N), O.Values, B)) continue;
-          planLoop(B, O);
+          planLoop(B, O, DT);
           if (B.P.EstimatedCost > FunctionCostLimit - Estimated) continue;
           B.P.ID = Plans.size();
           Rng R = Rng(Seed).fork("native-bundles-v1").fork(F.getName()).fork(B.P.ID);
@@ -553,6 +643,7 @@ json::Array encodeNativeBundles(Module &M, uint64_t Seed, const NativeBundleOpti
         {"candidate_regions", W.Candidates.size()},
         {"graph_scope", "pre-bundle-lowering"}, {"source_lineage", "input-ir-metadata"},
         {"pins", O.Pin}, {"loops", O.Loops}, {"phases", O.Phases},
+        {"loop_boundaries", O.LoopBoundaries},
         {"instructions_before", Before}};
     if (W.Blocked) {
       Row["status"] = "skipped"; Row["reason"] = "structure-or-size";
