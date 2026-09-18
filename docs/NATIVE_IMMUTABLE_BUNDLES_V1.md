@@ -119,3 +119,7 @@ Completed evidence, retaining earlier attempts:
 The compile/selection gap is visible evidence for subsequent ownership/selection
 work, not grounds for changing the cap or calling the preset complete. No paid
 agent run, protected holdout evaluation or hardness promotion occurred here.
+
+The later [bounded continuity-first selector](NATIVE_CONTINUITY_SELECTION_V1.md)
+closes two/four of those scale crossings at the same cap. Those results are
+separate artifact cells, not replacements for the zero-coverage baselines above.

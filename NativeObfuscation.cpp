@@ -39,6 +39,8 @@ cl::opt<bool> NativeData("native-data",
     cl::desc("F2: encode non-escaping immutable integer arrays"), cl::init(true));
 cl::opt<bool> NativeImmutableBundles("native-immutable-bundles",
     cl::desc("Joint immutable numeric tiles with direct bundle input transfers"), cl::init(false));
+cl::opt<bool> NativeContinuityPriority("native-continuity-priority",
+    cl::desc("Prioritize bounded encoded-input consumer units within existing budgets"), cl::init(false));
 cl::opt<bool> NativeHelpers("native-helper-hardening",
     cl::desc("F3: process registered generated helpers once"), cl::init(true));
 cl::opt<bool> NativeLate("native-late-constants",
@@ -246,6 +248,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-bundles requires native-region-plan=connected");
   if (NativeImmutableBundles && (!NativeBundles || !NativeData))
     report_fatal_error("native-immutable-bundles requires native-bundles and native-data");
+  if (NativeContinuityPriority && !NativeBundles)
+    report_fatal_error("native-continuity-priority requires native-bundles");
   if (!NativeBundles && (NativeTransferFamily.getNumOccurrences() || NativeBundleValues.getNumOccurrences() ||
                          NativeTransferNodes.getNumOccurrences() || NativeBundlePins.getNumOccurrences() ||
                          NativeBundleLoops.getNumOccurrences() || NativeBundlePhases.getNumOccurrences() ||
@@ -454,6 +458,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.Predicates = NativePredicateRegions;
     Options.Families = NativeRegionalFamilies;
     Options.Shards = NativeConnectedShards;
+    Options.ContinuityPriority = NativeContinuityPriority;
     Options.Aggregates = NativeConnectedAggregates;
     Options.JointOutputs = NativeJointOutputs;
     Options.CoupleState = NativeCoupledState;
@@ -735,6 +740,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"bundles", NativeBundles.getValue()},
                             {"object_bundles", NativeObjectBundles.getValue()},
                             {"immutable_bundles", NativeImmutableBundles.getValue()},
+                            {"continuity_priority", NativeContinuityPriority.getValue()},
                             {"immutable_continuity_contract", 2},
                             {"object_bundle_contract", 3},
                             {"object_phases", NativeObjectPhases.getValue()},

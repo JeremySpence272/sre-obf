@@ -94,9 +94,13 @@ def main():
     parser.add_argument("--partial", action="store_true")
     parser.add_argument("--unaligned", action="store_true")
     parser.add_argument("--connected-only", action="store_true", help="exclude the three-live-value bundle via its two-slot cap")
+    parser.add_argument("--continuity-priority", action="store_true")
+    parser.add_argument("--regional-families", action="store_true", help="exercise connected XOR/additive region conversions")
+    parser.add_argument("--bounded-selection", action="store_true", help="four-node shard selection; requires --connected-only")
     parser.add_argument("--ablation", action="store_true")
     parser.add_argument("--random-inputs", type=int, default=512)
     args = parser.parse_args()
+    if args.bounded_selection and not args.connected_only: parser.error("bounded selection requires --connected-only")
     if any(n < 1 or n >= (1 << min(args.widths)) for n in args.cells): parser.error("invalid element count")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -112,8 +116,12 @@ def main():
              "-native-plan=1", "-native-scale-budget=1", "-native-bundles=1", "-native-immutable-bundles=1",
              "-obf-deterministic", "-obf-verify"]
     if args.connected_only:
-        flags = ["-native-connected-nodes=32" if x == "-native-connected-nodes=2" else x for x in flags]
+        nodes = 4 if args.bounded_selection else 32
+        flags = [f"-native-connected-nodes={nodes}" if x == "-native-connected-nodes=2" else x for x in flags]
         flags.append("-native-bundle-values=2")
+    if args.bounded_selection: flags.append("-native-connected-shards=1")
+    if args.continuity_priority: flags.append("-native-continuity-priority=1")
+    if args.regional_families: flags.append("-native-regional-families=1")
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
@@ -151,9 +159,13 @@ def main():
                                 if sum(e["eliminated_scalar_uses"] for e in edges):
                                     raise ToolFailure("connected-only control credited early absorption")
                                 edges = data["immutable_connected_continuity"]
-                            if sum(e["remaining_scalar_uses"] for e in edges) != int(args.partial):
+                            if not args.bounded_selection and sum(e["remaining_scalar_uses"] for e in edges) != int(args.partial):
                                 raise ToolFailure("unaccounted/unabsorbed scalar crossings")
                             if not sum(e["eliminated_scalar_uses"] for e in edges): raise ToolFailure("no direct data-to-use path")
+                            if args.continuity_priority and args.bounded_selection:
+                                policy = [r["continuity_selection"] for r in data["connected_regions"] if "continuity_selection" in r]
+                                if not any(p["selected_roots"] and p["atomic_joins"] for p in policy):
+                                    raise ToolFailure("no bounded continuity unit selected")
                             check_backing((stage / "bundles.ll").read_text(), row)
                             if args.unaligned:
                                 source_ir = (stage / "bundles.ll").read_text()
@@ -188,6 +200,8 @@ def main():
                             result["cases"].append({"width": width, "cells": n, "family": family, "seed": seed,
                                 "pins": pins, "vectors": len(pairs), "backing_inverse_control": True,
                                 "consumer": "connected" if args.connected_only else "bundle",
+                                "bounded_selection": args.bounded_selection, "continuity_priority": args.continuity_priority,
+                                "regional_families": args.regional_families,
                                 "matched_disabled_control": args.ablation,
                                 "continuity": edges, "passed": True})
                             dump(out / "summary.json", result)

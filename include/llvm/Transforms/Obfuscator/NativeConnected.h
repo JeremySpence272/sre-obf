@@ -15,6 +15,9 @@ struct NativeConnectedOptions {
   // Partition an oversized component into bounded shards under the same cost
   // limit instead of skipping it whole. The limit itself is never raised.
   bool Shards = false;
+  // Prioritize already-encoded input/owned-memory consumers. Bounded atomic
+  // producer/consumer units use the same function, shard and module caps.
+  bool ContinuityPriority = false;
   // Admit bounded constant-index integer leaves of structs and nested arrays
   // as closed objects, after a precise use walk. Off, only the narrow scalar
   // and flat-array rule applies, exactly as before.

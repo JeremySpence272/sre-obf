@@ -100,7 +100,7 @@ bool enumerateLeaves(Type *T, uint64_t Base, const DataLayout &DL,
 struct Region {
   SmallVector<Instruction *, 32> Nodes;
   unsigned ID = 0, Component = 0, Shard = 0, Cost = 0, Score = 0;
-  bool Affine = false, Sharded = false;
+  bool Affine = false, Sharded = false, Continuity = false;
 };
 // One bounded joint-output group: two selected nodes whose encoded lanes are
 // replaced by the lanes of U = First + Second and V = First + 2*Second.
@@ -175,6 +175,8 @@ class Encoder {
   unsigned EligibleCost = 0, SelectedCost = 0, SkippedCost = 0, ShardLostCost = 0;
   unsigned ReserveDenied = 0, ReserveDeniedCost = 0;
   unsigned CostLimit = 0, ShardCostLimit = 0;
+  SmallPtrSet<Instruction *, 32> ContinuityRoots;
+  unsigned EligibleContinuityRoots = 0, SelectedContinuityRoots = 0, AtomicContinuityUnits = 0;
   DominatorTree DT;
   // The private typed plan. It records the decisions this planner already
   // makes; it never makes one of its own and never emits an instruction, so
@@ -783,6 +785,19 @@ class Encoder {
       Index[&I] = Candidates.size(); Candidates.push_back(&I);
     }
     EligibleNodes = Candidates.size();
+    if (O.ContinuityPriority) for (Instruction *I : Candidates) {
+      bool Incoming = llvm::any_of(I->operands(), [](Value *V) {
+        auto *X = dyn_cast<BinaryOperator>(V);
+        return bundle::immutablePair(V) || (X && X->getOpcode() == Instruction::Xor &&
+                                            X->getMetadata("sre.native.call.arg"));
+      });
+      if (auto *L = dyn_cast<LoadInst>(I); L && MemoryLoads.count(L)) Incoming = true;
+      if (!Incoming) continue;
+      ++EligibleContinuityRoots;
+      // Stable IR order bounds selection work. Membership is queried only;
+      // hash/pointer iteration order never determines priorities or grouping.
+      if (ContinuityRoots.size() < 256) ContinuityRoots.insert(I);
+    }
     if (O.Plan) recordOriginGraph(Candidates);
     std::vector<unsigned> Parent(Candidates.size()); std::iota(Parent.begin(), Parent.end(), 0);
     auto Root = [&](unsigned I) { while (Parent[I] != I) { Parent[I] = Parent[Parent[I]]; I = Parent[I]; } return I; };
@@ -804,12 +819,14 @@ class Encoder {
       R.Nodes.push_back(I);
       R.Cost += nodeCost(I);
       R.Score += nodeScore(I);
+      R.Continuity |= ContinuityRoots.contains(I);
     }
     // Stable input order breaks equal scores; unrelated function order does
     // not change this function's stream. Whole-component selection avoids
     // cutting a memory object in half to meet the node cap; shards keep every
     // load of one encoded object inside a single shard for the same reason.
     llvm::stable_sort(Planned, [](const Region &A, const Region &B) {
+      if (A.Continuity != B.Continuity) return A.Continuity;
       return uint64_t(A.Score) * B.Cost > uint64_t(B.Score) * A.Cost;
     });
     for (const Region &R : Planned) EligibleCost += R.Cost;
@@ -848,6 +865,7 @@ class Encoder {
         for (Instruction *I : Part->Nodes) {
           Part->Cost += nodeCost(I); Part->Score += nodeScore(I);
           RegionOf[I] = Part->ID; Nodes.push_back(I);
+          SelectedContinuityRoots += ContinuityRoots.contains(I);
         }
         if (O.Plan) {
           plan::RegionDescriptor D;
@@ -886,7 +904,7 @@ class Encoder {
         auto *L = dyn_cast<LoadInst>(I);
         return L && MemoryLoads.count(L);
       });
-      unsigned Limit = Owns || StructuralReserve >= CostLimit ? CostLimit : CostLimit - StructuralReserve;
+      unsigned Limit = Owns || R.Continuity || StructuralReserve >= CostLimit ? CostLimit : CostLimit - StructuralReserve;
       SawAffine = SawXor = false;
       if (Nodes.size() + R.Nodes.size() <= O.Nodes && Cost + R.Cost > Limit && Cost + R.Cost <= CostLimit) {
         // Denied only by the structural reserve: it would have fit the
@@ -916,18 +934,62 @@ class Encoder {
       // object is one object, so its leaf loads enlarge that atomic unit
       // rather than splitting it; a unit that cannot fit the remaining budget
       // is dropped whole and its object stays unencoded.
-      struct Unit { SmallVector<Instruction *, 8> Nodes; unsigned Cost = 0, Score = 0; };
+      struct Unit {
+        SmallVector<Instruction *, 8> Nodes;
+        unsigned Cost = 0, Score = 0;
+        bool Continuity = false;
+      };
       SmallVector<Unit, 32> Units;
+      // Start from the same indivisible closed-memory units. With continuity
+      // enabled, join a root to one actual consumer (cheapest, then IR order),
+      // at most eight nodes per joined unit. Dropping a unit drops both ends;
+      // no isolated root is manufactured merely to inflate absorption counts.
+      std::vector<unsigned> UnitParent(R.Nodes.size()), UnitSize(R.Nodes.size(), 1);
+      std::iota(UnitParent.begin(), UnitParent.end(), 0);
+      DenseMap<Instruction *, unsigned> Position;
+      for (unsigned J = 0; J < R.Nodes.size(); ++J) Position[R.Nodes[J]] = J;
+      auto unitRoot = [&](unsigned J) {
+        while (UnitParent[J] != J) { UnitParent[J] = UnitParent[UnitParent[J]]; J = UnitParent[J]; }
+        return J;
+      };
+      auto unite = [&](unsigned A, unsigned B) {
+        A = unitRoot(A); B = unitRoot(B);
+        if (A != B) { UnitParent[B] = A; UnitSize[A] += UnitSize[B]; }
+      };
       DenseMap<unsigned, unsigned> ObjectUnit;
-      for (Instruction *I : R.Nodes) {
-        unsigned Slot = Units.size();
+      for (unsigned J = 0; J < R.Nodes.size(); ++J) {
+        Instruction *I = R.Nodes[J];
         if (auto *L = dyn_cast<LoadInst>(I); L && MemoryLoads.count(L))
-          Slot = ObjectUnit.try_emplace(MemoryLoads.lookup(L), Slot).first->second;
+          unite(J, ObjectUnit.try_emplace(MemoryLoads.lookup(L), J).first->second);
+      }
+      if (O.ContinuityPriority) for (unsigned J = 0; J < R.Nodes.size(); ++J) {
+        Instruction *I = R.Nodes[J];
+        if (!ContinuityRoots.contains(I)) continue;
+        unsigned Best = R.Nodes.size();
+        for (User *U : I->users()) {
+          auto It = Position.find(dyn_cast<Instruction>(U));
+          if (It == Position.end() || It->second == J) continue;
+          unsigned K = It->second, A = unitRoot(J), B = unitRoot(K);
+          if (A == B || UnitSize[A] + UnitSize[B] > 8) continue;
+          if (Best == R.Nodes.size() || nodeCost(R.Nodes[K]) < nodeCost(R.Nodes[Best]) ||
+              (nodeCost(R.Nodes[K]) == nodeCost(R.Nodes[Best]) && K < Best)) Best = K;
+        }
+        if (Best != R.Nodes.size()) { unite(J, Best); ++AtomicContinuityUnits; }
+      }
+      DenseMap<unsigned, unsigned> UnitIndex;
+      for (unsigned J = 0; J < R.Nodes.size(); ++J) {
+        Instruction *I = R.Nodes[J];
+        unsigned Slot = UnitIndex.try_emplace(unitRoot(J), Units.size()).first->second;
         if (Slot == Units.size()) Units.push_back(Unit{});
         Units[Slot].Nodes.push_back(I);
         Units[Slot].Cost += nodeCost(I);
         Units[Slot].Score += nodeScore(I);
+        Units[Slot].Continuity |= ContinuityRoots.contains(I);
       }
+      if (O.ContinuityPriority) llvm::stable_sort(Units, [](const Unit &A, const Unit &B) {
+        if (A.Continuity != B.Continuity) return A.Continuity;
+        return A.Continuity && uint64_t(A.Score) * B.Cost > uint64_t(B.Score) * A.Cost;
+      });
       unsigned Shard = 0, ShardCost = 0, ShardScore = 0;
       SmallVector<Instruction *, 32> Current;
       // Seeded extent inside the fixed bound, so two seeded builds of one
@@ -1277,6 +1339,13 @@ public:
     Item["shard_estimated_cost_limit"] = O.Shards ? ShardCostLimit : 0;
     Item["shard_policy"] = O.Shards ? "instruction-order-units-with-atomic-memory-objects"
                                     : "whole-component-only";
+    if (O.ContinuityPriority) {
+      Item["continuity_selection"] = json::Object{{"contract", "sre-continuity-selection-v1"},
+          {"root_limit", 256}, {"joined_unit_limit", 8}, {"eligible_roots", EligibleContinuityRoots},
+          {"prioritized_roots", ContinuityRoots.size()}, {"selected_roots", SelectedContinuityRoots},
+          {"atomic_joins", AtomicContinuityUnits}, {"scope", "retained-selection"}, {"hardness_evaluated", false}};
+      if (O.Shards) Item["shard_policy"] = "continuity-priority-atomic-consumer-units-v1";
+    }
     Item["normalized_copies"] = Copies;
     Item["reserved_structural_cost"] = StructuralReserve;
     Item["reserve_denied_components"] = ReserveDenied;
@@ -1615,6 +1684,10 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
                             "joint_dependency_test", "joint_node_skips", "joint_pair_skips"})
         if (auto *Value = Item.get(Key)) Rolled[Key] = std::move(*Value);
       // Selection loss inside a rolled-back function is not rollback loss.
+      if (auto *Selection = Item.getObject("continuity_selection")) {
+        (*Selection)["scope"] = "attempted-selection";
+        Rolled["continuity_selection"] = std::move(*Selection);
+      }
       // Keeping only the eligible total and the attempted selection would
       // charge this function's genuine skips and shard losses to the rollback.
       if (auto *Value = Item.get("skipped_estimated_cost"))
