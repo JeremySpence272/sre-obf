@@ -923,6 +923,55 @@ optimization promotes exactly the objects the walk admits. A pinned slot is a
 compiler barrier, not a semantic one, so surviving stock optimization shows
 only that the optimizer did not fold it. Coverage is not hardness.
 
+## A decode the cross-family conversion was documented not to create
+
+The v04 offline family work applied a rejection criterion to the **shipping**
+v03 emitter and found two intermediates that materialize a decoded value as an
+SSA value. Both are in code this ledger already describes as avoiding exactly
+that.
+
+`NativeConnected.cpp::convertFamily`, the XOR-to-additive path, carries the
+comment "without ever creating the decoded scalar as an SSA value" directly
+above:
+
+    E = ((X.E + X.R) - 2*(X.E & X.R)) + R
+
+The inner subtraction is `X.E ^ X.R`, the plaintext, and it is a real `sub`
+whose result is then fed to an `add`. Confirmed by derivation and by 20,000
+random trials at 32 bits: the intermediate equals the decoded value in every
+one. The additive multiply has the same shape, where
+`((X.E*Y.E) - Cross) + X.R*Y.R` is exactly `x*y` before the output mask is
+added, likewise identical in 20,000 trials.
+
+Both are single-instruction regroupings, not design errors: adding the mask to
+the first partial product instead of last computes the same value from the same
+operands with no such intermediate. The regrouped forms are proved equal to the
+originals and are in `conformance/connected_model.py` as
+`xor_to_additive_grouped` and `affine_mul_grouped`. **The emitter itself is not
+yet fixed**, and the originals are retained as negative controls that SMT
+proves contain a decode at 8, 16, 32 and 64 bits.
+
+This is the concrete v03 claim the v04 plan's principle 1 anticipated: a wrapper
+around an ordinary operation is only a candidate until normalization tests it.
+The claim in commit `b685259` that mixed families connect "without scalar
+decodes" is false as implemented for these two paths, and the ledger text above
+describing that feature should be read with this correction.
+
+### A labelling artifact, and the supervisor's own misreading
+
+The exposure probe asks whether a suspect intermediate moves when the carrier
+masks move. Unsat means it never moves, so it is a function of the logical
+values alone, which is the bad outcome; sat means the solver produced a witness
+that it does move, which clears it. The runner initially recorded `expect:
+proved`, so every cleared intermediate was written out as a failing
+`counterexample`. Reading those raw counts, the supervisor twice reported that
+three candidate families had been "broken by their own probes". That was
+backwards and is retracted here. Under corrected semantics the final sweep has
+**zero substantive failures at any width**; all 271 failing entries are
+inconclusive. The lesson is the project's own: a count is not a result until
+its semantics are stated, and an aggregate with an `expect` field baked in can
+invert a conclusion.
+
 ## Next implementation batch
 
 The post-integration review repaired private-call eligibility and shard bounds.
