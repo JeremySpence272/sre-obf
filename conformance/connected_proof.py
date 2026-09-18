@@ -104,6 +104,12 @@ def family_sites(width):
   return [("nlcarry-abstract", tm.NlCarryAbstract(width, 11, lanes=3, kernel="and")),
           ("nlcarry-and", tm.NlCarry(width, 11, lanes=3, kernel="and")),
           ("nlcarry-arx", tm.NlCarry(width, 11, lanes=3, kernel="arx")),
+          # Measured, not assumed: removing modular multiplication from the
+          # network kernel does not make its laws decidable. `addrot` proves
+          # 1 of 18 transfer laws at both 8 and 16 bits, the same as `arx`, so
+          # the blocker is the depth of the carrier network rather than
+          # multiplication. Correctness for both rests on the abstract-carrier
+          # law instead, which covers every kernel.
           ("nlcarry-addrot", tm.NlCarry(width, 11, lanes=3, kernel="addrot")),
           ("tricouple", tm.TriCouple(width, 7)),
           ("arx-value", tm.ArxValue(width, 3, lanes=2))]
