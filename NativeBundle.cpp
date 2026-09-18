@@ -81,6 +81,7 @@ struct Program {
   bool Phases = false;
   unsigned CallSupplies = 0;
   SmallVector<PredicatePlan, 4> Predicates;
+  std::optional<json::Object> Selection;
   Family coordinates() const {
     switch (Rep.Fam) {
     case plan::Family::TriangularXor: return Family::Xor;
@@ -610,7 +611,7 @@ json::Object report(const Binding &B) {
   if (P.Backedges.size() == 1)
     for (unsigned K : P.Backedges.front().Slots) NextSlots.push_back(K);
   for (unsigned K : P.ScalarInputs) ScalarInputs.push_back(K);
-  return json::Object{{"id", P.ID}, {"width", P.Width}, {"lanes", P.Lanes},
+  json::Object Result{{"id", P.ID}, {"width", P.Width}, {"lanes", P.Lanes},
       {"family", plan::familyVersion(P.Rep.Fam, P.Rep.Rev)},
       {"representation", json::Object{{"family", plan::name(P.Rep.Fam)}, {"revision", P.Rep.Rev},
           {"physical_lanes", P.Rep.Lanes}, {"logical_width", P.Rep.LogicalWidth},
@@ -634,6 +635,8 @@ json::Object report(const Binding &B) {
       {"estimated_cost", P.EstimatedCost}, {"steps", std::move(Steps)},
       {"output_slots", std::move(Outputs)}, {"salts_hex", std::move(Salts)},
       {"rotations", std::move(Rotations)}};
+  if (P.Selection) Result["selection"] = json::Object(*P.Selection);
+  return Result;
 }
 }
 
@@ -703,6 +706,22 @@ FunctionPlan planFunction(Function &F, uint64_t Seed, const NativeBundleOptions 
           Rng R = Rng(Seed).fork("native-bundles-v1").fork(F.getName()).fork(B.P.ID);
           B.P.Rep.Fam = O.Family == "additive" || (O.Family == "seeded" && (R.u64() & 1))
                           ? plan::Family::TriangularAdditive : plan::Family::TriangularXor;
+          if (O.Policy) {
+            // Never transfer measurements across a different phase/call/predicate contract.
+            bool InScope = B.P.Backedges.empty() && B.P.Predicates.empty() &&
+                           !B.P.CallSupplies && !O.CallInputs;
+            const auto *Rule = InScope ? O.Policy->match(B.P.Width, B.P.Lanes, N, O.Pin) : nullptr;
+            json::Array Candidates;
+            if (Rule) {
+              for (const std::string &C : Rule->Candidates) Candidates.push_back(C);
+              const auto &Chosen = Rule->Candidates[R.fork("cached-policy-v1").u64() % Rule->Candidates.size()];
+              B.P.Rep.Fam = Chosen == "additive" ? plan::Family::TriangularAdditive : plan::Family::TriangularXor;
+            }
+            B.P.Selection = O.Policy->identity();
+            (*B.P.Selection)["status"] = Rule ? "matched" : "seeded-fallback";
+            (*B.P.Selection)["reason"] = Rule ? "" : InScope ? "unmeasured-shape" : "unsupported-context";
+            (*B.P.Selection)["candidates"] = std::move(Candidates);
+          }
           B.P.Rep.Rev = 1;
           B.P.Rep.LogicalWidth = B.P.Rep.LaneWidth = B.P.Width;
           B.P.Rep.Lanes = B.P.Lanes + 1;

@@ -4,11 +4,14 @@
 #include "llvm/Support/JSON.h"
 #include <cstdint>
 #include <string>
+#include <optional>
+#include "llvm/Transforms/Obfuscator/NativeBundlePolicy.h"
 
 namespace llvm::obf {
 struct NativeBundleOptions {
   // Two descriptor-driven triangular families, or a seeded per-region choice.
   std::string Family = "seeded";
+  std::optional<NativeBundlePolicy> Policy;
   unsigned Values = 4, Nodes = 16, GrowthBudget = 0;
   unsigned ObjectMaxCells = 4;
   unsigned ObjectRetainedGrowth = 65536;

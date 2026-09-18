@@ -119,6 +119,8 @@ cl::opt<std::string> NativeTransferFamily("native-transfer-family",
     cl::desc("Bundle representation: xor, additive, or seeded"), cl::init("seeded"));
 cl::opt<unsigned> NativeBundleValues("native-bundle-values",
     cl::desc("Logical slots per persistent bundle (2..4)"), cl::init(4));
+cl::opt<std::string> NativeBundlePolicyFile("native-bundle-policy",
+    cl::desc("Versioned offline-measured straight-bundle family cache"), cl::init(""));
 cl::opt<unsigned> NativeTransferNodes("native-transfer-nodes",
     cl::desc("Maximum original operations per combined transfer (8..32)"), cl::init(16));
 cl::opt<bool> NativeBundlePins("native-bundle-pins",
@@ -235,6 +237,12 @@ bool selected(const Function &F) {
 } // namespace
 
 PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &AM) {
+  std::optional<obf::NativeBundlePolicy> BundlePolicy;
+  if (!NativeBundlePolicyFile.empty()) {
+    if (!NativeBundles || NativeTransferFamily != "seeded")
+      report_fatal_error("native-bundle-policy requires bundles and seeded transfer family");
+    BundlePolicy = obf::NativeBundlePolicy::load(NativeBundlePolicyFile);
+  }
   if (NativeLevel != "max" && NativeLevel != "smoke")
     report_fatal_error("native-level must be max or smoke");
   if (NativeStateFamily > 3)
@@ -465,6 +473,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     checkModuleBudget(M, "before-bundle-allocation");
     obf::NativeBundleOptions Options;
     Options.Family = NativeTransferFamily;
+    Options.Policy = BundlePolicy;
     Options.Values = NativeBundleValues;
     Options.Nodes = NativeTransferNodes;
     Options.Pin = NativeBundlePins;
@@ -837,6 +846,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
     Result["encoded_calls"] = std::move(CallCoverage);
+    if (BundlePolicy) Result["bundle_policy"] = BundlePolicy->identity();
     if (NativeBundles) {
       if (obf::nativeBundleControl()) Result["bundle_control"] = obf::nativeBundleControlInventory(M, BundleCoverage);
       if (NativeBundlePredicates) Result["bundle_predicates"] = std::move(BundlePredicates);

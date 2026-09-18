@@ -3,6 +3,7 @@
 
 def add_options(parser):
     parser.add_argument("--bundles", action="store_true")
+    parser.add_argument("--bundle-policy")
     parser.add_argument("--object-bundles", action="store_true")
     parser.add_argument("--object-phases", action="store_true")
     parser.add_argument("--object-max-cells", type=int, choices=(4, 8))
@@ -26,6 +27,9 @@ def add_options(parser):
 
 def validate(args, connected):
     enabled = getattr(args, "bundles", False)
+    policy = getattr(args, "bundle_policy", None)
+    if policy and (not enabled or getattr(args, "transfer_family", None) not in (None, "seeded")):
+        raise ValueError("--bundle-policy requires --bundles and seeded transfer family")
     choices = any(getattr(args, key, None) is not None
                   for key in ("transfer_family", "bundle_values", "transfer_nodes", "object_max_cells", "object_retained_growth"))
     switches = any(getattr(args, key, False) for key in
@@ -62,7 +66,7 @@ def validate(args, connected):
 
 def flags(args):
     if not getattr(args, "bundles", False): return []
-    return ["-native-bundles=1",
+    return ([f"-native-bundle-policy={args.bundle_policy}"] if getattr(args, "bundle_policy", None) else []) + ["-native-bundles=1",
             f"-native-transfer-family={getattr(args, 'transfer_family', None) or 'seeded'}",
             f"-native-bundle-values={getattr(args, 'bundle_values', None) or 4}",
             f"-native-transfer-nodes={getattr(args, 'transfer_nodes', None) or 16}",
@@ -78,6 +82,7 @@ def flags(args):
 def argv(args):
     if not getattr(args, "bundles", False): return []
     out = ["--bundles"]
+    if getattr(args, "bundle_policy", None): out += ["--bundle-policy", str(args.bundle_policy)]
     for name in ("transfer_family", "bundle_values", "transfer_nodes", "object_max_cells", "object_retained_growth"):
         if getattr(args, name, None) is not None:
             out += ["--" + name.replace("_", "-"), str(getattr(args, name))]

@@ -22,6 +22,7 @@ recovery cost and generalization. Passing one does not establish the others.
 | Compiler normalization | `--post-o2-attack`, saved assembly | What remains after a second, explicitly experimental stock-O2 simplification pass? |
 | Decompiler normalization | Ghidra integration, `bundle_decompile.py` | What C/p-code does the matched stripped binary produce at the supplied entry? |
 | Semantic recovery | `extract_supplied.py`, `extract_discovery.py`, `relation_recovery.py` | Can a particular recovery method find and validate a simpler semantic description? |
+| Cached candidate selection | `policy_run.py`, `policy_controls.py`, `bundle_policy.py` | Do only complete, conclusive, cost-qualified training results influence compiler family choices? |
 | Honest accounting | `*_check.py`, `test_*.py`, `compare.py` | Are coverage, losses, boundaries, resource caps and reproducibility reported consistently? |
 | Scale and holdouts | `scale.py`, `scale_stage.py`, `prepare_holdouts.py` | Does the compiler preserve unchanged real workloads at fixed costs, and are holdout contracts frozen? |
 

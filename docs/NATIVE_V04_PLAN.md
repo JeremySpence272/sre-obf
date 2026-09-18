@@ -438,6 +438,12 @@ the fully fused crackme.
 
 ### W6 — attack-guided candidate selection and scale policy
 
+Implemented bounded first contract: [offline family cache](NATIVE_BUNDLE_POLICY_V1.md).
+It selects only existing straight pure bundle families, validates a frozen
+multi-route training matrix and retains a seeded fallback. The first measured
+matrix admits no rules; held-out improvement, transfer/repair costs and broader
+phase/storage policy selection remain research, not claimed completion.
+
 Search a bounded library of verified W1–W5 candidates at useful-region
 granularity. The development loop can be expensive; shipped compilation uses
 cached, versioned rules plus a bounded candidate count. Candidate identity
