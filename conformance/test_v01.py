@@ -1,6 +1,6 @@
 import random
 import unittest
-from conformance.recovery import choose
+from conformance.recovery import choose, choose_ast_ablation
 from conformance.whole import parser
 
 
@@ -51,16 +51,21 @@ class V01Tests(unittest.TestCase):
         self.assertFalse(any((args.fusion, args.memory, args.values, args.values_wide, args.invariant, args.closed_world)))
 
     def test_timeouts_errors_and_failed_controls_are_never_selected(self):
+        # Both the live metric and the retained ablation must refuse these rows.
         def row(native, control="recovered", growth=2):
             return {"candidate": "a", "native": {"status": native, "ast_nodes": 12, "steps": 7},
                     "control": {"status": control}, "growth": growth, "runtime_ratio": 1}
-        for status in ("budget", "inconclusive", "tool_error"):
-            self.assertEqual(choose([row(status)], 8), [])
-        self.assertEqual(choose([row("recovered", control="budget")], 8), [])
-        self.assertEqual(choose([row("recovered", growth=9)], 8), [])
-        self.assertEqual(choose([{**row("recovered"), "runtime_ratio": None}], 8), [])
-        self.assertEqual(choose([{**row("recovered"), "runtime_ratio": 17}], 8), [])
-        self.assertEqual(choose([row("recovered")], 8)[0]["score"], 19)
+        for case in ([row(s) for s in ("budget", "inconclusive", "tool_error")] +
+                     [row("recovered", control="budget"), row("recovered", growth=9),
+                      {**row("recovered"), "runtime_ratio": None},
+                      {**row("recovered"), "runtime_ratio": 17}]):
+            self.assertEqual(choose_ast_ablation([case], 8), [])
+            self.assertEqual(choose([case], 8)[0], [])
+        self.assertEqual(choose_ast_ablation([row("recovered")], 8)[0]["score"], 19)
+        # The ablation scores AST size; the live metric wants a validated outcome.
+        ranked, blocked = choose([row("recovered")], 8)
+        self.assertEqual(ranked[0]["attack_level"], "lifted")
+        self.assertEqual(blocked, [])
 
 
 if __name__ == "__main__":

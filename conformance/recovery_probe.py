@@ -1,8 +1,16 @@
-"""Bounded, informed-entry *symbolic* lifting probe. Run in the analysis image.
+"""Bounded *symbolic* lifting probe. Run in the analysis image.
 
-Never executes the target natively; Unicorn is disabled. The entry and ABI are
-oracle-supplied, so this measures recovery after discovery, not discovery itself.
+Never executes the target natively; Unicorn is disabled. The ABI is supplied.
+The entry comes either from private provenance (the supplied-region control) or
+from `conformance/extract_discovery.py`, which found it from the binary alone;
+this file is identical in both cases, which is what makes their costs comparable.
 No initializers are emulated: unsupported runtime initialization is inconclusive.
+
+On a successful lift it also evaluates the recovered expression at constructed
+points, grouped into sites, and emits them for `conformance/recovery.py` to fit
+and validate a model against. Those points are fixed and structural: no random
+sampling, no known answers, and the points used as constructed positives are
+disjoint from the points any model is fitted on.
 """
 from __future__ import annotations
 
@@ -11,6 +19,93 @@ import hashlib
 import json
 from pathlib import Path
 import time
+
+
+# Constructed evaluation grid. Edges, small values and a few structured words.
+# `SITES` are the second-argument values each site holds fixed; `POINTS` vary the
+# first argument. `EXTRA` is disjoint from POINTS and supplies constructed
+# positives at an unseen site, so a model is always asked about inputs it was
+# never fitted on.
+SITES = (0, 1, 0x9E3779B9)
+POINTS = (0, 1, 2, 3, 7, 8, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF, 0x1234, 0x55555555, 0xDEADBEEF)
+EXTRA_SITE = 0x0BADC0DE
+EXTRA = (4, 5, 6, 9, 0x10001, 0x7FFFFFFE)
+
+
+def evaluate(claripy, expression, x, y, start, args):
+    """Concretize the recovered expression on the constructed grid.
+
+    Evaluation goes through the solver rather than `replace`: angr 10 rebuilds
+    the AST during execution, so substituting the wrapper objects this file
+    created silently matches nothing and yields an empty grid. Asking for two
+    solutions and keeping only unique ones is also the check that the expression
+    is a function of the declared inputs; an input with two answers is dropped
+    rather than resolved by taking the first.
+    """
+    def at(a, b):
+        solver = claripy.Solver(timeout=2000)
+        solver.add(x == claripy.BVV(a, 32))
+        solver.add(y == claripy.BVV(b, 32))
+        try:
+            values = solver.eval(expression, 2)
+        except Exception:
+            return None
+        return int(values[0]) if len(values) == 1 else None
+
+    sites, positives, truncated = [], [], False
+    for b in SITES:
+        observations = []
+        for a in POINTS:
+            if time.monotonic() - start > args.seconds:
+                truncated = True
+                break
+            value = at(a, b)
+            if value is not None:
+                observations.append([[a, b], value])
+        if len(observations) >= 2:
+            sites.append({"name": f"y=0x{b:x}", "observations": observations})
+        if truncated:
+            break
+    for a in EXTRA:
+        if truncated or time.monotonic() - start > args.seconds:
+            truncated = True
+            break
+        value = at(a, EXTRA_SITE)
+        if value is not None:
+            positives.append([[a, EXTRA_SITE], value])
+    detail = {"grid": "constructed-edges-and-structured-words", "truncated": truncated,
+              "sites": len(sites), "points": sum(len(s["observations"]) for s in sites),
+              "note": "constructed positives are disjoint from the fitted points"}
+    if len(sites) < 2:
+        # An empty or single-site grid is a failed evaluation, not a simple
+        # answer. It must not reach the model fitter looking like evidence.
+        detail["status"] = "insufficient"
+        detail["reason"] = "grid-truncated" if truncated else "expression-not-a-function-of-declared-inputs"
+    else:
+        detail["status"] = "ok"
+    return {"sites": sites, "positives": positives, "evaluation": detail}
+
+
+def serialize(claripy, expression, out):
+    """Write the recovered expression out, without letting that step lose a result.
+
+    angr 10 does not expose `claripy.backends`, so the previous SMT-LIB dump
+    raised `AttributeError` on exactly the successful path and the probe reported
+    the recovery as `inconclusive`. A failure to pretty-print an expression we
+    already hold is a reporting boundary, never a failed recovery, so the status
+    is left alone and the serializer used is recorded.
+    """
+    for name, render in (("smt2", lambda: claripy.backends.z3.convert(expression).sexpr()),
+                         ("claripy-repr", lambda: str(expression))):
+        try:
+            text = render()
+        except Exception:
+            continue
+        if len(text) > 1024 * 1024:
+            return {"status": "capped", "format": name, "bytes": len(text)}
+        (out / ("expression." + ("smt2" if name == "smt2" else "txt"))).write_text(text + "\n")
+        return {"status": "written", "format": name, "bytes": len(text)}
+    return {"status": "unavailable", "reason": "no-serializer-in-this-image"}
 
 
 def probe(args):
@@ -54,6 +149,16 @@ def probe(args):
               "status": "inconclusive"}
     if sim.errored or sim.unconstrained or sim.deadended:
         result["reason"] = "unsupported-state-or-control-flow"
+        # Name the obstacle. "Inconclusive" with no detail is indistinguishable
+        # from protection when someone reads the table later, and it is not.
+        try:
+            result["error_classes"] = sorted({type(record.error).__name__
+                                              for record in sim.errored})[:4]
+            result["error_messages"] = sorted({str(record.error)[:160]
+                                               for record in sim.errored})[:4]
+        except Exception:
+            result["error_classes"] = ["unavailable"]
+        result["deadended"] = len(sim.deadended)
     elif sim.active:
         result.update(status="budget", reason="time-step-or-path-cap")
     elif returned:
@@ -80,12 +185,9 @@ def probe(args):
                     work.extend(node.args)
                 result.update(status="recovered" if not work else "lifted_large",
                               ast_nodes=len(seen), ast_depth=expression.depth)
+                result.update(evaluate(claripy, expression, x, y, start, args))
                 if not work:
-                    text = claripy.backends.z3.convert(expression).sexpr()
-                    if len(text) <= 1024 * 1024:
-                        (args.out / "expression.smt2").write_text(text + "\n")
-                    else:
-                        result.update(status="lifted_large", reason="serialization-cap")
+                    result["serialization"] = serialize(claripy, expression, args.out)
     else:
         result["reason"] = "no-return"
     result["seconds"] = round(time.monotonic() - start, 4)
