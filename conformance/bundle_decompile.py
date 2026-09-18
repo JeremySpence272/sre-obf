@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--width", type=int, choices=(8, 16, 32, 64), required=True)
     workload = parser.add_mutually_exclusive_group()
     workload.add_argument("--loop", action="store_true", help="use a supported bundle_loop_run case and full two-output workload")
-    workload.add_argument("--tile", action="store_true", help="use a supported tile_run case and all four output cells")
+    workload.add_argument("--tile", action="store_true", help="use a supported tile_run case and all declared output cells")
     workload.add_argument("--immutable", action="store_true", help="four-output immutable_run case with matched off arms")
     workload.add_argument("--private-calls", action="store_true", help="recursive_run bundle-input case and matched off arms")
     workload.add_argument("--predicate", action="store_true", help="predicate_run case with matched off arms and exact positive inputs")
@@ -56,7 +56,14 @@ def main():
         driver = out / "driver.o"
         driver_source = "tile_driver.c" if args.tile or args.immutable or args.private_calls else "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
         threaded = args.loop or args.tile or args.immutable or args.private_calls
+        output_cells = 4
+        if args.tile and (args.case / "fixture.json").is_file():
+            output_cells = json.loads((args.case / "fixture.json").read_text())["output_cells"]
+            if type(output_cells) is not int or not 4 <= output_cells <= 8:
+                raise ToolFailure("invalid tile output interface")
+        if args.tile: result["output_cells"] = output_cells
         runner.run(["clang", "-O2", *(["-pthread"] if threaded else []), "-c",
+                    *([f"-DTILE_OUTPUT_CELLS={output_cells}"] if args.tile else []),
                     str(FIXTURES / driver_source), "-o", str(driver)])
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}

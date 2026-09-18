@@ -10,11 +10,14 @@ check, dynamic secret, or anti-debug behavior.
 
 The pass inspects entry-block allocas in original selected owners, after fusion
 and encoded-call preparation but before the pure bundle and connected passes.
-It selects at most one closed `[N x iW]` alloca per function, N=2..4 and
+It selects at most one closed `[N x iW]` alloca per function, N=2..4 by default and
 W=8/16/32/64, with count one and address space zero. Function structure must be
 ordinary nonvariadic IR without personality, EH, indirect terminators, inline
 assembly, returns-twice/musttail calls or stack save/restore. The function cap
 is 12,000 incoming instructions.
+
+The explicit [larger-tile experiment](NATIVE_WIDE_TILES_V1.md) permits N=5..8
+under the same ownership and growth limits. It is not the default policy.
 
 The complete object-use walk accepts exact-width, nonvolatile, nonatomic scalar
 loads/stores and root-relative inbounds GEPs. It also accepts bounded fixed-vector

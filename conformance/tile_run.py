@@ -41,8 +41,14 @@ SUPPORTED = ("supported", "address", "many-loads", "lifetime", "lifetime-open",
              "phase-joins")
 
 
-def fixture(width, cells, shape="supported"):
-    if width not in (8, 16, 32, 64) or cells not in (2, 3, 4):
+def index_mask(cells):
+    # The whole power-of-two prefix is proved by KnownBits. Non-power-of-two
+    # tails are still read and checked in the complete final output.
+    return (1 << (cells.bit_length() - 1)) - 1
+
+
+def fixture(width, cells, shape="supported", max_cells=4):
+    if width not in (8, 16, 32, 64) or max_cells not in (4, 8) or not 2 <= cells <= max_cells:
         raise ValueError("unsupported tile shape")
     ty, array = f"i{width}", f"[{cells} x i{width}]"
     lines = ['target triple = "x86_64-unknown-linux-gnu"',
@@ -53,7 +59,7 @@ def fixture(width, cells, shape="supported"):
         lines += [f"  %p{k} = getelementptr inbounds {array}, ptr %tile, i32 0, i32 {k}",
                   f"  %init{k} = add {ty} %a, {k}", f"  store {ty} %init{k}, ptr %p{k}"]
     lines += ["  br label %loop", "loop:", "  %i = phi i32 [ 0, %entry ], [ %next, %loop ]",
-              f"  %idx = and {ty} %b, {3 if cells == 4 else 1}",
+              f"  %idx = and {ty} %b, {index_mask(cells)}",
               f"  %p = getelementptr inbounds {array}, ptr %tile, i32 0, {ty} %idx",
               f"  %left = load {ty}, ptr %p", f"  %right = load {ty}, ptr %p{cells - 1}",
               f"  %v0 = add {ty} %left, %b", f"  %v1 = xor {ty} %v0, %right",
@@ -61,7 +67,7 @@ def fixture(width, cells, shape="supported"):
               f"  %v4 = sub {ty} %v3, %a", f"  %v5 = or {ty} %v4, 1",
               f"  store {ty} %v5, ptr %p", "  %next = add i32 %i, 1",
               "  %again = icmp ult i32 %next, 4", "  br i1 %again, label %loop, label %exit", "exit:"]
-    for k in range(4):
+    for k in range(max(4, cells)):
         value = "0"
         if k < cells:
             lines.append(f"  %r{k} = load {ty}, ptr %p{k}")
@@ -79,7 +85,7 @@ def fixture(width, cells, shape="supported"):
     source = "\n".join(lines) + "\n"
     if shape == "partial-init": source = source.replace(f"  store {ty} %init1, ptr %p1\n", "")
     elif shape == "early-read": source = source.replace(f"  %init1 =", f"  %early = load {ty}, ptr %p0\n  %init1 =")
-    elif shape == "unbounded": source = source.replace(f"%idx = and {ty} %b, {3 if cells == 4 else 1}", f"%idx = add {ty} %b, 0")
+    elif shape == "unbounded": source = source.replace(f"%idx = and {ty} %b, {index_mask(cells)}", f"%idx = add {ty} %b, 0")
     elif shape == "volatile": source = source.replace(f"%left = load {ty}", f"%left = load volatile {ty}")
     elif shape == "atomic": source = source.replace(f"%left = load {ty}, ptr %p", f"%left = load atomic {ty}, ptr %p monotonic, align {width // 8}")
     elif shape == "byte-read": source = source.replace("  %left =", "  %byte = load i1, ptr %p\n  %left =")
@@ -161,7 +167,7 @@ def oracle(a, b, width, cells, shape="supported"):
     a, b = a & mask, b & mask
     tile = [(a + k) & mask for k in range(cells)]
     for _ in range(0 if shape == "phase-joins" and b == 0 else 4):
-        idx = 0 if shape.startswith("narrow-") else b & (3 if cells == 4 else 1)
+        idx = 0 if shape.startswith("narrow-") else b & index_mask(cells)
         v0 = (tile[idx] + b) & mask
         x = (((tile[idx] + b) & mask) ^ tile[-1]) * 3 & mask
         signed = x - (1 << width) if x >> (width - 1) else x
@@ -183,8 +189,8 @@ def c_oracle(a, b, width):
     return [*state, carry, 0]
 
 
-def private_fixture(width, cells):
-    source, ty = fixture(width, cells), f"i{width}"
+def private_fixture(width, cells, max_cells=4):
+    source, ty = fixture(width, cells, max_cells=max_cells), f"i{width}"
     for k in range(cells):
         source = source.replace(f"  %r{k} = load {ty}, ptr %p{k}",
             f"  %raw{k} = load {ty}, ptr %p{k}\n  %r{k} = call {ty} @tile_consume({ty} %raw{k})")
@@ -201,7 +207,8 @@ def main():
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
     parser.add_argument("--widths", type=int, nargs="+", choices=(8, 16, 32, 64), default=[8, 16, 32, 64])
-    parser.add_argument("--cells", type=int, nargs="+", choices=(2, 3, 4), default=[2, 3, 4])
+    parser.add_argument("--cells", type=int, nargs="+", choices=range(2, 9), default=[2, 3, 4])
+    parser.add_argument("--object-max-cells", type=int, choices=(4, 8), default=4)
     parser.add_argument("--shapes", nargs="+", choices=(*SUPPORTED, *FALLBACKS), default=["supported", "address"])
     parser.add_argument("--families", nargs="+", choices=("xor", "additive", "seeded"), default=["xor", "additive"])
     parser.add_argument("--seeds", type=int, nargs="+", default=[1])
@@ -211,6 +218,8 @@ def main():
     parser.add_argument("--private-calls", action="store_true", help="supply every tile cell directly to a real private integer consumer")
     parser.add_argument("--c-o2", action="store_true", help="ordinary optimized C; requires widths 32/64, cells 2, shape supported")
     args = parser.parse_args()
+    if any(n > args.object_max_cells for n in args.cells):
+        parser.error("larger fixtures require the explicit --object-max-cells 8 experiment")
     if args.private_calls and (args.c_o2 or args.shapes != ["supported"]):
         parser.error("--private-calls requires IR fixtures with only --shapes supported")
     if args.c_o2 and (set(args.widths) - {32, 64} or args.cells != [2] or args.shapes != ["supported"]):
@@ -224,7 +233,7 @@ def main():
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out,), timeout=180)
     summary = {"schema": "sre-tile-conformance-v1", "passed": False, "complete": False,
                "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False,
-               "frontend": "clang-O2" if args.c_o2 else "IR-fixture"}
+               "frontend": "clang-O2" if args.c_o2 else "IR-fixture", "object_max_cells": args.object_max_cells}
     c_source = out / "source.c"
     if args.c_o2:
         shutil.copy2(FIXTURES / "tile_c_kernel.c", c_source)
@@ -234,6 +243,7 @@ def main():
              "-native-late-constants=0", "-native-merge=0", "-native-values=1", "-native-values-wide=1",
              "-native-region-plan=connected", "-native-connected-nodes=2", "-native-functions=kernel",
              "-native-plan=1", "-native-scale-budget=1", "-native-bundles=1", "-native-object-bundles=1",
+             f"-native-object-max-cells={args.object_max_cells}",
              "-obf-deterministic", "-obf-verify"]
     if args.c_o2: flags.append("-native-transfer-nodes=32")
     if args.object_phases: flags.append("-native-object-phases=1")
@@ -241,21 +251,28 @@ def main():
         flags = [f for f in flags if f != "-native-functions=kernel"]
         flags += ["-native-functions=kernel,tile_consume", "-native-encoded-calls=1", "-native-bundle-call-outputs=1"]
     try:
-        driver = out / "driver.o"
-        runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
+        drivers = {}
+        for count in sorted({max(4, n) for n in args.cells}):
+            drivers[count] = out / f"driver-{count}.o"
+            runner.run(["clang", "-O2", "-pthread", f"-DTILE_OUTPUT_CELLS={count}", "-c",
+                        str(FIXTURES / "tile_driver.c"), "-o", str(drivers[count])])
         for width in args.widths:
             vectors = inputs(width, args.random_inputs)
             pairs = [tuple(map(int, line.split())) for line in vectors.splitlines()]
             for cells in args.cells:
+                driver = drivers[max(4, cells)]
                 for shape in args.shapes:
                     case = out / f"i{width}-n{cells}-{shape}"
                     case.mkdir()
+                    dump(case / "fixture.json", {"output_cells": max(4, cells), "tile_cells": cells,
+                                                "object_max_cells": args.object_max_cells})
                     clean = case / "clean.ll"
                     if args.c_o2:
                         runner.run(["clang", "-O2", *(["-DTILE_WORD32"] if width == 32 else []), "-S", "-emit-llvm",
                                     str(c_source), "-o", str(clean)])
                     else:
-                        clean.write_text(private_fixture(width, cells) if args.private_calls else fixture(width, cells, shape))
+                        clean.write_text(private_fixture(width, cells, args.object_max_cells) if args.private_calls else
+                                         fixture(width, cells, shape, args.object_max_cells))
                     expected = None
                     if shape not in FALLBACKS:
                         expected = "".join(" ".join(f"{v:016x}" for v in
@@ -315,9 +332,30 @@ def main():
                                     if digest(protected) != prior or digest(report) != prior_report:
                                         raise ToolFailure("nondeterministic IR/report")
                                     if args.ablation:
+                                        if cells > 4:
+                                            capped = case / (name + "-cap-four.ll")
+                                            capped_report = capped.with_suffix(".json")
+                                            cap_substitutions = {
+                                                "-native-object-max-cells=8": "-native-object-max-cells=4",
+                                                str(protected): str(capped),
+                                                f"-native-report-json={report}": f"-native-report-json={capped_report}",
+                                                f"-native-stage-dir={stage}": f"-native-stage-dir={stage}-cap-four"}
+                                            runner.run([cap_substitutions.get(arg, arg) for arg in command])
+                                            cap_data = json.loads(capped_report.read_text())
+                                            cap_rows = [r for r in cap_data["object_bundles"]
+                                                        if r["function"] == "kernel" and r["reason"] != "existing-owner"]
+                                            if (report_violations(cap_data) or len(cap_rows) != 1 or
+                                                cap_rows[0]["status"] != "skipped" or
+                                                cap_rows[0]["reason"] != "requires-small-flat-integer-array"):
+                                                raise ToolFailure("default four-cell ceiling did not reject wide object")
+                                            binary = capped.with_suffix(".bin")
+                                            runner.run(["clang", str(capped), str(driver), "-pthread", "-o", str(binary)])
+                                            if runner.run([str(binary)], stdin=vectors) != expected:
+                                                raise ToolFailure("four-cell ceiling control differential failed")
                                         disabled = case / (name + "-disabled.ll")
                                         disabled_report = case / (name + "-disabled.json")
                                         substitutions = {"-native-object-bundles=1": "-native-object-bundles=0",
+                                            "-native-object-max-cells=8": "-native-object-max-cells=4",
                                             "-native-object-phases=1": "-native-object-phases=0",
                                             str(protected): str(disabled),
                                             f"-native-report-json={report}": f"-native-report-json={disabled_report}",

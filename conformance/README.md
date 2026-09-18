@@ -337,6 +337,12 @@ Large-program gates are temporarily deferred for development per
 [`V04_DEFERRED_SCALE.md`](../docs/V04_DEFERRED_SCALE.md); their results are not
 silently promoted to passing.
 
+`tile_run --object-max-cells 8` opts into the bounded larger-tile experiment;
+the default stays four. Wider drivers compare every cell, and `--ablation`
+requires rejection under the default ceiling as well as testing the tiles-off
+control. `test_tile_width` checks explicit model/report policy and all five-to-eight
+cell shapes. See [the scope and budget limits](../docs/NATIVE_WIDE_TILES_V1.md).
+
 Corpus-lock revision `m0-3` freezes bzip2/cJSON IO manifests under ignored
 `out/v04-frozen-holdouts-20260918/`. Existing seeds and resource caps are unchanged.
 Only unobfuscated reference programs were built during preparation; their

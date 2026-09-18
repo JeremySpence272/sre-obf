@@ -107,6 +107,8 @@ cl::opt<bool> NativeObjectBundles("native-object-bundles",
     cl::desc("Experimental closed, initialized local integer tiles"), cl::init(false));
 cl::opt<bool> NativeObjectPhases("native-object-phases",
     cl::desc("Rekey and permute closed tiles at every useful store"), cl::init(false));
+cl::opt<unsigned> NativeObjectMaxCells("native-object-max-cells",
+    cl::desc("Closed tile shape ceiling: 4 (default) or explicit 8-cell experiment"), cl::init(4));
 cl::opt<std::string> NativeTransferFamily("native-transfer-family",
     cl::desc("Bundle representation: xor, additive, or seeded"), cl::init("seeded"));
 cl::opt<unsigned> NativeBundleValues("native-bundle-values",
@@ -276,6 +278,9 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-bundle-phases requires native-bundle-loops");
   if (NativeObjectPhases && !NativeObjectBundles)
     report_fatal_error("native-object-phases requires native-object-bundles");
+  if ((NativeObjectMaxCells != 4 && NativeObjectMaxCells != 8) ||
+      (NativeObjectMaxCells != 4 && !NativeObjectBundles))
+    report_fatal_error("native-object-max-cells must be 4, or 8 with native-object-bundles");
   if (NativeBundleLoopBoundaries && !NativeBundleLoops)
     report_fatal_error("native-bundle-loop-boundaries requires native-bundle-loops");
   if ((NativePlan || NativeSemanticBudget) && NativeRegionPlan != "connected")
@@ -452,6 +457,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.Phases = NativeBundlePhases;
     Options.LoopBoundaries = NativeBundleLoopBoundaries;
     Options.ObjectPhases = NativeObjectPhases;
+    Options.ObjectMaxCells = NativeObjectMaxCells;
     Options.CallInputs = NativeBundleCallInputs;
     Options.CallOutputs = NativeBundleCallOutputs;
     Options.Predicates = NativeBundlePredicates;
@@ -778,7 +784,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"bundle_control", obf::nativeBundleControl()},
                             {"continuity_priority", NativeContinuityPriority.getValue()},
                             {"immutable_continuity_contract", 2},
-                            {"object_bundle_contract", 3},
+                            {"object_bundle_contract", 4},
+                            {"object_max_cells", NativeObjectMaxCells.getValue()},
                             {"object_phases", NativeObjectPhases.getValue()},
                             {"transfer_family", NativeTransferFamily.getValue()},
                             {"bundle_values", NativeBundleValues.getValue()},

@@ -140,7 +140,7 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
   auto *T = dyn_cast<ArrayType>(A->getAllocatedType());
   auto *Count = dyn_cast<ConstantInt>(A->getArraySize());
   if (A->getAddressSpace() || !Count || !Count->isOne() || !T ||
-      T->getNumElements() < 2 || T->getNumElements() > 4 ||
+      T->getNumElements() < 2 || T->getNumElements() > O.ObjectMaxCells ||
       !T->getElementType()->isIntegerTy()) return fail("requires-small-flat-integer-array");
   B.P.Width = T->getElementType()->getIntegerBitWidth();
   B.P.Cells = T->getNumElements();
@@ -559,7 +559,7 @@ json::Array encodeNativeObjectBundles(Module &M, uint64_t Seed, const NativeBund
         {"schema", "sre-object-bundle-v1"}, {"status", "skipped"}, {"reason", B.Reason},
         {"growth_allocation", B.Reason.empty() ? B.P.Cost : 0}, {"module_growth_limit", O.GrowthBudget},
         {"attempted_operations", 0}, {"retained_operations", 0}, {"rolled_back_operations", 0},
-        {"pins", O.Pin}, {"hardness_evaluated", false}};
+        {"pins", O.Pin}, {"max_cells", O.ObjectMaxCells}, {"hardness_evaluated", false}};
     if (B.Reason.empty()) {
       Rng R = Rng(Seed).fork("native-object-bundles-v1").fork(B.F->getName()).fork(B.P.ID);
       B.P.Coordinates = O.Family == "additive" || (O.Family == "seeded" && (R.u64() & 1))

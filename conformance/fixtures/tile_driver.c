@@ -4,11 +4,18 @@
 #include <stdio.h>
 #include <string.h>
 
+#ifndef TILE_OUTPUT_CELLS
+#define TILE_OUTPUT_CELLS 4
+#endif
+#if TILE_OUTPUT_CELLS < 4 || TILE_OUTPUT_CELLS > 8
+#error "conformance tile output width must be 4..8"
+#endif
+
 extern void invoke(uint64_t, uint64_t, uint64_t *);
 
 static void *worker(void *arg) {
   uintptr_t id = (uintptr_t)arg;
-  uint64_t expected[4], actual[4];
+  uint64_t expected[TILE_OUTPUT_CELLS], actual[TILE_OUTPUT_CELLS];
   for (uint64_t k = 0; k < 128; ++k) {
     invoke(k + id, k * 13, expected);
     for (unsigned r = 0; r < 4; ++r) {
@@ -30,11 +37,14 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
-  uint64_t a, b, out[4];
+  uint64_t a, b, out[TILE_OUTPUT_CELLS];
   while (scanf("%" SCNu64 " %" SCNu64, &a, &b) == 2) {
     invoke(a, b, out);
-    printf("%016" PRIx64 " %016" PRIx64 " %016" PRIx64 " %016" PRIx64 "\n",
-           out[0], out[1], out[2], out[3]);
+    for (unsigned k = 0; k < TILE_OUTPUT_CELLS; ++k) {
+      if (k) putchar(' ');
+      printf("%016" PRIx64, out[k]);
+    }
+    putchar('\n');
   }
   return ferror(stdin) ? 2 : 0;
 }

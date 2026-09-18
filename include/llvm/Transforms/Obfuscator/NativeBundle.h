@@ -10,6 +10,7 @@ struct NativeBundleOptions {
   // Two descriptor-driven triangular families, or a seeded per-region choice.
   std::string Family = "seeded";
   unsigned Values = 4, Nodes = 16, GrowthBudget = 0;
+  unsigned ObjectMaxCells = 4;
   bool Pin = true;
   bool Loops = false, Phases = false;
   bool LoopBoundaries = false;
@@ -24,7 +25,8 @@ struct NativeBundleOptions {
 json::Array stampNativeBundleOrigins(Module &);
 json::Array encodeNativeBundles(Module &, uint64_t, const NativeBundleOptions &);
 json::Array nativeBundlePredicateInventory(Module &);
-// One closed, fully initialized 2..4-cell local integer tile per function.
+// One closed, fully initialized local integer tile per function; four-cell
+// default, explicit eight-cell shape experiment with the same growth caps.
 // Shares the caller's bundle growth allowance; disabled by default in driver.
 json::Array encodeNativeObjectBundles(Module &, uint64_t, const NativeBundleOptions &);
 }

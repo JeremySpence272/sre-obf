@@ -280,6 +280,9 @@ contracts below. W3 remains incomplete and is not promoted.
 It now preserves proved single-entry root lifetimes and supports exact constant
 byte offsets and decoded packed-read boundaries, including ordinary O2 C
 fixtures. This is not an interprocedural ownership or general-layout solution.
+The explicit [five-to-eight-cell experiment](NATIVE_WIDE_TILES_V1.md) is also
+implemented, with full-output tests and unchanged budgets; the default stays
+four. An eight-cell phased fixture remains over its shared allocation.
 
 Existing flat-array encoding already accepts some runtime indices and carries
 two lanes through loads/stores; the aggregate leaf extension accepts constant

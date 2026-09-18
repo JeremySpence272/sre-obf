@@ -16,20 +16,22 @@ class Descriptor:
     family: str
     salts: tuple[int, ...]
     rotations: tuple[int, ...]
+    max_lanes: int = 4
 
     def __post_init__(self):
         if self.width not in (2, 4, 8, 16, 32, 64) or self.family not in FAMILIES:
             raise ValueError("unsupported descriptor")
-        if not 2 <= len(self.salts) <= 4 or len(self.rotations) != len(self.salts):
+        if (type(self.max_lanes) is not int or self.max_lanes not in (4, 8) or
+                not 2 <= len(self.salts) <= self.max_lanes or len(self.rotations) != len(self.salts)):
             raise ValueError("invalid lane count")
         if any(not 0 < r < self.width for r in self.rotations):
             raise ValueError("poison rotation")
 
     @classmethod
-    def from_plan(cls, region):
+    def from_plan(cls, region, max_lanes=4):
         return cls(region["width"], region["family"],
                    tuple(int(s, 16) for s in region["salts_hex"]),
-                   tuple(region["rotations"]))
+                   tuple(region["rotations"]), max_lanes=max_lanes)
 
     @property
     def bits(self):

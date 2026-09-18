@@ -26,11 +26,15 @@ def tile_violations(report):
     enabled = report.get("features", {}).get("object_bundles", False)
     if not enabled:
         if report.get("features", {}).get("object_phases"): return ["object phases require object bundles"]
+        if report.get("features", {}).get("object_max_cells", 4) != 4: return ["wide tiles require object bundles"]
         return ["tile rows exist with feature disabled"] if report.get("object_bundles") else []
     if not report.get("features", {}).get("bundles") or "object_bundles" not in report:
         return ["enabled tiles require bundles and an object inventory"]
     contract = report.get("features", {}).get("object_bundle_contract", 1)
-    if type(contract) is not int or contract not in (1, 2, 3): return ["unsupported object bundle contract"]
+    if type(contract) is not int or contract not in (1, 2, 3, 4): return ["unsupported object bundle contract"]
+    max_cells = report.get("features", {}).get("object_max_cells", 4 if contract < 4 else None)
+    if type(max_cells) is not int or max_cells not in (4, 8) or (contract < 4 and max_cells != 4):
+        return ["missing or unsupported tile shape ceiling"]
     phases = report.get("features", {}).get("object_phases", False)
     if type(phases) is not bool or (phases and contract < 3): return ["invalid object phase feature"]
     rows = report["object_bundles"]
@@ -53,6 +57,9 @@ def tile_violations(report):
         require(attempted == retained + lost, "attempted/retained/rollback mismatch")
         require(row["hardness_evaluated"] is False, "engineering gate claimed hardness")
         require(type(row["pins"]) is bool, "invalid pin mode")
+        if contract >= 4:
+            require(type(row.get("max_cells")) is int and row["max_cells"] == max_cells,
+                    "object shape ceiling differs from policy")
         if row["status"] == "skipped":
             require(row["reason"] in SKIPS, "unknown fallback")
             require(attempted == retained == lost == row["growth_allocation"] == 0, "skipped work credited")
@@ -62,9 +69,13 @@ def tile_violations(report):
         require(row["function"] not in owners, "multiple selected objects in one owner")
         owners.add(row["function"])
         plan = row["plan"]
-        desc = Descriptor.from_plan(plan)
+        try:
+            desc = Descriptor.from_plan(plan, max_lanes=max_cells)
+        except (KeyError, TypeError, ValueError):
+            errors.append(f"{name}: invalid bounded tile descriptor")
+            continue
         n = plan["cells"]
-        require(desc.width in (8, 16, 32, 64) and 2 <= n <= 4 and len(desc.salts) == n, "invalid shape")
+        require(desc.width in (8, 16, 32, 64) and 2 <= n <= max_cells and len(desc.salts) == n, "invalid shape")
         require(sorted(plan["physical_slots"]) == list(range(n)), "non-bijective layout")
         require(plan["law"] == "closed-initialized-tile-v1" and
                 plan["phase_mode"] == ("store-toggle-v1" if phases else "static"), "unknown law")
