@@ -1,0 +1,20 @@
+; Homogeneous SSA and two real output dependencies before the final reduction.
+; WIDTH is substituted by the conformance runner, never by the compiler pass.
+target triple = "x86_64-unknown-linux-gnu"
+define iWIDTH @kernel(iWIDTH %a, iWIDTH %b) noinline {
+entry:
+  %a0 = add iWIDTH %a, %b
+  %b0 = xor iWIDTH %b, 91
+  %a1 = mul iWIDTH %a0, 13
+  %b1 = sub iWIDTH %b0, %a0
+  %a2 = lshr iWIDTH %a1, 3
+  %b2 = shl iWIDTH %b1, 2
+  %a3 = xor iWIDTH %a1, %a2
+  %b3 = or iWIDTH %b1, %b2
+  %a4 = add iWIDTH %a3, %b3
+  %b4 = and iWIDTH %b3, 127
+  %a5 = ashr iWIDTH %a4, 1
+  %b5 = xor iWIDTH %b4, %a4
+  %answer = xor iWIDTH %a5, %b5
+  ret iWIDTH %answer
+}

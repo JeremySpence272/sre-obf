@@ -58,6 +58,8 @@ enum class Family : uint8_t {
   None,
   XorPrefixPair,   // e ^ r, carry network for arithmetic          (v03 baseline)
   AdditivePair,    // e - r, coordinate-wise for linear operations (v03 baseline)
+  TriangularXor,  // jointly chained XOR coordinates plus a carrier
+  TriangularAdditive, // jointly chained additive coordinates plus a carrier
   Count
 };
 StringRef name(Family);
@@ -116,15 +118,13 @@ std::string originId(StringRef Function, StringRef Kind, unsigned Index);
 // and every transfer names the representation on each side, so a reference
 // model can be checked against the plan without reading the emitter.
 //
-// M1 delivers that declaration point and the descriptor. It does NOT yet make
-// the lowering dispatch on it: the connected emitter still branches on a
-// per-region `Affine` boolean for the two v03 families. Replacing that branch
-// with a descriptor-driven dispatch is M2 work, and until it happens a new
-// family needs a lowering path as well as a descriptor.
+// The v03 connected path still branches on its per-region `Affine` boolean.
+// NativeBundle's new lowering instead dispatches from this descriptor and a
+// sealed slot schedule; declaring a family here alone never supplies a lowering.
 struct Representation {
   Family Fam = Family::None;
   uint16_t Rev = 0;          // revision of that family
-  uint8_t Lanes = 0;         // physical lanes carrying one logical value
+  uint8_t Lanes = 0;         // physical coordinates, including shared carriers
   uint16_t LogicalWidth = 0; // source value width in bits; 0 = mixed
   uint16_t LaneWidth = 0;    // physical carrier width per lane, in bits
   // The invariant a valid lane tuple satisfies, as a checkable name, e.g.

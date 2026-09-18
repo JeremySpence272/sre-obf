@@ -5,6 +5,7 @@
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
 #include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/NativeBudget.h"
+#include "llvm/Transforms/Obfuscator/NativeBundle.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InlineAsm.h"
@@ -87,6 +88,16 @@ cl::opt<unsigned> NativeSemanticBudget("native-semantic-budget",
     cl::desc("M1: percent of the connected component cost limit reserved for components that own "
              "encoded storage (0..50; 0 reserves nothing)"),
     cl::init(0));
+cl::opt<bool> NativeBundles("native-bundles",
+    cl::desc("Experimental planned multi-output triangular native transfers"), cl::init(false));
+cl::opt<std::string> NativeTransferFamily("native-transfer-family",
+    cl::desc("Bundle representation: xor, additive, or seeded"), cl::init("seeded"));
+cl::opt<unsigned> NativeBundleValues("native-bundle-values",
+    cl::desc("Logical slots per persistent bundle (2..4)"), cl::init(4));
+cl::opt<unsigned> NativeTransferNodes("native-transfer-nodes",
+    cl::desc("Maximum original operations per combined transfer (8..32)"), cl::init(16));
+cl::opt<bool> NativeBundlePins("native-bundle-pins",
+    cl::desc("Pin whole tuples at entry/exit; off is the forwarding ablation"), cl::init(true));
 
 void saveNativeStage(const Module &M, StringRef Stage) {
   if (NativeStageDir.empty()) return;
@@ -215,6 +226,15 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-scale-structure requires native-scale-budget");
   if (NativeSemanticBudget > 50)
     report_fatal_error("native-semantic-budget must be 0..50");
+  if (NativeTransferFamily != "xor" && NativeTransferFamily != "additive" && NativeTransferFamily != "seeded")
+    report_fatal_error("native-transfer-family must be xor, additive, or seeded");
+  if (NativeBundleValues < 2 || NativeBundleValues > 4 || NativeTransferNodes < 8 || NativeTransferNodes > 32)
+    report_fatal_error("native bundle limits require 2..4 values and 8..32 transfer nodes");
+  if (NativeBundles && NativeRegionPlan != "connected")
+    report_fatal_error("native-bundles requires native-region-plan=connected");
+  if (!NativeBundles && (NativeTransferFamily.getNumOccurrences() || NativeBundleValues.getNumOccurrences() ||
+                         NativeTransferNodes.getNumOccurrences() || NativeBundlePins.getNumOccurrences()))
+    report_fatal_error("native bundle options require native-bundles");
   if ((NativePlan || NativeSemanticBudget) && NativeRegionPlan != "connected")
     report_fatal_error("native-plan and native-semantic-budget require native-region-plan=connected");
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
@@ -253,6 +273,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   // Output-directory names must not change RNG streams or encoded data.
   M.setModuleIdentifier(sys::path::filename(M.getSourceFileName()));
   auto InputInventory = obf::nativeBoundaryInventory(M, "input-before-fusion");
+  json::Array BundleOrigins;
+  if (NativeBundles) BundleOrigins = obf::stampNativeBundleOrigins(M);
   json::Array FusionCoverage, FusionAbsorbed;
   if (NativeFusion) {
     // Captured immediately before fusion, so a function it consumes is
@@ -363,7 +385,23 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   for (Function &F : M)
     if (F.hasFnAttribute("sre.native.original"))
       SourceWeights.emplace_back(&F, std::clamp(F.getInstructionCount(), 32u, 4096u));
-  json::Array GrowthCoverage;
+  json::Array GrowthCoverage, BundleCoverage;
+  if (NativeBundles) {
+    checkModuleBudget(M, "before-bundle-allocation");
+    obf::NativeBundleOptions Options;
+    Options.Family = NativeTransferFamily;
+    Options.Values = NativeBundleValues;
+    Options.Nodes = NativeTransferNodes;
+    Options.Pin = NativeBundlePins;
+    // One bounded share of remaining headroom. Connected/CFF/helper passes
+    // allocate against the remaining module, never the pre-bundle total.
+    Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
+    BundleCoverage = obf::encodeNativeBundles(M, PreparedCache.ModuleSeed, Options);
+    AM.invalidate(M, PreservedAnalyses::none());
+    if (verifyModule(M, &errs())) report_fatal_error("native bundles produced invalid IR");
+    checkModuleBudget(M, "after-bundles");
+    saveNativeStage(M, "bundles.ll");
+  }
   if (NativeRegionPlan == "connected") {
     obf::NativeConnectedOptions Options;
     Options.Nodes = NativeConnectedNodes;
@@ -647,6 +685,11 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"scale_budget", NativeScaleBudget.getValue()}, {"helper_limit", HelperLimit},
                             {"scale_structure", NativeScaleStructure.getValue()},
                             {"plan", NativePlan.getValue()},
+                            {"bundles", NativeBundles.getValue()},
+                            {"transfer_family", NativeTransferFamily.getValue()},
+                            {"bundle_values", NativeBundleValues.getValue()},
+                            {"transfer_nodes", NativeTransferNodes.getValue()},
+                            {"bundle_pins", NativeBundlePins.getValue()},
                             {"semantic_budget", NativeSemanticBudget.getValue()},
                             {"memory_ssa", NativeMemorySSA.getValue()}, {"predicate_regions", NativePredicateRegions.getValue()},
                             {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},
@@ -669,6 +712,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
     Result["encoded_calls"] = std::move(CallCoverage);
+    if (NativeBundles) {
+      Result["bundle_input_inventory"] = std::move(BundleOrigins);
+      Result["bundles"] = std::move(BundleCoverage);
+    }
     // Absent, not empty, when no arbitration ran: an unplanned denominator is
     // unknown rather than zero.
     if (NativeCallPolicy) Result["call_policy"] = std::move(CallPolicy);

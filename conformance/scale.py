@@ -10,11 +10,12 @@ import base64
 from collections import Counter
 import json
 from pathlib import Path
-from conformance import corpora
+from conformance import bundle_options, corpora
 from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.whole import build, parser as build_parser
 from conformance.run import ROOT
 from conformance.connected_check import SHARD_ACCOUNTING, cost_accounting, report_violations
+from conformance.bundle_check import bundle_summary
 
 
 # Reports that actually emit connected planning denominators. An older report
@@ -76,6 +77,7 @@ def source_ledger(report):
     source = [row for row in rows if not row.get("generated_helper")]
     selection = {row["function"]: row for row in report.get("functions", []) or []}
     planner = {row["function"]: row for row in report.get("connected_regions", []) or []}
+    bundled = {row["function"] for row in report.get("bundles", []) if row["retained_operations"]}
     final = {row["function"] for row in (report.get("final_inventory", {}).get("functions") or [])}
     owners = merge_owners(report)
     encoded = {row["function"]: row["encoded_function"]
@@ -95,6 +97,8 @@ def source_ledger(report):
         plan = planner.get(owner)
         if name in selection and not selection[name].get("selected", True):
             state = "not-selected"
+        elif owner in bundled:
+            state = "encoded"
         elif plan is None:
             if name in selection or name in owners:
                 state = "not-planned"
@@ -140,8 +144,10 @@ def source_ledger(report):
                 sum(1 for row in rows if row.get("generated_helper")),
             "unaccounted_examples": unaccounted,
             "selection_rows": len(selection), "planner_rows": len(planner),
+            "bundle_owners": len(bundled),
             "scope": "input IR before fusion, merging and every pass; a merged origin is "
                      "credited to its current owner, including encoded-interface renames. "
+                     "Selected regions include retained connected regions or bundles. "
                      "Instruction weights are whole-function input weights, not counts of "
                      "protected source instructions. Explicit fusion/dead-code removals "
                      "remain an absorption bucket with unknown body coverage; an absent "
@@ -435,6 +441,7 @@ def coverage(report):
     source_rows = original["functions"]
     ledger, objects = source_ledger(report), object_ledger(report)
     measured = {"source_ledger": ledger, "object_ledger": objects,
+            "bundles": bundle_summary(report),
             "support_charge": support_charge(report), "cap_ledger": cap_ledger(report),
             "loss_ledger": loss_ledger(report),
             "coverage_views": coverage_views(report, ledger, objects),
@@ -503,6 +510,7 @@ def main():
     for flag in ("plan", "encoded-calls", "call-policy"):
         p.add_argument("--" + flag, action="store_true")
     p.add_argument("--semantic-budget", type=int, default=0)
+    bundle_options.add_options(p)
     p.add_argument("--connected-shards", action="store_true",
                    help="Explicit bounded-shard experiment for oversized connected components; not a promotion flag")
     p.add_argument("--require-flattening", action="store_true")
@@ -513,6 +521,10 @@ def main():
     p.add_argument("--require-aggregate-memory", action="store_true")
     p.add_argument("--post-o2-attack", action="store_true")
     args = p.parse_args()
+    try:
+        bundle_options.validate(args, args.variant == "v02")
+    except ValueError as exc:
+        p.error(str(exc))
     if (args.plan or args.encoded_calls or args.call_policy or args.semantic_budget) and args.variant != "v02":
         p.error("v04 experiments require the connected v02 base variant")
     if args.call_policy and not args.encoded_calls:
@@ -592,7 +604,8 @@ def main():
               "scale_budget": args.scale_budget,
               "scale_structure": args.scale_structure,
               "v04_features": {"plan": args.plan, "encoded_calls": args.encoded_calls,
-                               "call_policy": args.call_policy, "semantic_budget": args.semantic_budget},
+                               "call_policy": args.call_policy, "semantic_budget": args.semantic_budget,
+                               "bundle_flags": bundle_options.flags(args)},
               "connected_shards": args.connected_shards,
               "connected_aggregates": args.connected_aggregates,
               "post_o2_attack": args.post_o2_attack,
@@ -620,6 +633,7 @@ def main():
             for name in ("plan", "encoded_calls", "call_policy"):
                 if getattr(args, name): argv += ["--" + name.replace("_", "-")]
             argv += ["--semantic-budget", str(args.semantic_budget)]
+            argv += bundle_options.argv(args)
     phase = "build"
     try:
         manifest = build(build_parser().parse_args(argv))

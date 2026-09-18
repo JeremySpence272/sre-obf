@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
 #include "llvm/Transforms/Obfuscator/NativePlan.h"
+#include "llvm/Transforms/Obfuscator/NativeTransfer.h"
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
 #include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
@@ -42,7 +43,7 @@ bool safe(const Function &F) {
   }
   return true;
 }
-struct Pair { Value *E = nullptr, *R = nullptr; };
+using Pair = transfer::Pair;
 struct Object {
   AllocaInst *A;
   Type *Element;
@@ -331,34 +332,20 @@ class Encoder {
     return B.CreateOr(B.CreateShl(V, N), B.CreateLShr(V, W - N));
   }
   Pair bxor(IRBuilder<> &B, Pair X, Pair Y) {
-    return {B.CreateXor(X.E, Y.E), B.CreateXor(X.R, Y.R)};
+    return transfer::bxor(B, X, Y);
   }
   Pair band(IRBuilder<> &B, Pair X, Pair Y) {
-    // Keep one product in the second coordinate: no temporary combines all
-    // four terms into plaintext. Site-level pinning refreshes the pair later.
-    Value *E = B.CreateXor(B.CreateXor(B.CreateAnd(X.E, Y.E), B.CreateAnd(X.E, Y.R)),
-                          B.CreateAnd(X.R, Y.E));
-    return {E, B.CreateAnd(X.R, Y.R)};
+    return transfer::band(B, X, Y);
   }
-  Pair bor(IRBuilder<> &B, Pair X, Pair Y) { return bxor(B, bxor(B, X, Y), band(B, X, Y)); }
-  Pair bnot(IRBuilder<> &B, Pair X) { return {B.CreateNot(X.E), X.R}; }
-  Pair shl(IRBuilder<> &B, Pair X, unsigned D) { return {B.CreateShl(X.E, D), B.CreateShl(X.R, D)}; }
-  Pair lshr(IRBuilder<> &B, Pair X, unsigned D) { return {B.CreateLShr(X.E, D), B.CreateLShr(X.R, D)}; }
+  Pair bor(IRBuilder<> &B, Pair X, Pair Y) { return transfer::bor(B, X, Y); }
+  Pair bnot(IRBuilder<> &B, Pair X) { return transfer::bnot(B, X); }
+  Pair shl(IRBuilder<> &B, Pair X, unsigned D) { return transfer::shl(B, X, D); }
+  Pair lshr(IRBuilder<> &B, Pair X, unsigned D) { return transfer::lshr(B, X, D); }
   Pair convert(IRBuilder<> &B, Pair X, Type *T, bool Sign = false) {
-    return {B.CreateIntCast(X.E, T, Sign), B.CreateIntCast(X.R, T, Sign)};
+    return transfer::cast(B, X, T, Sign);
   }
   Pair badd(IRBuilder<> &B, Pair X, Pair Y, bool CarryIn = false) {
-    Pair P = bxor(B, X, Y), Original = P;
-    unsigned W = X.E->getType()->getIntegerBitWidth();
-    if (CarryIn) Original.E = B.CreateXor(Original.E, constant(X.E->getType(), 1));
-    if (W == 1) return Original;
-    Pair G = band(B, X, Y);
-    if (CarryIn) G = bor(B, G, band(B, P, {constant(X.E->getType(), 1), constant(X.E->getType(), 0)}));
-    for (unsigned D = 1; D < W; D *= 2) {
-      G = bor(B, G, band(B, P, shl(B, G, D)));
-      if (D * 2 < W) P = band(B, P, shl(B, P, D));
-    }
-    return bxor(B, Original, shl(B, G, 1));
+    return transfer::add(B, X, Y, CarryIn);
   }
   Pair convertFamily(IRBuilder<> &B, Pair X, bool FromAffine, bool ToAffine) {
     if (FromAffine == ToAffine) return X;
@@ -474,6 +461,9 @@ class Encoder {
     return {Regions[RegionID].Affine ? B.CreateAdd(X, R) : B.CreateXor(X, R), R};
   }
   bool candidate(const Instruction &I) {
+    // A bundle transfer already owns these coordinates and boundaries. Never
+    // count its implementation instructions as new useful source operations.
+    if (I.getMetadata("sre.native.bundle")) return false;
     // Encoded-call plumbing already holds a pair, or hides one coordinate of
     // it. Encoding it would encode an encoding and would put the pair out of
     // reach of direct absorption. The join xor is deliberately not listed: its
@@ -532,7 +522,7 @@ class Encoder {
     unsigned ObjectID = 0;
     for (Instruction &I : F.getEntryBlock()) {
       auto *A = dyn_cast<AllocaInst>(&I);
-      if (!A || A->getAddressSpace() != 0 || !isa<ConstantInt>(A->getArraySize()) ||
+      if (!A || A->getMetadata("sre.native.bundle") || A->getAddressSpace() != 0 || !isa<ConstantInt>(A->getArraySize()) ||
           !cast<ConstantInt>(A->getArraySize())->isOne()) continue;
       std::string ID = (F.getName() + "/alloca/" + Twine(ObjectID++)).str();
       Type *T = A->getAllocatedType(), *E = T;

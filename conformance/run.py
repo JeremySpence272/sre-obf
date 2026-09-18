@@ -12,6 +12,7 @@ import sys
 
 from .metrics import CANARY, FOLDABLE, c_metrics, contains_integer, flattening_ran
 from .process import Runner, ToolFailure, digest, dump
+from . import bundle_options
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "conformance" / "fixtures"
@@ -88,7 +89,7 @@ def opt_command(plugin: Path) -> list[str]:
 
 
 def feature_flags(args: argparse.Namespace) -> list[str]:
-    return [f"-native-diversity={int(not args.no_diversity)}",
+    return bundle_options.flags(args) + [f"-native-diversity={int(not args.no_diversity)}",
             f"-native-data={int(not args.no_data)}",
             f"-native-helper-hardening={int(not args.no_helpers)}",
             f"-native-late-constants={int(not args.no_late)}",
@@ -382,6 +383,7 @@ def parser() -> argparse.ArgumentParser:
                  "joint-outputs", "encoded-calls", "call-policy", "plan"):
         p.add_argument("--" + name, action="store_true")
     p.add_argument("--semantic-budget", type=int, default=0)
+    bundle_options.add_options(p)
     p.add_argument("--lane-transitions", choices=tuple(LANE_TRANSITIONS), default="off",
                    help="P6: key dispatcher transitions on the live encoded-data word")
     p.add_argument("--family", type=int, choices=(-1, 0, 1, 2, 3), default=-1)
@@ -404,6 +406,10 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    try:
+        bundle_options.validate(args, args.region_plan == "connected")
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     args.out, args.plugin = args.out.resolve(), args.plugin.resolve()
     if not args.plugin.is_file():
         raise SystemExit(f"build this fork first; plugin missing: {args.plugin}")

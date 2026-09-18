@@ -3,6 +3,7 @@ import argparse
 import json
 from pathlib import Path
 from conformance.call_policy import policy_violations
+from conformance.bundle_check import bundle_violations
 from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, test_inputs
 
@@ -33,7 +34,7 @@ def cost_accounting(report):
 def report_violations(report):
     """Validate before computing coverage; malformed reports fail explicitly."""
     violations = []
-    for check in (invariants, call_violations, policy_violations, plan_violations):
+    for check in (invariants, call_violations, policy_violations, plan_violations, bundle_violations):
         try:
             violations.extend(check(report))
         except (KeyError, TypeError, ValueError) as exc:
@@ -43,7 +44,7 @@ def report_violations(report):
 
 BOUNDARY_REASONS = ("external-abi", "address-exposure", "unsupported-operation",
                     "object-escape", "component-limit", "interface-mismatch", "budget-loss")
-PLAN_FAMILIES = ("none", "xor-prefix-pair", "additive-pair")
+PLAN_FAMILIES = ("none", "xor-prefix-pair", "additive-pair", "triangular-xor", "triangular-additive")
 PLAN_VERIFICATION = ("unverified", "algebraic", "enumerated", "smt")
 PLAN_CONSUMERS = ("branch-choice", "address", "return", "call", "store", "phi",
                   "unsupported-consumer")

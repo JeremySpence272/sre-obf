@@ -11,7 +11,7 @@ const char *const BoundaryNames[unsigned(Boundary::Count)] = {
     "external-abi", "address-exposure", "unsupported-operation", "object-escape",
     "component-limit", "interface-mismatch", "budget-loss"};
 const char *const FamilyNames[unsigned(Family::Count)] = {
-    "none", "xor-prefix-pair", "additive-pair"};
+    "none", "xor-prefix-pair", "additive-pair", "triangular-xor", "triangular-additive"};
 const char *const NodeKindNames[unsigned(NodeKind::Count)] = {
     "pure", "load", "store", "compare", "phi", "select", "cast"};
 const char *const TransferNames[unsigned(TransferKind::Count)] = {

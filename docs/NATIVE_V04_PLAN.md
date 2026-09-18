@@ -654,6 +654,11 @@ comparison. Large static libc must not hide application-level cost regressions.
 
 ## 8. Delivery order and difficulty
 
+Implementation checkpoint: [experimental native bundles](NATIVE_BUNDLE_V1.md)
+documents the first descriptor-driven, bounded M2 emitter and its controls.
+That checkpoint is not completion of M0–M6; phase/loop, memory, predicate and
+private-call bundle integration remain outstanding.
+
 Implement medium milestones with independently reviewable code and evidence.
 Maintain the current two-space C++ style, stdlib Python tests, schema conventions
 and owner Git identity. Refactoring must preserve the existing v03-off path.

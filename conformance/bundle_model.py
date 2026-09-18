@@ -1,0 +1,152 @@
+"""Bit-vector specification and independent oracle for triangular native bundles.
+
+The specification knows the descriptor. Successful decoding is an inverse control,
+not a binary-only extraction result. Correctness and protection are separate.
+"""
+from dataclasses import dataclass
+from conformance import connected_model as cm
+
+FAMILIES = ("triangular-xor-v1", "triangular-additive-v1")
+OPCODES = ("add", "sub", "mul", "xor", "and", "or", "shl", "lshr", "ashr")
+
+
+@dataclass(frozen=True)
+class Descriptor:
+    width: int
+    family: str
+    salts: tuple[int, ...]
+    rotations: tuple[int, ...]
+
+    def __post_init__(self):
+        if self.width not in (2, 4, 8, 16, 32, 64) or self.family not in FAMILIES:
+            raise ValueError("unsupported descriptor")
+        if not 2 <= len(self.salts) <= 4 or len(self.rotations) != len(self.salts):
+            raise ValueError("invalid lane count")
+        if any(not 0 < r < self.width for r in self.rotations):
+            raise ValueError("poison rotation")
+
+    @classmethod
+    def from_plan(cls, region):
+        return cls(region["width"], region["family"],
+                   tuple(int(s, 16) for s in region["salts_hex"]),
+                   tuple(region["rotations"]))
+
+    @property
+    def bits(self):
+        return (1 << self.width) - 1
+
+    @property
+    def additive(self):
+        return self.family == FAMILIES[1]
+
+    def mask(self, state, carrier, slot):
+        a = state[slot - 1] if slot else carrier
+        t = ((a ^ self.salts[slot]) + carrier) & self.bits
+        r = self.rotations[slot]
+        return (((t << r) | (t >> (self.width - r))) ^
+                (a * (self.salts[slot] | 1))) & self.bits
+
+    def encode(self, values, carrier):
+        if len(values) != len(self.salts):
+            raise ValueError("wrong logical tuple width")
+        state = []
+        for slot, value in enumerate(values):
+            mask = self.mask(state, carrier, slot)
+            state.append(((value + mask) if self.additive else (value ^ mask)) & self.bits)
+        return tuple(state)
+
+    def decode(self, state, carrier):
+        if len(state) != len(self.salts):
+            raise ValueError("wrong encoded tuple width")
+        return tuple(((word - self.mask(state, carrier, k)) if self.additive else
+                      (word ^ self.mask(state, carrier, k))) & self.bits
+                     for k, word in enumerate(state))
+
+    def update(self, state, carrier, destination, opcode, x, y):
+        """Masked transfer followed by triangular downstream repair."""
+        def read(operand):
+            if "constant_hex" in operand:
+                return int(operand["constant_hex"], 16) & self.bits, 0
+            slot = operand["slot"]
+            return state[slot], self.mask(state, carrier, slot)
+        fresh = carrier ^ state[-1]
+        result = pair_operation(opcode, read(x), read(y), self.width, self.additive, fresh)
+        new = list(state)
+        for k in range(destination, len(state)):
+            old = result if k == destination else (state[k], self.mask(state, carrier, k))
+            m = self.mask(new, carrier, k)
+            new[k] = ((old[0] + m - old[1]) if self.additive else (old[0] ^ (old[1] ^ m))) & self.bits
+        return tuple(new)
+
+
+def scalar(opcode, x, y, width):
+    """Independent source semantics, including defined arithmetic right shift."""
+    bits = (1 << width) - 1
+    if opcode in ("shl", "lshr", "ashr") and not 0 <= y < width:
+        raise ValueError("poison shift")
+    if opcode == "add": out = x + y
+    elif opcode == "sub": out = x - y
+    elif opcode == "mul": out = x * y
+    elif opcode == "xor": out = x ^ y
+    elif opcode == "and": out = x & y
+    elif opcode == "or": out = x | y
+    elif opcode == "shl": out = x << y
+    elif opcode == "lshr": out = (x & bits) >> y
+    elif opcode == "ashr": out = ((x & bits) - ((1 << width) if x & (1 << (width - 1)) else 0)) >> y
+    else: raise ValueError("unsupported operation")
+    return out & bits
+
+
+def pair_operation(opcode, x, y, width, additive, fresh):
+    bits = (1 << width) - 1
+    fresh &= bits
+    xor, inv, land, lor, *_ = cm.operations(width)
+    to_add = lambda z: cm.xor_to_additive_grouped(z, fresh, width)
+    to_xor = lambda z: cm.additive_to_xor(z, fresh, fresh ^ bits, width)
+    def product(a, b):
+        return ((a[0] * b[0] + fresh - (a[0] * b[1] + b[0] * a[1]) +
+                 a[1] * b[1]) & bits, fresh)
+    if opcode in ("shl", "lshr", "ashr"):
+        if y[1]:
+            raise ValueError("shift amount must be unshared constant")
+        a = to_xor(x) if additive else x
+        out = tuple(scalar(opcode, p, y[0], width) for p in a)
+        return to_add(out) if additive else out
+    if additive:
+        if opcode in ("add", "sub"):
+            return tuple(scalar(opcode, a, b, width) for a, b in zip(x, y))
+        if opcode == "mul": return product(x, y)
+        # The emitter uses the complemented refresh for the second conversion;
+        # that affects coordinates but not decoded semantics.
+        other = cm.additive_to_xor(y, fresh ^ bits, fresh, width)
+        return to_add(pair_operation(opcode, to_xor(x), other, width, False, fresh))
+    if opcode == "xor": out = xor(x, y)
+    elif opcode == "and": out = land(x, y)
+    elif opcode == "or": out = lor(x, y)
+    elif opcode == "add": out = cm.add(x, y, width)
+    elif opcode == "sub": out = cm.add(x, inv(y), width, True)
+    elif opcode == "mul":
+        other = cm.xor_to_additive_grouped(y, fresh ^ bits, width)
+        out = to_xor(product(to_add(x), other))
+    else: raise ValueError("unsupported operation")
+    return tuple(p & bits for p in out)
+
+
+def replay(region, inputs):
+    """Compare every emitted-plan step with scalar semantics; retain all outputs."""
+    d = Descriptor.from_plan(region)
+    if len(inputs) != region["inputs"]:
+        raise ValueError("wrong input count")
+    values = list(inputs) + [0] * (region["lanes"] - len(inputs))
+    r = d.rotations[0]
+    rotated = ((inputs[0] << r) | (inputs[0] >> (d.width - r))) & d.bits
+    carrier = (rotated + (inputs[1] ^ d.salts[0])) & d.bits
+    state = d.encode(values, carrier)
+    def read(op):
+        return int(op["constant_hex"], 16) & d.bits if "constant_hex" in op else values[op["slot"]]
+    for step in region["steps"]:
+        state = d.update(state, carrier, step["destination"], step["opcode"], step["x"], step["y"])
+        values[step["destination"]] = scalar(step["opcode"], read(step["x"]), read(step["y"]), d.width)
+        if d.decode(state, carrier) != tuple(values):
+            raise AssertionError("bundle transfer differs from independent source semantics")
+    return tuple(values[k] for k in region["output_slots"])
