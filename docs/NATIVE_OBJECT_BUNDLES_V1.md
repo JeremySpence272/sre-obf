@@ -16,13 +16,28 @@ ordinary nonvariadic IR without personality, EH, indirect terminators, inline
 assembly, returns-twice/musttail calls or stack save/restore. The function cap
 is 12,000 incoming instructions.
 
-The complete object-use walk accepts only exact-width, nonvolatile, nonatomic
-loads/stores and root-relative inbounds GEPs. Every index must be proved
+The complete object-use walk accepts exact-width, nonvolatile, nonatomic scalar
+loads/stores and root-relative inbounds GEPs. It also accepts bounded fixed-vector
+reads of whole elements as explicitly decoded output boundaries (not encoded
+vector computation). Their start must be constant and the entire span must fit.
+Root-relative constant byte offsets must be nonnegative, element-aligned and
+inside the object. Byte-addressed pointers do not permit bytewise observation.
+Every scalar element index must be proved
 nonnegative and below N by LLVM known-bits analysis; an `inbounds` annotation
 alone is insufficient. GEP sign extension is respected. No pointer escapes,
-identity observations, derived aliases, partial/byte accesses, lifetime markers,
+identity observations, derived aliases, partial/byte accesses, vector stores,
 memory intrinsics, pointer PHIs/selects or unreachable accesses are admitted.
 Those cases remain unchanged with an explicit fallback reason.
+
+Whole-object lifetime markers are supported under `sre-tile-lifetime-v1`:
+either none, or one root start in the entry block dominating all accesses,
+plus up to eight reachable ends. After an end, no object access or further
+lifetime marker may be reachable, including through a backedge or shared
+epilogue. Mutually exclusive ends and a start without explicit ends are valid.
+Restarts, late starts, unreachable markers, derived-pointer markers and operand
+bundles are rejected. The LLVM 22 whole-alloca marker calls are retargeted in
+place to the new allocation, never discarded or moved. The original alloca
+alignment is preserved, including alignment promised by lifetime arguments.
 
 The first N memory accesses must initialize each distinct constant slot exactly
 once in the entry block. The last initializer must dominate every remaining
@@ -64,6 +79,9 @@ creating the decoded scalar. A store reads the old tuple, selects the new pair
 for its logical destination, then repairs every coordinate using old/new masks.
 For unchanged cells this is `E xor (R xor R')` or `(E + R') - R`. The old masks
 are always computed from the old tuple. All other cell values are preserved.
+Slot comparisons preserve narrow LLVM index semantics: impossible slot numbers
+are not truncated into an i1/i2 index type. A regression reproduced the earlier
+i1 bug, where slot 2 compared equal to slot 0 after constant truncation.
 
 External uses reconstruct a scalar at the original definition point. This
 includes encoded results used as an index. Reports count original scalar
@@ -71,6 +89,11 @@ boundary values/use edges, including the subset of GEP-index uses. Dynamic
 access counts also include indices that entered as ordinary scalar inputs;
 `scalar_address_uses` is not a count of every physical machine address.
 Tracked index bindings follow RAUW before source instructions are erased.
+Packed output reads load the tuple once and reconstruct the requested vector
+lanes. `vector_output_values`, `vector_output_uses` and `decoded_vector_lanes`
+record that exposure separately; those decodes are not credited as useful
+encoded arithmetic. This permits ordinary O2-coalesced output reads without
+pretending the vector stays protected at the interface.
 
 The layout and carrier are **static for the activation** in v1. The loop-phase
 option does not imply object rekeying. Each call owns an independent stack
@@ -98,6 +121,8 @@ bundle-owned so the later bundle, connected and legacy memory paths do not
 count or re-encode it as new source work.
 
 The native-v6 report adds `object_bundles` rows using `sre-object-bundle-v1`.
+Feature `object_bundle_contract=2` requires lifetime, access-span and vector
+boundary accounting. Older contract-1 artifacts remain readable.
 The shared accounting gate checks dispositions, ownership/initialization and
 bounds declarations, layout bijection, useful operations, original ancestry,
 growth, extra physical reads/writes and scalar exposures. Counts are static
@@ -130,7 +155,15 @@ random cases. Native output and report determinism, repeated calls and threaded
 calls are checked. Negative ownership fixtures are compiled/verified but never
 executed when their source could be undefined.
 These are deliberately shaped IR fixtures, not evidence of broad optimized
-C/C++ coverage. `--shapes many-loads` additionally stresses deterministic
+C/C++ coverage. The additional `--c-o2` mode compiles an archived ordinary C
+fixture with plain Clang `-O2` (32-/64-bit word variants), without disabling SROA,
+vectorization, lifetime insertion or unrolling. `noinline` retains the named
+test entry; there is no `optnone`, volatile or inline assembly in the C source.
+The native transfer-node bound is 32 to admit frontend-unrolled updates. It has
+an independent unsigned-word oracle and uses the same all-output/disabled/O2/
+threaded checks. Use `--widths 32 64 --cells 2 --shapes supported --c-o2 --ablation`.
+This establishes optimized-C fixture support, not broad corpus coverage.
+`--shapes many-loads` additionally stresses deterministic
 boundary emission beyond the inline pointer-set capacity; its redundant loads
 are a stress control, not evidence of useful new protection.
 
@@ -141,9 +174,59 @@ not binary-only discovery. Full-output agreement, assembly hashes and decompiler
 shape are diagnostics; none establishes resistance to recovery scripts, SMT,
 storage forwarding, or agents. Extra decompiled lines are not a hardness score.
 
-## Recorded evidence, 2026-09-18
+## Lifetime and optimized-C continuation evidence, 2026-09-18
 
 Final plugin SHA-256:
+`eef278941d55e9ca9ba2551078dde9c0afe30cbd8ff360260be4ed4749a9f335`.
+The full pinned-solver suite passes 449 tests, no skips (78.061 seconds).
+
+- `out/tile-lifetime-first-20260918`: ten i16 controls for closed/open lifetimes,
+  mutually exclusive ends with a shared epilogue, constant byte offsets and
+  vector exits, both pin modes.
+- `out/tile-lifetime-negative-20260918`: 22 compiler-only controls rejecting
+  early/backedge/conditional ends followed by accesses, restarts, missing/late
+  starts, repeated/unreachable ends, unaligned offsets and invalid vector spans.
+- `out/tile-lifetime-matrix-20260918`: 16 i8/i64 three-cell lifetime-join/vector
+  controls, both families and pin modes, seed 3. Byte input pairs exhaustive.
+- `out/tile-narrow-prefix-control-20260918` reproduces an actual pre-fix output
+  mismatch for a proved-zero i1 index. `out/tile-narrow-fixed-20260918` passes
+  eight exhaustive i8 four-cell constant/dynamic-index controls with both
+  families and pin modes. The failure artifact is retained, not overwritten.
+- `out/tile-lifetime-alignment-20260918`: two positive 64-byte-aligned marker
+  controls and two pointer-bearing operand-bundle rejection controls.
+- `out/tile-lifetime-final-reemit-20260918`: final plugin emits byte-identical
+  IR for all 56 preceding first/negative/matrix/narrow controls and all 48
+  original scalar tile matrix cells (104 total); final accounting checks pass.
+- `out/tile-c-o2-release-20260918`: final plugin, eight ordinary Clang-O2 C
+  cases, 32-/64-bit words, both families and pin modes, seed 4. The C source
+  is archived/hashed. Each retains **18 encoded operations**, translates two
+  lifetime markers, and records two decoded vector lanes. All 593 outputs
+  agree with the independent oracle at clean, tile-stage, final and post-O2
+  stages; matched disabled/O2 and threaded controls pass. This is nonzero
+  optimized-C fixture coverage, not nonzero large-corpus coverage.
+- `out/tile-c-lifetime-cff-20260918`: both families with applied multi-state
+  flattening under the max constenc/flattening ablation; 593 C-oracle vectors
+  pass natively and after O2. Not the full max preset.
+- `out/tile-c-o2-decompile-20260918`: five stripped informed-entry arms, each
+  with 1,105 agreeing outputs. Clean/native/post-O2/off/off-O2 C sizes are
+  985/19,851/12,425/2,660/2,588 bytes. Shape diagnostics only, not hardness.
+- `out/tile-lifetime-final-scale-zlib-20260918` and
+  `out/tile-lifetime-final-scale-lua-20260918`: exact final plugin passes the
+  original primary 250k caps, workloads, accounting and post-O2 gates. IR remains
+  248,698/238,820; **zero tiles retained in either corpus**. The formerly
+  lifetime-blocked candidates now fail the subsequent pointer-escape check.
+
+Earlier continuation runs are preserved: first/lifetime-negative artifacts
+used `3eb5b3bb57e5281ff77253e11fcb43d0cbb9b6d6b130a1717bb2b2bb9b6185c1`;
+the initial narrow fix and `tile-c-o2-final` used
+`53856febe9bb8577e64dc6431137c635c99217eed5a10b88d9ac213482dbbc44` before
+alignment preservation. The final replay and release directories above qualify
+the current results. No agent run, protected holdout evaluation, cap increase,
+or crackme repackaging was performed. W3 and v04 remain incomplete.
+
+## Initial tile increment evidence (413b2b6), 2026-09-18
+
+That increment's plugin SHA-256:
 `96c6a8c748646a529780b2fcd1698f739232665306d82c4243b38b61d08e9beb`.
 Pinned LLVM 22.1.8 build passes. The full pinned-solver Python suite passes
 442 tests with no skips (84.389 seconds).
@@ -189,7 +272,7 @@ performed. Generality and resistance remain unestablished for this increment.
 ## Remaining W3 work
 
 Still deferred: immutable/global backing, aggregates and derived aliases,
-proved lifetime handling, initialized-subobject and memory-intrinsic support,
+restarted/nested lifetimes, initialized-subobject and memory-intrinsic support,
 ownership propagation through direct calls, multiple tiles/owners, object-phase
 joins/rekeying and phase-dependent permutations, richer operation scheduling,
 and informed index/storage-recovery baselines. Escaping/heap ownership remains

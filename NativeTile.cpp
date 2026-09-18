@@ -8,6 +8,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/ValueHandle.h"
@@ -57,6 +58,7 @@ bool safe(const Function &F) {
 struct Access {
   std::optional<unsigned> Constant;
   bool Store = false, Initializer = false;
+  unsigned Elements = 1;
   std::string Origin;
 };
 struct Step { unsigned Opcode; std::string Origin; };
@@ -74,14 +76,59 @@ struct Binding {
   Plan P;
   SmallVector<GetElementPtrInst *, 16> Pointers;
   SmallVector<Instruction *, 16> Memory;
+  SmallVector<LifetimeIntrinsic *, 8> Lifetimes;
+  LifetimeIntrinsic *LifetimeStart = nullptr;
   SmallVector<WeakTrackingVH, 16> Indices;
   SmallVector<StoreInst *, 4> Initializers;
   StoreInst *LastInitializer = nullptr;
   SmallVector<Instruction *, 32> Nodes;
   unsigned BoundaryValues = 0, BoundaryUses = 0, AddressUses = 0;
   unsigned ScalarInputs = 0;
+  unsigned VectorOutputs = 0, VectorUses = 0, VectorLanes = 0;
   std::string Reason;
 };
+
+bool planLifetime(Binding &B, const DominatorTree &DT) {
+  auto fail = [&](StringRef Reason) { B.Reason = Reason.str(); return false; };
+  if (B.Lifetimes.empty()) return true;
+  unsigned Starts = 0, Ends = 0;
+  for (LifetimeIntrinsic *I : B.Lifetimes) {
+    if (!DT.isReachableFromEntry(I->getParent())) return fail("unreachable-lifetime-marker");
+    if (I->getIntrinsicID() == Intrinsic::lifetime_start) { ++Starts; B.LifetimeStart = I; }
+    else ++Ends;
+  }
+  if (Starts != 1 || B.LifetimeStart->getParent() != &B.F->getEntryBlock())
+    return fail("requires-single-entry-lifetime");
+  if (Ends > 8) return fail("lifetime-end-limit");
+  for (Instruction *I : B.Memory)
+    if (!DT.dominates(B.LifetimeStart, I)) return fail("lifetime-start-does-not-dominate");
+  SmallPtrSet<Instruction *, 32> Accesses(B.Memory.begin(), B.Memory.end());
+  SmallPtrSet<Instruction *, 16> Markers(B.Lifetimes.begin(), B.Lifetimes.end());
+  for (LifetimeIntrinsic *End : B.Lifetimes) {
+    if (End == B.LifetimeStart) continue;
+    if (!DT.dominates(B.LifetimeStart, End)) return fail("lifetime-start-does-not-dominate");
+    // Check the suffix, then reachable successors (including a possible return
+    // to this block). No memory access or second marker may follow an end on
+    // ANY path. Mutually exclusive ends need not postdominate one another.
+    auto check = [&](Instruction *First) {
+      for (Instruction *I = First; I; I = I->getNextNode()) {
+        if (Accesses.contains(I)) return fail("access-after-lifetime-end");
+        if (Markers.contains(I)) return fail("repeated-lifetime-end");
+      }
+      return true;
+    };
+    if (!check(End->getNextNode())) return false;
+    SmallVector<BasicBlock *, 16> Queue(successors(End->getParent()));
+    SmallPtrSet<BasicBlock *, 32> Seen;
+    for (unsigned K = 0; K < Queue.size(); ++K) {
+      BasicBlock *BB = Queue[K];
+      if (!Seen.insert(BB).second) continue;
+      if (!check(&BB->front())) return false;
+      llvm::append_range(Queue, successors(BB));
+    }
+  }
+  return true;
+}
 
 bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &DT) {
   AllocaInst *A = B.Object;
@@ -99,11 +146,10 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
   Type *E = T->getElementType();
   DenseMap<Value *, Value *> Index;
   Index[A] = ConstantInt::get(Type::getInt32Ty(A->getContext()), 0);
-  // Deliberately only root-relative GEPs in v1. Derived aliases, lifetimes,
-  // byte observation and memory intrinsics have explicit fallbacks, not an
-  // assumption that an inbounds annotation proves initialized tile contents.
+  // Root-relative GEPs only, including constant byte offsets emitted by O2.
+  // A byte-addressed pointer is not permission for bytewise observation.
   for (User *U : A->users()) if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
-    if (!G->isInBounds() || G->getPointerOperand() != A || G->getResultElementType() != E)
+    if (!G->isInBounds() || G->getPointerOperand() != A)
       return fail("unsupported-pointer-layout");
     Value *V = nullptr;
     if (G->getSourceElementType() == T && G->getNumIndices() == 2) {
@@ -112,6 +158,12 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
       V = G->getOperand(2);
     } else if (G->getSourceElementType() == E && G->getNumIndices() == 1) {
       V = G->getOperand(1);
+    } else if (G->getSourceElementType()->isIntegerTy(8) && G->getNumIndices() == 1) {
+      auto *Offset = dyn_cast<ConstantInt>(G->getOperand(1));
+      unsigned Bytes = B.P.Width / 8;
+      if (!Offset || Offset->isNegative() || Offset->getValue().uge(uint64_t(Bytes) * B.P.Cells) ||
+          Offset->getZExtValue() % Bytes) return fail("unaligned-or-unbounded-byte-offset");
+      V = ConstantInt::get(Type::getInt64Ty(A->getContext()), Offset->getZExtValue() / Bytes);
     } else return fail("unsupported-pointer-layout");
     if (!V->getType()->isIntegerTy()) return fail("unproved-index");
     KnownBits K = computeKnownBits(V, A->getModule()->getDataLayout(), nullptr, G, &DT);
@@ -129,17 +181,27 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
       return fail("derived-pointer");
     }
     if (auto *L = dyn_cast<LoadInst>(U)) {
-      if (L->getPointerOperand() != Pointer || L->getType() != E || !L->isSimple())
+      bool Exact = L->getType() == E;
+      if (auto *V = dyn_cast<FixedVectorType>(L->getType())) {
+        auto *Start = dyn_cast<ConstantInt>(Index.lookup(Pointer));
+        Exact = V->getElementType() == E && Start &&
+                V->getNumElements() >= 2 && V->getNumElements() <= B.P.Cells &&
+                Start->getZExtValue() + V->getNumElements() <= B.P.Cells;
+      }
+      if (L->getPointerOperand() != Pointer || !Exact || !L->isSimple())
         return fail("partial-volatile-or-atomic-access");
     } else if (auto *S = dyn_cast<StoreInst>(U)) {
       if (S->getPointerOperand() != Pointer || S->getValueOperand()->getType() != E || !S->isSimple())
         return fail("partial-volatile-or-atomic-access");
-    } else if (auto *I = dyn_cast<IntrinsicInst>(U); I && I->isLifetimeStartOrEnd()) {
-      return fail("lifetime-not-supported");
+    } else if (auto *I = dyn_cast<LifetimeIntrinsic>(U)) {
+      if (Pointer != A || I->arg_size() != 1 || I->getArgOperand(0) != A || I->hasOperandBundles())
+        return fail("requires-root-lifetime-marker");
     } else return fail("pointer-escape-or-observation");
   }
   // Deterministic order independent of pointer use lists / hash iteration.
   for (Instruction &I : instructions(*B.F)) {
+    if (auto *L = dyn_cast<LifetimeIntrinsic>(&I); L && L->getArgOperand(0) == A)
+      B.Lifetimes.push_back(L);
     Value *Ptr = nullptr;
     if (auto *L = dyn_cast<LoadInst>(&I)) Ptr = L->getPointerOperand();
     if (auto *S = dyn_cast<StoreInst>(&I)) Ptr = S->getPointerOperand();
@@ -147,11 +209,16 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
     if (!DT.isReachableFromEntry(I.getParent())) return fail("unreachable-access");
     Access M;
     M.Store = isa<StoreInst>(I); M.Origin = origin(I);
+    if (auto *V = dyn_cast<FixedVectorType>(I.getType())) {
+      M.Elements = V->getNumElements();
+      ++B.VectorOutputs; B.VectorUses += I.getNumUses(); B.VectorLanes += M.Elements;
+    }
     Value *V = Index.lookup(Ptr);
     if (auto *C = dyn_cast<ConstantInt>(V)) M.Constant = C->getZExtValue();
     B.Indices.push_back(V); B.Memory.push_back(&I); B.P.Accesses.push_back(M);
     if (B.Memory.size() > 64) return fail("memory-access-limit");
   }
+  if (!planLifetime(B, DT)) return false;
   B.Initializers.resize(B.P.Cells, nullptr);
   unsigned Initialized = 0;
   for (unsigned K = 0; K < B.Memory.size(); ++K) {
@@ -170,7 +237,9 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
 
   SmallPtrSet<Instruction *, 32> Forward, Useful;
   SmallVector<Instruction *, 32> Queue;
-  for (Instruction *I : B.Memory) if (isa<LoadInst>(I)) { Forward.insert(I); Queue.push_back(I); }
+  for (Instruction *I : B.Memory) if (isa<LoadInst>(I) && I->getType() == E) {
+    Forward.insert(I); Queue.push_back(I);
+  }
   if (Queue.empty()) return fail("no-loads");
   for (unsigned K = 0; K < Queue.size(); ++K) for (User *U : Queue[K]->users()) {
     auto *I = dyn_cast<Instruction>(U);
@@ -249,7 +318,12 @@ class Lowering {
     B.CreateStore(M, pointer(P.Cells))->setVolatile(Pin);
   }
   Value *matches(unsigned Access, unsigned K) {
+    if (P.Accesses[Access].Constant) return B.getInt1(*P.Accesses[Access].Constant == K);
     Value *V = Bound.Indices[Access];
+    // LLVM permits i1/i2 GEP indices. Do not truncate K into that type: e.g.
+    // constant 2 would become i1 zero and alias logical slots zero and two.
+    unsigned Width = V->getType()->getIntegerBitWidth();
+    if (Width < 64 && K >= (uint64_t(1) << Width)) return B.getFalse();
     return B.CreateICmpEQ(V, ConstantInt::get(V->getType(), K));
   }
   Pair read(Value *V) {
@@ -274,7 +348,13 @@ public:
     IRBuilder<> Entry(getAllocaIP(F));
     StorageType = ArrayType::get(B.getIntNTy(P.Width), P.Cells + 1);
     Storage = Entry.CreateAlloca(StorageType, nullptr, "sre.tile.tuple");
+    // Retargeted lifetime argument attributes may promise the original
+    // alignment. Preserve that promise on the larger private allocation.
+    Storage->setAlignment(std::max(Storage->getAlign(), Bound.Object->getAlign()));
     Storage->setMetadata("sre.native.value", MDNode::get(F.getContext(), {}));
+    // LLVM 22 lifetimes name the whole alloca, not a byte-size argument.
+    // Retarget in place: no marker motion, deletion, or new intrinsic callee.
+    for (LifetimeIntrinsic *I : Bound.Lifetimes) { I->setArgOperand(0, Storage); I->setMetadata(TagName, Tag); }
     SmallVector<Value *, 4> Initial, Z;
     for (StoreInst *S : Bound.Initializers) Initial.push_back(B.CreateFreeze(S->getValueOperand()));
     Value *M = B.CreateAdd(bundle::rotate(B, Initial[0], P.Rotations[0]), B.CreateXor(Initial[1], c(P.Salts[0])));
@@ -285,8 +365,23 @@ public:
     for (unsigned K = 0; K < Bound.Memory.size(); ++K) {
       auto *L = dyn_cast<LoadInst>(Bound.Memory[K]);
       if (!L) continue;
-      Members.insert(L); B.SetInsertPoint(L);
+      B.SetInsertPoint(L);
       Z = load(M);
+      if (auto *V = dyn_cast<FixedVectorType>(L->getType())) {
+        Value *Out = PoisonValue::get(V);
+        unsigned First = *P.Accesses[K].Constant;
+        for (unsigned J = 0; J < V->getNumElements(); ++J) {
+          Value *R = mask(Z, M, First + J);
+          Value *X = P.Coordinates == Family::Xor ? B.CreateXor(Z[First + J], R)
+                                                 : B.CreateSub(Z[First + J], R);
+          if (auto *I = dyn_cast<Instruction>(X))
+            I->setMetadata("sre.native.boundary", MDNode::get(F.getContext(), MDString::get(F.getContext(), "tile-vector-exit")));
+          Out = B.CreateInsertElement(Out, X, J);
+        }
+        L->replaceAllUsesWith(Out);
+        continue;
+      }
+      Members.insert(L);
       Pair Out{Z[0], mask(Z, M, 0)};
       for (unsigned J = 1; J < P.Cells; ++J) {
         Value *C = matches(K, J);
@@ -330,7 +425,8 @@ public:
         Boundary->setMetadata("sre.native.boundary", MDNode::get(F.getContext(), MDString::get(F.getContext(), "tile-exit")));
       I->replaceUsesWithIf(Scalar, external);
     }
-    for (Instruction *I : Bound.Memory) if (isa<StoreInst>(I)) I->eraseFromParent();
+    for (Instruction *I : Bound.Memory)
+      if (isa<StoreInst>(I) || I->getType()->isVectorTy()) I->eraseFromParent();
     for (Instruction *I : OrderedMembers) I->dropAllReferences();
     for (Instruction *I : OrderedMembers) I->eraseFromParent();
     for (GetElementPtrInst *G : Bound.Pointers) G->eraseFromParent();
@@ -350,7 +446,8 @@ json::Object describe(const Binding &B) {
     Loads += !A.Store; Stores += A.Store; Dynamic += !A.Constant;
     Accesses.push_back(json::Object{{"kind", A.Store ? "store" : "load"}, {"initializer", A.Initializer},
         {"index", A.Constant ? json::Value(*A.Constant) : json::Value(nullptr)},
-        {"bounds", A.Constant ? "constant" : "known-bits-nonnegative-in-range"}, {"input_origin", A.Origin}});
+        {"bounds", A.Constant ? "constant" : "known-bits-nonnegative-in-range"},
+        {"elements", A.Elements}, {"input_origin", A.Origin}});
   }
   for (const Step &S : P.Steps) Steps.push_back(json::Object{
       {"opcode", Instruction::getOpcodeName(S.Opcode)}, {"input_origin", S.Origin}});
@@ -364,6 +461,14 @@ json::Object describe(const Binding &B) {
       {"physical_stores", (1 + Stores - P.Cells) * (P.Cells + 1)},
       {"scalar_input_values", B.ScalarInputs}, {"scalar_output_values", B.BoundaryValues},
       {"scalar_output_uses", B.BoundaryUses}, {"scalar_address_uses", B.AddressUses},
+      {"vector_output_values", B.VectorOutputs}, {"vector_output_uses", B.VectorUses},
+      {"decoded_vector_lanes", B.VectorLanes},
+      {"lifetime", json::Object{{"contract", "sre-tile-lifetime-v1"},
+          {"mode", B.LifetimeStart ? "single-entry" : "whole-function"},
+          {"source_starts", B.LifetimeStart ? 1 : 0},
+          {"source_ends", B.Lifetimes.size() - (B.LifetimeStart ? 1 : 0)},
+          {"translated_markers", B.Lifetimes.size()},
+          {"proof", "start-dominates-accesses-no-access-or-marker-reachable-after-end"}}},
       {"accesses", std::move(Accesses)}, {"steps", std::move(Steps)}};
 }
 }

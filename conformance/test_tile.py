@@ -137,6 +137,86 @@ class TileReports(unittest.TestCase):
         self.assertEqual(ledger["bundle_owners"], 0)
 
 
+def lifetime_report():
+    data = valid_report()
+    data["features"]["object_bundle_contract"] = 2
+    plan = data["object_bundles"][0]["plan"]
+    plan.update(vector_output_values=0, vector_output_uses=0, decoded_vector_lanes=0)
+    for access in plan["accesses"]: access["elements"] = 1
+    plan["lifetime"] = {"contract": "sre-tile-lifetime-v1", "mode": "single-entry",
+                        "source_starts": 1, "source_ends": 2, "translated_markers": 3,
+                        "proof": "start-dominates-accesses-no-access-or-marker-reachable-after-end"}
+    return data
+
+
+class TileLifetimes(unittest.TestCase):
+    def test_complete_single_entry_and_unmarked_contracts(self):
+        data = lifetime_report()
+        self.assertEqual(tile_violations(data), [])
+        self.assertEqual(tile_summary(data)["lifetime_owned_objects"], 1)
+        self.assertEqual(tile_summary(data)["translated_lifetime_markers"], 3)
+        life = data["object_bundles"][0]["plan"]["lifetime"]
+        life.update(mode="whole-function", source_starts=0, source_ends=0, translated_markers=0)
+        self.assertEqual(tile_violations(data), [])
+
+    def test_missing_modern_proofs(self):
+        for key in ("lifetime", "vector_output_values", "vector_output_uses", "decoded_vector_lanes"):
+            data = lifetime_report()
+            del data["object_bundles"][0]["plan"][key]
+            self.assertTrue(tile_violations(data), key)
+        data = lifetime_report()
+        del data["object_bundles"][0]["plan"]["accesses"][0]["elements"]
+        self.assertTrue(tile_violations(data))
+        data["features"]["object_bundle_contract"] = 99
+        self.assertTrue(tile_violations(data))
+
+    def test_lifetime_mutations(self):
+        for key, value in (("mode", "restarted"), ("proof", "assumed"), ("contract", "unknown"),
+                           ("source_starts", 0), ("source_starts", 2), ("source_ends", 9),
+                           ("source_ends", -1), ("translated_markers", 0)):
+            data = lifetime_report()
+            data["object_bundles"][0]["plan"]["lifetime"][key] = value
+            self.assertTrue(tile_violations(data), key)
+
+    def test_vector_boundary_is_not_scalar_or_encoded_operation_credit(self):
+        data = lifetime_report()
+        plan = data["object_bundles"][0]["plan"]
+        plan["accesses"][-2]["elements"] = 2
+        plan.update(vector_output_values=1, vector_output_uses=1, decoded_vector_lanes=2)
+        self.assertEqual(tile_violations(data), [])
+        self.assertEqual(tile_summary(data)["decoded_vector_lanes"], 2)
+        self.assertEqual(tile_summary(data)["retained_operations"], 6)
+        for key in ("vector_output_values", "decoded_vector_lanes"):
+            changed = copy.deepcopy(data)
+            changed["object_bundles"][0]["plan"][key] = 0
+            self.assertTrue(tile_violations(changed), key)
+
+    def test_vector_span_must_be_whole_elements_and_proved_in_bounds(self):
+        for index, span in ((0, 0), (0, 3), (1, 2), (None, 2)):
+            data = lifetime_report()
+            plan = data["object_bundles"][0]["plan"]
+            plan["accesses"][-2].update(index=index, elements=span)
+            self.assertTrue(tile_violations(data))
+        data = lifetime_report()
+        data["object_bundles"][0]["plan"]["accesses"][0]["elements"] = 2
+        self.assertTrue(tile_violations(data))
+
+    def test_source_fixture_oracle_wraps_at_each_word_width(self):
+        from conformance.tile_run import c_oracle
+        for width in (32, 64):
+            mask = (1 << width) - 1
+            for a, b in ((0, 0), (mask, mask), (mask, 16), (1 << (width - 1), mask - 1)):
+                out = c_oracle(a, b, width)
+                self.assertTrue(all(0 <= x <= mask for x in out))
+                self.assertEqual(out[2:], [a ^ b, 0])
+
+    def test_narrow_index_oracle_preserves_all_other_cells(self):
+        from conformance.tile_run import fixture, oracle
+        for shape in ("narrow-index", "narrow-constant"):
+            self.assertIn("i32 0, i1 ", fixture(8, 4, shape))
+            self.assertEqual(oracle(7, 3, 8, 4, shape)[1:], [8, 9, 10])
+
+
 class TileAlgebra(unittest.TestCase):
     def test_all_small_states_and_stores(self):
         # Independent replacement law. Exhaustive at reduced width, random at

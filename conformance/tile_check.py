@@ -14,6 +14,10 @@ SKIPS = {
     "requires-complete-entry-initialization", "initialization-does-not-dominate",
     "no-loads", "operation-limit", "no-useful-encoded-update", "function-cost-limit",
     "function-structure-or-size", "one-object-per-function", "module-unit-budget",
+    "requires-root-lifetime-marker", "requires-single-entry-lifetime",
+    "unreachable-lifetime-marker", "lifetime-end-limit",
+    "lifetime-start-does-not-dominate", "access-after-lifetime-end",
+    "repeated-lifetime-end", "unaligned-or-unbounded-byte-offset",
 }
 
 
@@ -24,6 +28,8 @@ def tile_violations(report):
         return ["tile rows exist with feature disabled"] if report.get("object_bundles") else []
     if not report.get("features", {}).get("bundles") or "object_bundles" not in report:
         return ["enabled tiles require bundles and an object inventory"]
+    contract = report.get("features", {}).get("object_bundle_contract", 1)
+    if type(contract) is not int or contract not in (1, 2): return ["unsupported object bundle contract"]
     rows = report["object_bundles"]
     sources = {r["function"]: r["instructions"] for r in report.get("bundle_input_inventory", [])}
     seen, owners, limits, allocated = set(), set(), set(), 0
@@ -61,12 +67,34 @@ def tile_violations(report):
         require(plan["ownership"] == "closed-entry-alloca" and
                 plan["initialization"] == "complete-entry-stores-dominate-accesses", "missing ownership proof")
         accesses = plan["accesses"]
+        modern = contract == 2
+        if modern:
+            require("lifetime" in plan, "missing lifetime contract")
+            require(all("elements" in a for a in accesses), "missing access spans")
+            require(all(k in plan for k in ("vector_output_values", "vector_output_uses", "decoded_vector_lanes")),
+                    "missing vector boundary accounting")
+        life = plan.get("lifetime")
+        if life is not None:
+            require(life["contract"] == "sre-tile-lifetime-v1" and life["proof"] ==
+                    "start-dominates-accesses-no-access-or-marker-reachable-after-end", "unknown lifetime proof")
+            for key in ("source_starts", "source_ends", "translated_markers"):
+                require(type(life[key]) is int and life[key] >= 0, f"invalid lifetime {key}")
+            starts, ends = life["source_starts"], life["source_ends"]
+            require(life["translated_markers"] == starts + ends, "lifetime markers lost")
+            require((life["mode"] == "whole-function" and starts == ends == 0) or
+                    (life["mode"] == "single-entry" and starts == 1 and 0 <= ends <= 8),
+                    "unsupported lifetime shape")
         initial = [a for a in accesses if a["initializer"]]
         require(len(initial) == n and sorted(a["index"] for a in initial) == list(range(n)),
                 "incomplete or duplicate initialization")
         require(initial == accesses[:n] and all(a["kind"] == "store" for a in initial),
                 "read/update precedes initialization")
         for a in accesses:
+            span = a.get("elements", 1)
+            require(type(span) is int and 1 <= span <= n, "invalid element span")
+            require(span == 1 or (a["kind"] == "load" and a["index"] is not None and
+                                 0 <= a["index"] and a["index"] + span <= n and not a["initializer"]),
+                    "unproved vector span")
             require(a["kind"] in ("load", "store"), "invalid memory operation")
             require(type(a["initializer"]) is bool, "invalid initializer marker")
             if a["index"] is None:
@@ -85,6 +113,12 @@ def tile_violations(report):
             require(type(plan[key]) is int and plan[key] >= 0, f"invalid {key}")
         require(plan["scalar_output_uses"] >= plan["scalar_output_values"] and
                 plan["scalar_output_uses"] >= plan["scalar_address_uses"], "exposure accounting mismatch")
+        vector_reads = [a for a in accesses if a.get("elements", 1) > 1]
+        require(plan.get("vector_output_values", 0) == len(vector_reads) and
+                plan.get("decoded_vector_lanes", 0) == sum(a["elements"] for a in vector_reads),
+                "vector exposure accounting mismatch")
+        uses = plan.get("vector_output_uses", 0)
+        require(type(uses) is int and uses >= 0 and (bool(vector_reads) or uses == 0), "invalid vector use count")
         require(4 <= len(plan["steps"]) <= 32 and attempted == len(plan["steps"]), "operation accounting mismatch")
         require(all(s["opcode"] in OPCODES for s in plan["steps"]), "unsupported useful operation")
         for item in (*accesses, *plan["steps"]):
@@ -122,5 +156,8 @@ def tile_summary(report):
             "retained_source_stores": sum(r["plan"]["source_stores"] for r in retained),
             "scalar_output_uses": sum(r["plan"]["scalar_output_uses"] for r in retained),
             "scalar_address_uses": sum(r["plan"]["scalar_address_uses"] for r in retained),
+            "decoded_vector_lanes": sum(r["plan"].get("decoded_vector_lanes", 0) for r in retained),
+            "lifetime_owned_objects": sum(r["plan"].get("lifetime", {}).get("mode") == "single-entry" for r in retained),
+            "translated_lifetime_markers": sum(r["plan"].get("lifetime", {}).get("translated_markers", 0) for r in retained),
             "skip_reasons": dict(Counter(r["reason"] for r in rows if r["status"] == "skipped")),
             "final_surviving_semantic_coverage": None, "hardness_evaluated": False}

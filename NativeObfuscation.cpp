@@ -717,6 +717,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"plan", NativePlan.getValue()},
                             {"bundles", NativeBundles.getValue()},
                             {"object_bundles", NativeObjectBundles.getValue()},
+                            {"object_bundle_contract", 2},
                             {"transfer_family", NativeTransferFamily.getValue()},
                             {"bundle_values", NativeBundleValues.getValue()},
                             {"transfer_nodes", NativeTransferNodes.getValue()},

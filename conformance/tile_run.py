@@ -4,6 +4,7 @@ No paid agent, protected holdout, promotion or hardness measurement.
 """
 import argparse
 import json
+import re
 from pathlib import Path
 import shutil
 
@@ -22,8 +23,21 @@ FALLBACKS = {
     "byte-read": "partial-volatile-or-atomic-access",
     "escape": "pointer-escape-or-observation",
     "derived": "derived-pointer",
-    "lifetime": "lifetime-not-supported",
+    "lifetime-early-end": "access-after-lifetime-end",
+    "lifetime-backedge-end": "access-after-lifetime-end",
+    "lifetime-conditional-end": "access-after-lifetime-end",
+    "lifetime-restart": "requires-single-entry-lifetime",
+    "lifetime-no-start": "requires-single-entry-lifetime",
+    "lifetime-late-start": "lifetime-start-does-not-dominate",
+    "lifetime-double-end": "repeated-lifetime-end",
+    "lifetime-unreachable-end": "unreachable-lifetime-marker",
+    "lifetime-bundle": "requires-root-lifetime-marker",
+    "byte-misaligned": "unaligned-or-unbounded-byte-offset",
+    "vector-overrun": "partial-volatile-or-atomic-access",
+    "vector-dynamic": "partial-volatile-or-atomic-access",
 }
+SUPPORTED = ("supported", "address", "many-loads", "lifetime", "lifetime-open",
+             "lifetime-joins", "lifetime-aligned", "byte-offset", "vector-exit", "narrow-index", "narrow-constant")
 
 
 def fixture(width, cells, shape="supported"):
@@ -70,9 +84,52 @@ def fixture(width, cells, shape="supported"):
     elif shape == "byte-read": source = source.replace("  %left =", "  %byte = load i1, ptr %p\n  %left =")
     elif shape == "escape": source = source.replace("  br label %loop", "  %observed = ptrtoint ptr %tile to i64\n  br label %loop", 1)
     elif shape == "derived": source = source.replace("  %left =", f"  %alias = getelementptr inbounds {ty}, ptr %p, i32 0\n  %left =")
-    elif shape == "lifetime":
-        source = source.replace(f"  %p0 =", "  call void @llvm.lifetime.start.p0(ptr %tile)\n  %p0 =", 1)
+    elif shape.startswith("lifetime"):
+        start = "  call void @llvm.lifetime.start.p0(ptr %tile)\n"
+        end = "  call void @llvm.lifetime.end.p0(ptr %tile)\n"
+        if shape != "lifetime-no-start": source = source.replace("  %p0 =", start + "  %p0 =", 1)
+        if shape not in ("lifetime-open", "lifetime-early-end", "lifetime-backedge-end", "lifetime-conditional-end"):
+            source = source.replace("  ret void\n}", end + "  ret void\n}", 1)
+        if shape == "lifetime-late-start":
+            source = source.replace(start, "", 1).replace("  %p1 =", start + "  %p1 =", 1)
+        elif shape == "lifetime-restart": source = source.replace("  %left =", start + "  %left =", 1)
+        elif shape == "lifetime-early-end": source = source.replace("  %left =", end + "  %left =", 1)
+        elif shape == "lifetime-backedge-end": source = source.replace("  %next =", end + "  %next =", 1)
+        elif shape == "lifetime-double-end": source = source.replace(end, end + end, 1)
+        elif shape == "lifetime-conditional-end":
+            source = source.replace("exit:\n", f"exit:\n  %stop = icmp eq {ty} %a, 0\n"
+                "  br i1 %stop, label %ended, label %read\nended:\n" + end +
+                "  br label %read\nread:\n", 1)
+        elif shape == "lifetime-joins":
+            source = source.replace(end + "  ret void", f"  %stop = icmp eq {ty} %a, 0\n"
+                "  br i1 %stop, label %end0, label %end1\nend0:\n" + end +
+                "  br label %done\nend1:\n" + end + "  br label %done\ndone:\n  ret void", 1)
+        elif shape == "lifetime-unreachable-end":
+            source = source.replace("}\ndefine void @invoke", "dead:\n" + end + "  ret void\n}\ndefine void @invoke", 1)
+        elif shape == "lifetime-aligned":
+            source = source.replace(f"%tile = alloca {array}", f"%tile = alloca {array}, align 64")
+            source = source.replace(".p0(ptr %tile)", ".p0(ptr align 64 %tile)")
+        elif shape == "lifetime-bundle":
+            source = source.replace(start, start.rstrip() + ' [ "deopt"(ptr %tile) ]\n', 1)
         source += "declare void @llvm.lifetime.start.p0(ptr captures(none))\n"
+        source += "declare void @llvm.lifetime.end.p0(ptr captures(none))\n"
+    elif shape in ("byte-offset", "byte-misaligned"):
+        offset = width // 8 if shape == "byte-offset" else 1
+        source = source.replace(f"getelementptr inbounds {array}, ptr %tile, i32 0, i32 1",
+                                f"getelementptr inbounds i8, ptr %tile, i64 {offset}")
+    elif shape.startswith("narrow-"):
+        index = "0"
+        if shape == "narrow-index":
+            source = source.replace("  %p =", f"  %bit = icmp ne {ty} %b, 0\n  %narrow = and i1 %bit, false\n  %p =", 1)
+            index = "%narrow"
+        source = source.replace(f"i32 0, {ty} %idx", f"i32 0, i1 {index}", 1)
+    elif shape.startswith("vector-"):
+        pointer = "%p0" if shape == "vector-exit" else f"%p{cells - 1}" if shape == "vector-overrun" else "%p"
+        vector = f"  %packed = load <2 x {ty}>, ptr {pointer}\n"
+        source = source.replace("exit:\n", "exit:\n" + vector, 1)
+        for k in range(2):
+            source = source.replace(f"  %r{k} = load {ty}, ptr %p{k}",
+                                    f"  %r{k} = extractelement <2 x {ty}> %packed, i32 {k}", 1)
     elif shape == "address":
         source = source.replace(f"  store {ty} %v5, ptr %p", f"  %nextidx = and {ty} %v5, 1\n"
                                 f"  %q = getelementptr inbounds {array}, ptr %tile, i32 0, {ty} %nextidx\n"
@@ -92,7 +149,7 @@ def oracle(a, b, width, cells, shape="supported"):
     a, b = a & mask, b & mask
     tile = [(a + k) & mask for k in range(cells)]
     for _ in range(4):
-        idx = b & (3 if cells == 4 else 1)
+        idx = 0 if shape.startswith("narrow-") else b & (3 if cells == 4 else 1)
         x = (((tile[idx] + b) & mask) ^ tile[-1]) * 3 & mask
         signed = x - (1 << width) if x >> (width - 1) else x
         x = (((signed >> 1) - a) & mask) | 1
@@ -101,31 +158,53 @@ def oracle(a, b, width, cells, shape="supported"):
     return tile + [0] * (4 - cells)
 
 
+def c_oracle(a, b, width):
+    mask = (1 << width) - 1
+    a, b = a & mask, b & mask
+    state, carry = [a, b], a ^ b
+    for k in range((b & 15) + 1):
+        idx = (a + k) & 1
+        x = (((state[idx] + b) & mask) ^ carry) * 3 & mask
+        state[idx] = (((x >> 1) - a) & mask) | 1
+    return [*state, carry, 0]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
     parser.add_argument("--widths", type=int, nargs="+", choices=(8, 16, 32, 64), default=[8, 16, 32, 64])
     parser.add_argument("--cells", type=int, nargs="+", choices=(2, 3, 4), default=[2, 3, 4])
-    parser.add_argument("--shapes", nargs="+", choices=("supported", "address", "many-loads", *FALLBACKS), default=["supported", "address"])
+    parser.add_argument("--shapes", nargs="+", choices=(*SUPPORTED, *FALLBACKS), default=["supported", "address"])
     parser.add_argument("--families", nargs="+", choices=("xor", "additive", "seeded"), default=["xor", "additive"])
     parser.add_argument("--seeds", type=int, nargs="+", default=[1])
     parser.add_argument("--random-inputs", type=int, default=512)
     parser.add_argument("--ablation", action="store_true", help="also emit/test matched tile-disabled and normalized controls")
+    parser.add_argument("--c-o2", action="store_true", help="ordinary optimized C; requires widths 32/64, cells 2, shape supported")
     args = parser.parse_args()
+    if args.c_o2 and (set(args.widths) - {32, 64} or args.cells != [2] or args.shapes != ["supported"]):
+        parser.error("--c-o2 requires --widths 32 and/or 64 --cells 2 --shapes supported")
+    if "byte-misaligned" in args.shapes and 8 in args.widths:
+        parser.error("byte-misaligned requires widths >= 16")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     plugin = out / "Obfuscator.so"
     shutil.copy2(ROOT / "build/Obfuscator.so", plugin)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out,), timeout=180)
     summary = {"schema": "sre-tile-conformance-v1", "passed": False, "complete": False,
-               "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False}
+               "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False,
+               "frontend": "clang-O2" if args.c_o2 else "IR-fixture"}
+    c_source = out / "source.c"
+    if args.c_o2:
+        shutil.copy2(FIXTURES / "tile_c_kernel.c", c_source)
+        summary["source_c_sha256"] = digest(c_source)
     flags = ["-passes=native-obfuscation", "-native-level=smoke", "-native-passes=constenc",
              "-native-strings=0", "-native-data=0", "-native-helper-hardening=0",
              "-native-late-constants=0", "-native-merge=0", "-native-values=1", "-native-values-wide=1",
              "-native-region-plan=connected", "-native-connected-nodes=2", "-native-functions=kernel",
              "-native-plan=1", "-native-scale-budget=1", "-native-bundles=1", "-native-object-bundles=1",
              "-obf-deterministic", "-obf-verify"]
+    if args.c_o2: flags.append("-native-transfer-nodes=32")
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
@@ -137,10 +216,15 @@ def main():
                     case = out / f"i{width}-n{cells}-{shape}"
                     case.mkdir()
                     clean = case / "clean.ll"
-                    clean.write_text(fixture(width, cells, shape))
+                    if args.c_o2:
+                        runner.run(["clang", "-O2", *(["-DTILE_WORD32"] if width == 32 else []), "-S", "-emit-llvm",
+                                    str(c_source), "-o", str(clean)])
+                    else:
+                        clean.write_text(fixture(width, cells, shape))
                     expected = None
                     if shape not in FALLBACKS:
-                        expected = "".join(" ".join(f"{v:016x}" for v in oracle(a, b, width, cells, shape)) + "\n"
+                        expected = "".join(" ".join(f"{v:016x}" for v in
+                                           (c_oracle(a, b, width) if args.c_o2 else oracle(a, b, width, cells, shape))) + "\n"
                                            for a, b in pairs).encode()
                         binary = case / "clean"
                         runner.run(["clang", str(clean), str(driver), "-pthread", "-o", str(binary)])
@@ -169,6 +253,18 @@ def main():
                                     if row["status"] != "encoded": raise ToolFailure(f"no tile retained: {row}")
                                     if shape == "address" and row["plan"]["scalar_address_uses"] == 0:
                                         raise ToolFailure("address projection not accounted")
+                                    if (shape.startswith("lifetime") or args.c_o2) and row["plan"]["lifetime"]["mode"] != "single-entry":
+                                        raise ToolFailure("lifetime control did not retain its contract")
+                                    if (shape == "vector-exit" or args.c_o2) and row["plan"]["decoded_vector_lanes"] == 0:
+                                        raise ToolFailure("vector output exposure not accounted")
+                                    if row["plan"]["lifetime"]["translated_markers"]:
+                                        stage_ir = (stage / "object-bundles.ll").read_text()
+                                        expected_markers = row["plan"]["lifetime"]["translated_markers"]
+                                        actual = re.findall(r'call void @llvm\.lifetime\.(?:start|end)\.p0\(ptr[^\n]*%sre\.tile\.tuple\)', stage_ir)
+                                        if len(actual) != expected_markers:
+                                            raise ToolFailure("lifetime markers not translated onto the tuple")
+                                        if shape == "lifetime-aligned" and not re.search(r'%sre\.tile\.tuple = alloca [^\n]*align 64', stage_ir):
+                                            raise ToolFailure("lifetime pointer alignment contract lost")
                                     prior, prior_report = digest(protected), digest(report)
                                     runner.run(command)
                                     if digest(protected) != prior or digest(report) != prior_report:

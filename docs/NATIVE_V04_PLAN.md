@@ -269,6 +269,9 @@ Implementation status: the default-off [closed local tile prototype](NATIVE_OBJE
 is a first bounded increment only. It does not yet handle immutable backing,
 object phases, direct-call ownership propagation, or the wider layout/lifetime
 contracts below. W3 remains incomplete and is not promoted.
+It now preserves proved single-entry root lifetimes and supports exact constant
+byte offsets and decoded packed-read boundaries, including ordinary O2 C
+fixtures. This is not an interprocedural ownership or general-layout solution.
 
 Existing flat-array encoding already accepts some runtime indices and carries
 two lanes through loads/stores; the aggregate leaf extension accepts constant
