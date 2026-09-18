@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeBundle.h"
 #include "llvm/Transforms/Obfuscator/NativeBundleMath.h"
+#include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/NativeTransfer.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/NativePlan.h"
@@ -67,6 +68,7 @@ struct Program {
   SmallVector<Backedge, 4> Backedges;
   SmallVector<unsigned, 4> ScalarInputs;
   bool Phases = false;
+  unsigned CallSupplies = 0;
   Family coordinates() const {
     switch (Rep.Fam) {
     case plan::Family::TriangularXor: return Family::Xor;
@@ -274,7 +276,7 @@ class Lowering {
   PHINode *CarrierPhi = nullptr, *PhasePhi = nullptr;
   SmallVector<PHINode *, 4> StatePhis;
   MDNode *Tag;
-  bool Pin, CallInputs;
+  bool Pin, CallInputs, CallOutputs;
   ConstantInt *c(uint64_t X) { return ConstantInt::get(B.getIntNTy(P.Width), X); }
   Value *rotate(Value *X, unsigned R) {
     return B.CreateOr(B.CreateShl(X, R), B.CreateLShr(X, P.Width - R));
@@ -392,10 +394,10 @@ class Lowering {
     CarrierPhi->addIncoming(M, Bound.Latches[Edge]);
   }
 public:
-  Lowering(Function &F, const Binding &Bound, bool Pin, bool CallInputs)
+  Lowering(Function &F, const Binding &Bound, bool Pin, bool CallInputs, bool CallOutputs)
       : F(F), P(Bound.P), B(Bound.Nodes.front()),
         Tag(MDNode::get(F.getContext(), MDString::get(F.getContext(),
-            plan::originId(F.getName(), "native-bundle", P.ID)))), Pin(Pin), CallInputs(CallInputs) {}
+            plan::originId(F.getName(), "native-bundle", P.ID)))), Pin(Pin), CallInputs(CallInputs), CallOutputs(CallOutputs) {}
   void run(const Binding &Bound) {
     Instruction *First = Bound.Nodes.front(), *Prev = First->getPrevNode();
     if (Bound.Preheader) enterLoop(Bound);
@@ -418,11 +420,15 @@ public:
     for (PHINode *Phi : Bound.Recurrences) Members.insert(Phi);
     SmallVector<Value *, 4> Outputs;
     for (unsigned N = 0; N < P.OutputSlots.size(); ++N) {
+      unsigned K = P.OutputSlots[N];
+      if (CallOutputs && llvm::any_of(Bound.Outputs[N]->users(), [&](User *U) {
+            auto *I = dyn_cast<Instruction>(U);
+            return I && isNativeBundleCallSupply(*I, Bound.Outputs[N]);
+          })) supplyNativeBundleCalls(F, Bound.Outputs[N], {Z[K], mask(Z, K)}, P.coordinates());
       bool Needed = llvm::any_of(Bound.Outputs[N]->users(), [&](User *U) {
         return !Members.contains(dyn_cast<Instruction>(U));
       });
       if (!Needed) { Outputs.push_back(nullptr); continue; }
-      unsigned K = P.OutputSlots[N];
       Value *R = mask(Z, K);
       Value *X = P.coordinates() == Family::Xor ? B.CreateXor(Z[K], R, "sre.bundle.boundary")
                                     : B.CreateSub(Z[K], R, "sre.bundle.boundary");
@@ -489,6 +495,7 @@ json::Object report(const Binding &B) {
       {"law", "triangular-slot-update-v1"}, {"verification", "algebraic"},
       {"useful_operations", P.Steps.size()}, {"inputs", B.Inputs.size()},
       {"outputs", B.Outputs.size()}, {"scalar_output_uses", B.BoundaryUses},
+      {"call_supply_uses", P.CallSupplies}, {"call_supply_reservation", P.CallSupplies * 384},
       {"loop", json::Object{{"status", B.Preheader ? "encoded" : "straight-line"},
           {"contract", "sre-bundle-loop-v2"}, {"graph_scope", "dominated-header-recurrence"},
           {"reason", B.LoopReason}, {"law", "triangular-recurrence-rebase-v1"},
@@ -559,6 +566,11 @@ FunctionPlan planFunction(Function &F, uint64_t Seed, const NativeBundleOptions 
           if (256 + N * 1200 > FunctionCostLimit - Estimated ||
               !schedule(ArrayRef<Instruction *>(Run).slice(Start, N), O.Values, B)) continue;
           planLoop(B, O, DT);
+          if (O.CallOutputs) {
+            for (Instruction *Output : B.Outputs) for (User *U : Output->users())
+              if (auto *I = dyn_cast<Instruction>(U); I && isNativeBundleCallSupply(*I, Output)) ++B.P.CallSupplies;
+            B.P.EstimatedCost += B.P.CallSupplies * 384;
+          }
           if (B.P.EstimatedCost > FunctionCostLimit - Estimated) continue;
           B.P.ID = Plans.size();
           Rng R = Rng(Seed).fork("native-bundles-v1").fork(F.getName()).fork(B.P.ID);
@@ -655,7 +667,7 @@ json::Array encodeNativeBundles(Module &M, uint64_t Seed, const NativeBundleOpti
       FunctionSnapshot Snapshot(*F);
       // Backwards emission keeps later bindings alive when an earlier output
       // feeds a later region's entry. RAUW updates the already-emitted use.
-      for (const Binding &B : llvm::reverse(Plans)) Lowering(*F, B, O.Pin, O.CallInputs).run(B);
+      for (const Binding &B : llvm::reverse(Plans)) Lowering(*F, B, O.Pin, O.CallInputs, O.CallOutputs).run(B);
       After = F->getInstructionCount();
       Rollback = After > uint64_t(Before) + Budget;
       if (verifyFunction(*F, &errs())) report_fatal_error("native bundle lowering produced invalid IR");

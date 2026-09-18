@@ -32,18 +32,22 @@ def main():
     workload.add_argument("--tile", action="store_true", help="use a supported tile_run case and all four output cells")
     workload.add_argument("--immutable", action="store_true", help="four-output immutable_run case with matched off arms")
     workload.add_argument("--private-calls", action="store_true", help="recursive_run bundle-input case and matched off arms")
+    parser.add_argument("--call-output-ablation", action="store_true", help="private-calls disabled arms turn off outputs, leaving inputs on")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
     parser.add_argument("--ghidra-image", required=True)
     parser.add_argument("--ghidra", default="/opt/ghidra/support/analyzeHeadless")
     parser.add_argument("--decompile-timeout", type=float, default=240)
     args = parser.parse_args()
+    if args.call_output_ablation and not args.private_calls:
+        parser.error("--call-output-ablation requires --private-calls")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out, args.case), timeout=180)
     result = {"schema": "sre-bundle-decompiler-v1", "passed": False, "scope": "informed-entry",
               "workload": "private-calls" if args.private_calls else "immutable" if args.immutable else "tile" if args.tile else "loop" if args.loop else "straight-line",
               "hardness_evaluated": False, "semantic_recovery": "not_measured", "arms": {}}
+    if args.private_calls: result["private_ablation"] = "outputs" if args.call_output_ablation else "inputs"
     try:
         driver = out / "driver.o"
         driver_source = "tile_driver.c" if args.tile or args.immutable or args.private_calls else "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
@@ -53,11 +57,14 @@ def main():
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}
         if args.tile or args.immutable or args.private_calls:
-            name = "call-inputs" if args.private_calls else "immutable" if args.immutable else "tiles"
+            name = ("call-outputs" if args.call_output_ablation else "call-inputs") if args.private_calls else "immutable" if args.immutable else "tiles"
             selected[name + "-off"] = args.case / (args.stem + "-disabled.ll")
             selected[name + "-off-post-o2"] = args.case / (args.stem + "-disabled-post-o2.ll")
         expected = None
         vectors = inputs(args.width, 1024)
+        if args.private_calls:
+            y = (1 << (args.width - 2)) - 13
+            vectors += f"16 {y}\n{y} 16\n".encode()
         if args.loop:
             from conformance.bundle_loop_run import vectors as loop_vectors
             vectors = "".join(f"{a} {b} {n}\n" for a, b, n in loop_vectors(args.width, True)).encode()

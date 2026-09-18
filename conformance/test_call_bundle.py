@@ -2,10 +2,11 @@ import argparse
 import unittest
 
 from conformance import bundle_options
-from conformance.call_bundle_check import call_bundle_summary, call_bundle_violations
+from conformance.call_bundle_check import call_bundle_summary, call_bundle_violations, call_supply_violations
 from conformance.recursive_run import fixture, oracle
 from conformance.bundle_decompile import private_offset
 from conformance.process import ToolFailure
+from conformance.tile_run import private_fixture, private_oracle, oracle as tile_oracle
 
 
 def report():
@@ -86,6 +87,85 @@ class BundlePrivateInputs(unittest.TestCase):
                 return (right ^ 11) if left == 0 else (left ^ right)
             for a, b in ((0, 0), (mask, mask), (1, mask), (1 << (width - 1), 7)):
                 self.assertEqual(oracle(a, b, width, True)[:2], [work(a, b), work(b, a)])
+
+
+def supply_report():
+    return {"features": {"bundles": True, "encoded_calls": True, "bundle_call_outputs": True},
+        "encoded_calls": [{"encoded_function": "f.sre.encoded", "status": "encoded", "absorbed_results": 3}],
+        "bundles": [{"function": "f.sre.encoded", "status": "encoded", "regions": [
+            {"call_supply_uses": 2, "call_supply_reservation": 768, "scalar_output_uses": 3}]}],
+        "bundle_call_outputs": [{"function": "f.sre.encoded", "interface": "f.sre.encoded",
+            "contract": "bundle-call-supply-v1", "stage": "after-bundles-before-regions",
+            "argument_pairs": 1, "result_pairs": 1}]}
+
+
+class BundlePrivateOutputs(unittest.TestCase):
+    def test_exact_retained_supply_reservation(self):
+        self.assertEqual(call_supply_violations(supply_report()), [])
+        for key, value in (("call_supply_uses", 3), ("call_supply_uses", True),
+                           ("call_supply_reservation", 384), ("scalar_output_uses", 1)):
+            data = supply_report()
+            data["bundles"][0]["regions"][0][key] = value
+            self.assertTrue(call_supply_violations(data), key)
+
+    def test_rollback_has_no_supply_coverage(self):
+        data = supply_report()
+        data["bundles"][0]["status"] = "rolled-back"
+        self.assertTrue(call_supply_violations(data))
+        data["bundle_call_outputs"] = []
+        self.assertEqual(call_supply_violations(data), [])
+
+    def test_unknown_duplicate_or_miscredited_interface(self):
+        for change in ({"interface": "unknown"}, {"function": "other"}, {"contract": "unknown"},
+                       {"stage": "final"}, {"argument_pairs": -1}, {"result_pairs": 2}):
+            data = supply_report()
+            data["bundle_call_outputs"][0].update(change)
+            self.assertTrue(call_supply_violations(data), change)
+        data = supply_report()
+        data["bundle_call_outputs"] *= 2
+        self.assertTrue(call_supply_violations(data))
+
+    def test_final_supply_accounting_is_not_lost(self):
+        data = supply_report()
+        data["encoded_calls"][0]["absorbed_results"] = 1
+        self.assertTrue(call_supply_violations(data))
+
+    def test_missing_reports_dependencies_and_disabled_claims(self):
+        for flag in ("bundles", "encoded_calls", "bundle_call_outputs"):
+            data = supply_report()
+            data["features"][flag] = False
+            self.assertTrue(call_supply_violations(data))
+        data = supply_report()
+        del data["bundle_call_outputs"]
+        self.assertTrue(call_supply_violations(data))
+        data = supply_report()
+        data["features"]["bundle_call_outputs"] = False
+        data["bundles"] = []
+        self.assertTrue(call_supply_violations(data))
+
+    def test_tile_and_pure_supplies_share_the_same_denominator(self):
+        data = supply_report()
+        plan = data["bundles"].pop()["regions"][0]
+        data["object_bundles"] = [{"function": "f.sre.encoded", "status": "encoded", "plan": plan}]
+        self.assertEqual(call_supply_violations(data), [])
+
+    def test_constructed_rare_return_is_live_at_every_width(self):
+        for width in (8, 16, 32, 64):
+            y = (1 << (width - 2)) - 13
+            self.assertEqual(oracle(16, y, width, True, True)[0], 11)
+            self.assertNotEqual(oracle(0, 0, width, True, True)[0], 11)
+            self.assertIn(f"done:\n  ret i{width} %v7", fixture(width, True, True))
+
+    def test_private_tile_outputs_are_real_observable_results(self):
+        for width in (8, 16, 32, 64):
+            for cells in (2, 3, 4):
+                text = private_fixture(width, cells)
+                self.assertEqual(text.count(f"call i{width} @tile_consume"), cells)
+                mask = (1 << width) - 1
+                for a, b in ((0, 0), (mask, mask), (1, mask)):
+                    expected = tile_oracle(a, b, width, cells)
+                    for k in range(cells): expected[k] = ((expected[k] * 3) & mask) ^ 55
+                    self.assertEqual(private_oracle(a, b, width, cells), expected)
 
 
 if __name__ == "__main__":

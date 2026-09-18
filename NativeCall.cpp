@@ -630,6 +630,77 @@ json::Array encodeNativeCalls(Module &M, uint64_t Seed, const NativeCallOptions 
   return Interfaces(M, Seed, O).run();
 }
 
+namespace {
+const Function *bundleSupplyOwner(const Instruction &I, const Value *V) {
+  if (I.getOpcode() != Instruction::Xor || I.getOperand(0) != V || !I.hasOneUse()) return nullptr;
+  if (I.getMetadata("sre.native.call.split")) {
+    const auto *C = dyn_cast<CallInst>(*I.user_begin());
+    return C && C->isArgOperand(&*I.use_begin()) ? C->getCalledFunction() : nullptr;
+  }
+  if (I.getMetadata("sre.native.call.result")) {
+    const auto *Insert = dyn_cast<InsertValueInst>(*I.user_begin());
+    if (Insert && Insert->getInsertedValueOperand() == &I && Insert->getIndices().size() == 1 &&
+        Insert->getIndices().front() == 0) return I.getFunction();
+  }
+  return nullptr;
+}
+}
+
+bool isNativeBundleCallSupply(const Instruction &I, const Value *V) {
+  return bundleSupplyOwner(I, V) != nullptr;
+}
+
+void supplyNativeBundleCalls(Function &F, Value *V, transfer::Pair P, transfer::Family Family) {
+  // Stable function order, not the address/use-list order of a multi-user exit.
+  SmallVector<Instruction *, 8> Sites;
+  for (Instruction &I : instructions(F)) if (isNativeBundleCallSupply(I, V)) Sites.push_back(&I);
+  for (Instruction *I : Sites) {
+    const Function *Owner = bundleSupplyOwner(*I, V);
+    Instruction *Prev = I->getPrevNode();
+    IRBuilder<> B(I);
+    Value *Mask = I->getOperand(1);
+    transfer::Pair X = Family == transfer::Family::Additive ? transfer::toXor(B, P, Mask) : P;
+    Value *E = transfer::remask(B, X, transfer::Family::Xor, Mask);
+    // One explicit identity per site gives the retained transaction a unique
+    // accounting owner even if constant folding reuses an existing coordinate.
+    auto *Supply = new FreezeInst(E, "sre.bundle.call.supply", I->getIterator());
+    Supply->setMetadata("sre.native.bundle.call-supply", MDNode::get(F.getContext(), {
+        MDString::get(F.getContext(), Owner->getName()),
+        MDString::get(F.getContext(), I->getMetadata("sre.native.call.split") ? "argument" : "result")}));
+    MDNode *Owned = MDNode::get(F.getContext(), {});
+    for (Instruction *N = Prev ? Prev->getNextNode() : &I->getParent()->front(); N != I; N = N->getNextNode())
+      N->setMetadata("sre.native.bundle", Owned);
+    I->replaceAllUsesWith(Supply);
+    I->eraseFromParent();
+  }
+}
+
+json::Array finishNativeBundleCallOutputs(Module &M, StringMap<NativeCallAbsorption> &Absorbed) {
+  json::Array Rows;
+  for (Function &F : M) {
+    // First-seen owner order is determined by the IR, never by a hash table.
+    SmallVector<std::string, 8> Owners;
+    StringMap<std::pair<unsigned, unsigned>> Counts;
+    for (Instruction &I : instructions(F))
+      if (MDNode *MD = I.getMetadata("sre.native.bundle.call-supply")) {
+        StringRef Owner = cast<MDString>(MD->getOperand(0))->getString();
+        bool Argument = cast<MDString>(MD->getOperand(1))->getString() == "argument";
+        if (!Counts.count(Owner)) Owners.push_back(Owner.str());
+        auto &Count = Counts[Owner];
+        if (Argument) ++Count.first; else ++Count.second;
+        ++Absorbed[Owner].Results;
+        I.setMetadata("sre.native.bundle.call-supply", nullptr);
+      }
+    for (const std::string &Owner : Owners) {
+      auto Count = Counts.lookup(Owner);
+      Rows.push_back(json::Object{{"function", F.getName().str()}, {"interface", Owner},
+          {"contract", "bundle-call-supply-v1"}, {"stage", "after-bundles-before-regions"},
+          {"argument_pairs", Count.first}, {"result_pairs", Count.second}});
+    }
+  }
+  return Rows;
+}
+
 json::Array nativeBundleCallInputs(const Module &M) {
   json::Array Rows;
   for (const Function &F : M) {

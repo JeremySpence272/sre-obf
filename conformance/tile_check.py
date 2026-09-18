@@ -140,7 +140,7 @@ def tile_violations(report):
                 owner, number = item["input_origin"].rsplit("/input-op/", 1)
                 require(owner in sources and 0 <= int(number) < sources[owner], "invented input lineage")
         phase_cost = 64 * len(accesses) * (n + 2) if phases else 0
-        require(row["growth_allocation"] == 512 + attempted * 1200 + len(accesses) * n * 192 + phase_cost,
+        require(row["growth_allocation"] == 512 + attempted * 1200 + len(accesses) * n * 192 + phase_cost + plan.get("call_supply_reservation", 0),
                 "cost estimate mismatch")
         require(row["growth_allocation"] <= 65536, "function cap exceeded")
         before, after = row["instructions_before"], row["instructions_after"]
@@ -169,7 +169,9 @@ def tile_summary(report):
             "retained_operations_without_ancestry": sum(not s["input_origin"] for s in steps),
             "retained_source_loads": sum(r["plan"]["source_loads"] for r in retained),
             "retained_source_stores": sum(r["plan"]["source_stores"] for r in retained),
-            "scalar_output_uses": sum(r["plan"]["scalar_output_uses"] for r in retained),
+            "source_scalar_output_uses": sum(r["plan"]["scalar_output_uses"] for r in retained),
+            "scalar_output_uses": sum(r["plan"]["scalar_output_uses"] - r["plan"].get("call_supply_uses", 0) for r in retained),
+            "private_interface_supplies": sum(r["plan"].get("call_supply_uses", 0) for r in retained),
             "scalar_address_uses": sum(r["plan"]["scalar_address_uses"] for r in retained),
             "decoded_vector_lanes": sum(r["plan"].get("decoded_vector_lanes", 0) for r in retained),
             "lifetime_owned_objects": sum(r["plan"].get("lifetime", {}).get("mode") == "single-entry" for r in retained),

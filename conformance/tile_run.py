@@ -183,6 +183,19 @@ def c_oracle(a, b, width):
     return [*state, carry, 0]
 
 
+def private_fixture(width, cells):
+    source, ty = fixture(width, cells), f"i{width}"
+    for k in range(cells):
+        source = source.replace(f"  %r{k} = load {ty}, ptr %p{k}",
+            f"  %raw{k} = load {ty}, ptr %p{k}\n  %r{k} = call {ty} @tile_consume({ty} %raw{k})")
+    return source + f"define internal {ty} @tile_consume({ty} %x) noinline {{\nentry:\n  %a = mul {ty} %x, 3\n  %b = xor {ty} %a, 55\n  ret {ty} %b\n}}\n"
+
+
+def private_oracle(a, b, width, cells):
+    values, mask = oracle(a, b, width, cells), (1 << width) - 1
+    return [((v * 3) & mask) ^ 55 if k < cells else v for k, v in enumerate(values)]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
@@ -195,8 +208,11 @@ def main():
     parser.add_argument("--random-inputs", type=int, default=512)
     parser.add_argument("--ablation", action="store_true", help="also emit/test matched tile-disabled and normalized controls")
     parser.add_argument("--object-phases", action="store_true", help="rekey and permute after each tile update")
+    parser.add_argument("--private-calls", action="store_true", help="supply every tile cell directly to a real private integer consumer")
     parser.add_argument("--c-o2", action="store_true", help="ordinary optimized C; requires widths 32/64, cells 2, shape supported")
     args = parser.parse_args()
+    if args.private_calls and (args.c_o2 or args.shapes != ["supported"]):
+        parser.error("--private-calls requires IR fixtures with only --shapes supported")
     if args.c_o2 and (set(args.widths) - {32, 64} or args.cells != [2] or args.shapes != ["supported"]):
         parser.error("--c-o2 requires --widths 32 and/or 64 --cells 2 --shapes supported")
     if "byte-misaligned" in args.shapes and 8 in args.widths:
@@ -221,6 +237,9 @@ def main():
              "-obf-deterministic", "-obf-verify"]
     if args.c_o2: flags.append("-native-transfer-nodes=32")
     if args.object_phases: flags.append("-native-object-phases=1")
+    if args.private_calls:
+        flags = [f for f in flags if f != "-native-functions=kernel"]
+        flags += ["-native-functions=kernel,tile_consume", "-native-encoded-calls=1", "-native-bundle-call-outputs=1"]
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
@@ -236,11 +255,11 @@ def main():
                         runner.run(["clang", "-O2", *(["-DTILE_WORD32"] if width == 32 else []), "-S", "-emit-llvm",
                                     str(c_source), "-o", str(clean)])
                     else:
-                        clean.write_text(fixture(width, cells, shape))
+                        clean.write_text(private_fixture(width, cells) if args.private_calls else fixture(width, cells, shape))
                     expected = None
                     if shape not in FALLBACKS:
                         expected = "".join(" ".join(f"{v:016x}" for v in
-                                           (c_oracle(a, b, width) if args.c_o2 else oracle(a, b, width, cells, shape))) + "\n"
+                                           (c_oracle(a, b, width) if args.c_o2 else private_oracle(a, b, width, cells) if args.private_calls else oracle(a, b, width, cells, shape))) + "\n"
                                            for a, b in pairs).encode()
                         binary = case / "clean"
                         runner.run(["clang", str(clean), str(driver), "-pthread", "-o", str(binary)])
@@ -260,6 +279,10 @@ def main():
                                 errors = report_violations(data)
                                 if errors: raise ToolFailure("; ".join(errors))
                                 rows = [r for r in data["object_bundles"] if r["function"] == "kernel"]
+                                if args.private_calls:
+                                    owned = [r for r in rows if r["reason"] == "existing-owner"]
+                                    if len(owned) != 1: raise ToolFailure("private call activation was not inventoried separately")
+                                    rows = [r for r in rows if r["reason"] != "existing-owner"]
                                 if len(rows) != 1: raise ToolFailure("unexpected object denominator")
                                 row = rows[0]
                                 if shape in FALLBACKS:
@@ -269,6 +292,10 @@ def main():
                                     if row["status"] != "encoded": raise ToolFailure(f"no tile retained: {row}")
                                     if (row["plan"]["phase_mode"] != "static") != args.object_phases:
                                         raise ToolFailure("object phase option did not reach the emitter")
+                                    if args.private_calls:
+                                        supplies = data["bundle_call_outputs"]
+                                        if sum(r["argument_pairs"] for r in supplies if r["function"] == "kernel") != cells:
+                                            raise ToolFailure("tile did not supply every real private consumer")
                                     if shape == "address" and row["plan"]["scalar_address_uses"] == 0:
                                         raise ToolFailure("address projection not accounted")
                                     if (shape.startswith("lifetime") or args.c_o2) and row["plan"]["lifetime"]["mode"] != "single-entry":
@@ -318,6 +345,7 @@ def main():
                                 summary["cases"].append({"width": width, "cells": cells, "shape": shape,
                                     "family": family, "seed": seed, "pins": pins, "passed": True,
                                     "matched_disabled_control": args.ablation and shape not in FALLBACKS,
+                                    "bundle_call_outputs": data.get("bundle_call_outputs", []),
                                     "vectors": len(pairs) if expected else 0,
                                     "coverage": tile_summary(data), "reason": row["reason"]})
                                 dump(out / "summary.json", summary)

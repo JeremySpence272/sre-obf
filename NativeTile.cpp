@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeBundle.h"
 #include "llvm/Transforms/Obfuscator/NativeBundleMath.h"
+#include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
@@ -66,6 +67,7 @@ struct Plan {
   unsigned ID = 0, Width = 0, Cells = 0, Cost = 0;
   Family Coordinates = Family::Xor;
   bool Phases = false;
+  unsigned CallSupplies = 0;
   SmallVector<uint64_t, 4> Salts;
   SmallVector<unsigned, 4> Rotations, Physical;
   SmallVector<Access, 16> Accesses;
@@ -281,12 +283,14 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
       if (auto *S = dyn_cast_or_null<StoreInst>(User);
           S && llvm::is_contained(B.Memory, S) && U.getOperandNo() == 0) continue;
       ++Uses;
+      if (O.CallOutputs && User && isNativeBundleCallSupply(*User, I)) ++B.P.CallSupplies;
       if (isa_and_nonnull<GetElementPtrInst>(User)) ++B.AddressUses;
     }
     B.BoundaryValues += Uses != 0; B.BoundaryUses += Uses;
   }
   B.P.Phases = O.ObjectPhases;
   B.P.Cost = 512 + B.Nodes.size() * 1200 + B.Memory.size() * B.P.Cells * 192;
+  B.P.Cost += B.P.CallSupplies * 384;
   if (B.P.Phases) B.P.Cost += 64 * B.Memory.size() * (B.P.Cells + 2);
   if (B.P.Cost > 65536) return fail("function-cost-limit");
   return true;
@@ -298,7 +302,7 @@ class Lowering {
   IRBuilder<> B;
   AllocaInst *Storage;
   ArrayType *StorageType;
-  bool Pin, CallInputs;
+  bool Pin, CallInputs, CallOutputs;
   DenseMap<Value *, Pair> Pairs;
   SmallPtrSet<Instruction *, 32> Members;
   ConstantInt *c(uint64_t X) { return ConstantInt::get(B.getIntNTy(P.Width), X); }
@@ -358,8 +362,8 @@ class Lowering {
     return Out;
   }
 public:
-  Lowering(Binding &Bound, bool Pin, bool CallInputs) : Bound(Bound), P(Bound.P),
-      B(Bound.LastInitializer), Pin(Pin), CallInputs(CallInputs) {}
+  Lowering(Binding &Bound, bool Pin, bool CallInputs, bool CallOutputs) : Bound(Bound), P(Bound.P),
+      B(Bound.LastInitializer), Pin(Pin), CallInputs(CallInputs), CallOutputs(CallOutputs) {}
   void run() {
     Function &F = *Bound.F;
     SmallPtrSet<Instruction *, 32> Original;
@@ -445,6 +449,7 @@ public:
     // Indices are also scalar boundaries: generated comparisons still refer
     // to their original SSA value and are rewritten here before it is erased.
     for (Instruction *I : OrderedMembers) {
+      if (CallOutputs) supplyNativeBundleCalls(F, I, Pairs.lookup(I), P.Coordinates);
       auto external = [&](Use &U) {
         auto *User = dyn_cast<Instruction>(U.getUser());
         return !Members.contains(User) && !llvm::is_contained(Bound.Memory, User);
@@ -500,6 +505,7 @@ json::Object describe(const Binding &B) {
       {"physical_stores", (1 + Stores - P.Cells) * (P.Cells + 1 + unsigned(P.Phases))},
       {"scalar_input_values", B.ScalarInputs}, {"scalar_output_values", B.BoundaryValues},
       {"scalar_output_uses", B.BoundaryUses}, {"scalar_address_uses", B.AddressUses},
+      {"call_supply_uses", P.CallSupplies}, {"call_supply_reservation", P.CallSupplies * 384},
       {"vector_output_values", B.VectorOutputs}, {"vector_output_uses", B.VectorUses},
       {"decoded_vector_lanes", B.VectorLanes},
       {"lifetime", json::Object{{"contract", "sre-tile-lifetime-v1"},
@@ -573,7 +579,7 @@ json::Array encodeNativeObjectBundles(Module &M, uint64_t Seed, const NativeBund
     auto &Row = *Report[K].getAsObject();
     unsigned Before = B.F->getInstructionCount();
     FunctionSnapshot Snapshot(*B.F);
-    Lowering(B, O.Pin, O.CallInputs).run();
+    Lowering(B, O.Pin, O.CallInputs, O.CallOutputs).run();
     unsigned Attempted = B.F->getInstructionCount();
     if (verifyFunction(*B.F, &errs())) report_fatal_error("native object bundle produced invalid IR");
     bool Rollback = Attempted > uint64_t(Before) + B.P.Cost;

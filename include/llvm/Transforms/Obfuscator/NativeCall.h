@@ -3,6 +3,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Transforms/Obfuscator/NativeTransfer.h"
 #include <string>
 #include <vector>
 
@@ -68,4 +69,7 @@ void recordNativeCallAbsorption(json::Array &Rows,
 // credits markers not already reconciled by a retained connected transaction.
 json::Array nativeBundleCallInputs(const Module &);
 void finishNativeBundleCallInputs(Module &, StringMap<NativeCallAbsorption> &);
+bool isNativeBundleCallSupply(const Instruction &, const Value *);
+void supplyNativeBundleCalls(Function &, Value *, transfer::Pair, transfer::Family);
+json::Array finishNativeBundleCallOutputs(Module &, StringMap<NativeCallAbsorption> &);
 } // namespace llvm::obf
