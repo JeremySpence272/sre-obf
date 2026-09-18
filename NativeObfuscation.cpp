@@ -73,6 +73,8 @@ cl::opt<bool> NativePredicateRegions("native-predicate-regions", cl::desc("Conne
 cl::opt<bool> NativeRegionalFamilies("native-regional-families", cl::desc("Seeded XOR/additive families for whole supported components"), cl::init(false));
 cl::opt<bool> NativeEncodedCalls("native-encoded-calls",
     cl::desc("Private encoded-call interfaces: integer arguments and results cross a private call as (E, R) pairs"), cl::init(false));
+cl::opt<bool> NativeCallPolicy("native-call-policy",
+    cl::desc("W5: arbitrate merging against encoded private calls before either runs, and record the winner per function"), cl::init(false));
 cl::opt<bool> NativeSupportRegions("native-support-regions", cl::desc("Absorb bounded generated data decoders before region planning"), cl::init(false));
 cl::opt<std::string> NativeStageDir("native-stage-dir", cl::desc("Private directory for pre-driver and post-driver IR snapshots"), cl::init(""));
 cl::opt<unsigned> NativeModuleInsts("native-module-insts", cl::desc("Explicit module IR instruction cap (10000..5000000)"), cl::init(250000));
@@ -210,6 +212,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
        NativeConnectedShards || NativeConnectedAggregates || NativeJointOutputs ||
        NativeEncodedCalls) && NativeRegionPlan != "connected")
     report_fatal_error("connected subfeatures require native-region-plan=connected");
+  if (NativeCallPolicy && !NativeEncodedCalls)
+    report_fatal_error("native-call-policy requires native-encoded-calls");
   if (NativeMemorySSA && !NativeMemory) report_fatal_error("native-memory-ssa requires native-memory");
   if (NativeConnectedAggregates && !NativeMemorySSA)
     report_fatal_error("native-connected-aggregates requires native-memory-ssa");
@@ -238,9 +242,14 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   // Output-directory names must not change RNG streams or encoded data.
   M.setModuleIdentifier(sys::path::filename(M.getSourceFileName()));
   auto InputInventory = obf::nativeBoundaryInventory(M, "input-before-fusion");
-  json::Array FusionCoverage;
+  json::Array FusionCoverage, FusionAbsorbed;
   if (NativeFusion) {
+    // Captured immediately before fusion, so a function it consumes is
+    // attributed to fusion alone instead of differenced out of an inventory
+    // that every later stage also changes.
+    std::vector<std::string> BeforeFusion = obf::nativeFusionCandidates(M);
     FusionCoverage = obf::fuseNativeFunctions(M, static_cast<uint64_t>(ObfSeed), NativeFunctions);
+    FusionAbsorbed = obf::nativeFusionAbsorption(BeforeFusion, M, FusionCoverage);
     AM.invalidate(M, PreservedAnalyses::none());
     if (verifyModule(M, &errs())) report_fatal_error("native fusion produced invalid IR");
     checkModuleBudget(M, "after-fusion");
@@ -272,6 +281,15 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
         {"structural_eligible", Protect && Blocker.empty()},
         {"reason", Blocker}, {"spec", Spec},
         {"instructions_before", static_cast<int64_t>(F.getInstructionCount())}});
+  }
+
+  // Merging, fusion and encoded private calls all want the same internal
+  // functions and merging runs first, so the contest is settled here, once,
+  // over unmerged source functions, and recorded on each of them.
+  json::Array CallPolicy;
+  if (NativeCallPolicy) {
+    obf::NativeCallPolicyOptions PolicyOptions;
+    CallPolicy = obf::planNativeCallPolicy(M, PolicyOptions);
   }
 
   // Run module preparation exactly once, before data inventory and application
@@ -325,6 +343,9 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     if (verifyModule(M, &errs())) report_fatal_error("native encoded calls produced invalid IR");
     checkModuleBudget(M, "after-encoded-calls");
   }
+  // What each arbitrated function actually became, read back from the module
+  // rather than assumed from the decision that was made about it.
+  if (NativeCallPolicy) obf::reconcileNativeCallPolicy(M, CallPolicy, CallCoverage);
   // Collected after the encoded-call twins exist: an erased original must
   // never reach a later stage as a dangling weight.
   SmallVector<std::pair<Function *, unsigned>, 64> SourceWeights;
@@ -607,9 +628,11 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"joint_outputs", NativeJointOutputs.getValue()},
                             {"lane_transitions", obf::nativeLaneTransitions()},
                             {"encoded_calls", NativeEncodedCalls.getValue()},
+                            {"call_policy", NativeCallPolicy.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},
-                        {"fused_calls", std::move(FusionCoverage)}, {"memory", std::move(MemoryCoverage)},
+                        {"fused_calls", std::move(FusionCoverage)},
+                        {"fusion_absorbed", std::move(FusionAbsorbed)}, {"memory", std::move(MemoryCoverage)},
                         {"flattening_state", std::move(StateCoverage)},
                         {"values", std::move(ValueCoverage)}, {"outlined_regions", std::move(OutlineCoverage)},
                         {"connected_regions", std::move(ConnectedCoverage)}, {"support_regions", std::move(SupportCoverage)},
@@ -619,6 +642,9 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
     Result["encoded_calls"] = std::move(CallCoverage);
+    // Absent, not empty, when no arbitration ran: an unplanned denominator is
+    // unknown rather than zero.
+    if (NativeCallPolicy) Result["call_policy"] = std::move(CallPolicy);
     Result["input_inventory"] = std::move(InputInventory);
     Result["growth_allocations"] = std::move(GrowthCoverage);
     Result["structural_allocations"] = std::move(StructuralCoverage);

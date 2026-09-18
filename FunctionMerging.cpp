@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/FunctionMerging.h"
+#include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationConfig.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
@@ -108,6 +109,16 @@ namespace {
 	bool isEligible(Function& F, const FunctionMergingConfig& Cfg, std::string& Reason) {
 		if (F.isDeclaration() || F.hasAvailableExternallyLinkage()) {
 			Reason = "declaration"; return false;
+		}
+		// W5 arbitration. Merging runs before the encoded private-call pass and
+		// would otherwise absorb the same helper, hand it an i64 argument pack
+		// that erases its per-width interface, and leave it mutually recursive
+		// for the later pass to refuse. When a policy was planned for this
+		// module, honour the one it recorded on the function instead of racing
+		// for it. Absent — every build that planned no policy — this is inert.
+		if (F.getFnAttribute(llvm::obf::NativeCallPolicyAttr).getValueAsString() ==
+			llvm::obf::NativeCallPolicyInterface) {
+			Reason = "reserved_encoded_interface"; return false;
 		}
 		if (!Cfg.thunkAddrTaken && !F.hasLocalLinkage()) {
 			Reason = "not_local_linkage"; return false;
