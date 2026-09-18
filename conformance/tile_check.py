@@ -18,6 +18,8 @@ SKIPS = {
     "unreachable-lifetime-marker", "lifetime-end-limit",
     "lifetime-start-does-not-dominate", "access-after-lifetime-end",
     "repeated-lifetime-end", "unaligned-or-unbounded-byte-offset",
+    "requires-single-private-borrow", "unproved-private-borrow", "unsupported-borrow-signature",
+    "unsupported-borrow-effect", "borrow-lifetime-not-supported", "borrow-no-useful-update",
 }
 
 
@@ -27,11 +29,19 @@ def tile_violations(report):
     if not enabled:
         if report.get("features", {}).get("object_phases"): return ["object phases require object bundles"]
         if report.get("features", {}).get("object_max_cells", 4) != 4: return ["wide tiles require object bundles"]
+        if report.get("features", {}).get("object_calls"): return ["object calls require object bundles"]
+        if report.get("features", {}).get("object_retained_growth", 65536) != 65536: return ["object growth ceiling requires object bundles"]
         return ["tile rows exist with feature disabled"] if report.get("object_bundles") else []
     if not report.get("features", {}).get("bundles") or "object_bundles" not in report:
         return ["enabled tiles require bundles and an object inventory"]
     contract = report.get("features", {}).get("object_bundle_contract", 1)
-    if type(contract) is not int or contract not in (1, 2, 3, 4): return ["unsupported object bundle contract"]
+    if type(contract) is not int or contract not in (1, 2, 3, 4, 5): return ["unsupported object bundle contract"]
+    features = report.get("features", {})
+    calls = features.get("object_calls", False)
+    ceiling = features.get("object_retained_growth", 65536 if contract < 5 else None)
+    if type(calls) is not bool or (calls and contract < 5): return ["invalid object-call policy"]
+    if type(ceiling) is not int or not 1 <= ceiling <= 65536 or (contract < 5 and ceiling != 65536):
+        return ["invalid object retained-growth policy"]
     max_cells = report.get("features", {}).get("object_max_cells", 4 if contract < 4 else None)
     if type(max_cells) is not int or max_cells not in (4, 8) or (contract < 4 and max_cells != 4):
         return ["missing or unsupported tile shape ceiling"]
@@ -64,11 +74,26 @@ def tile_violations(report):
             require(row["reason"] in SKIPS, "unknown fallback")
             require(attempted == retained == lost == row["growth_allocation"] == 0, "skipped work credited")
             require("plan" not in row, "skipped object has executable plan")
+            if contract >= 5: require(row.get("retained_growth_limit") == 0, "skipped object has a retention allowance")
             continue
         require(row["status"] in ("encoded", "rolled-back"), "unknown disposition")
         require(row["function"] not in owners, "multiple selected objects in one owner")
         owners.add(row["function"])
         plan = row["plan"]
+        closed = plan.get("closed_call")
+        if closed is not None:
+            require(calls and closed.get("contract") == "sole-private-leaf-borrow-v1", "unrequested or unknown private borrow")
+            callee = closed.get("callee")
+            require(closed.get("caller") == row["function"] and isinstance(callee, str) and
+                    bool(callee) and callee != row["function"], "invalid borrow owners")
+            require(callee not in owners, "callee belongs to multiple object transactions")
+            owners.add(callee)
+            require(type(closed.get("pointer_argument")) is int and closed["pointer_argument"] >= 0 and
+                    closed.get("direct_sites") == 1, "invalid private pointer interface")
+            require(closed.get("proof") == "sole-use-leaf-single-pointer-closed-accesses-initialization-dominates-call",
+                    "missing borrowing proof")
+            require(type(closed.get("callee_operations")) is int and 4 <= closed["callee_operations"] <= len(plan["steps"]),
+                    "no useful encoded update in borrower")
         try:
             desc = Descriptor.from_plan(plan, max_lanes=max_cells)
         except (KeyError, TypeError, ValueError):
@@ -79,9 +104,15 @@ def tile_violations(report):
         require(sorted(plan["physical_slots"]) == list(range(n)), "non-bijective layout")
         require(plan["law"] == "closed-initialized-tile-v1" and
                 plan["phase_mode"] == ("store-toggle-v1" if phases else "static"), "unknown law")
-        require(plan["ownership"] == "closed-entry-alloca" and
-                plan["initialization"] == "complete-entry-stores-dominate-accesses", "missing ownership proof")
+        require(plan["ownership"] == ("closed-private-borrow" if closed else "closed-entry-alloca") and
+                plan["initialization"] == ("complete-entry-stores-dominate-accesses-and-call" if closed else
+                                          "complete-entry-stores-dominate-accesses"), "missing ownership proof")
         accesses = plan["accesses"]
+        if closed:
+            require(closed.get("layout_words") == n + 1 + int(phases), "borrowed layout disagrees with storage")
+            require(all(a.get("function") in (row["function"], callee) for a in accesses) and
+                    any(a.get("function") == callee and a["kind"] == "store" for a in accesses), "invalid borrowed accesses")
+            require(all(a.get("function") == row["function"] for a in accesses if a["initializer"]), "callee initializes private backing")
         modern = contract >= 2
         if modern:
             require("lifetime" in plan, "missing lifetime contract")
@@ -154,16 +185,20 @@ def tile_violations(report):
         require(row["growth_allocation"] == 512 + attempted * 1200 + len(accesses) * n * 192 + phase_cost + plan.get("call_supply_reservation", 0),
                 "cost estimate mismatch")
         require(row["growth_allocation"] <= 65536, "function cap exceeded")
+        retained_limit = row.get("retained_growth_limit", row["growth_allocation"]) if contract >= 5 else row["growth_allocation"]
+        if contract >= 5:
+            require(type(row.get("retained_growth_limit")) is int and retained_limit == min(ceiling, row["growth_allocation"]),
+                    "retained object ceiling differs from policy")
         before, after = row["instructions_before"], row["instructions_after"]
         require(before >= 0 and after >= 0 and row["attempted_instructions"] >= 0, "negative instruction count")
         if row["status"] == "encoded":
             require(row["reason"] == "" and retained == attempted and lost == 0, "invalid retained disposition")
-            require(after == row["attempted_instructions"] and after <= before + row["growth_allocation"],
+            require(after == row["attempted_instructions"] and after <= before + retained_limit,
                     "retained growth exceeds allowance")
         else:
             require(row["reason"] == "growth-budget" and retained == 0 and lost == attempted and after == before,
                     "rollback not restored/accounted")
-            require(row["attempted_instructions"] > before + row["growth_allocation"], "spurious growth rollback")
+            require(row["attempted_instructions"] > before + retained_limit, "spurious growth rollback")
     if len(limits) > 1 or (limits and allocated > next(iter(limits))):
         errors.append("tile allocations exceed/disagree on shared module allowance")
     return errors
@@ -175,6 +210,7 @@ def tile_summary(report):
     retained = [r for r in rows if r["status"] == "encoded"]
     steps = [step for row in retained for step in row["plan"]["steps"]]
     return {"inspected_entry_allocas": len(rows), "retained_objects": len(retained),
+            "retained_private_borrows": sum("closed_call" in r["plan"] for r in retained),
             "retained_operations": sum(r["retained_operations"] for r in retained),
             "retained_unique_operation_ancestry": len({s["input_origin"] for s in steps if s["input_origin"]}),
             "retained_operations_without_ancestry": sum(not s["input_origin"] for s in steps),

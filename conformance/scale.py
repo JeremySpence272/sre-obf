@@ -85,7 +85,10 @@ def source_ledger(report):
     selection = {row["function"]: row for row in report.get("functions", []) or []}
     planner = {row["function"]: row for row in report.get("connected_regions", []) or []}
     bundled = {row["function"] for row in report.get("bundles", []) if row["retained_operations"]}
-    tiled = {row["function"] for row in report.get("object_bundles", []) if row["retained_operations"]}
+    tile_rows = [row for row in report.get("object_bundles", []) if row["retained_operations"]]
+    storage_owners = {row["function"] for row in tile_rows}
+    borrowers = {row["plan"]["closed_call"]["callee"] for row in tile_rows if "closed_call" in row.get("plan", {})}
+    tiled = storage_owners | borrowers
     final = {row["function"] for row in (report.get("final_inventory", {}).get("functions") or [])}
     owners = merge_owners(report)
     encoded = {row["function"]: row["encoded_function"]
@@ -154,6 +157,7 @@ def source_ledger(report):
             "selection_rows": len(selection), "planner_rows": len(planner),
             "bundle_owners": len(bundled),
             "object_bundle_owners": len(tiled),
+            "object_storage_owners": len(storage_owners), "object_borrowers": len(borrowers),
             "scope": "input IR before fusion, merging and every pass; a merged origin is "
                      "credited to its current owner, including encoded-interface renames. "
                      "Selected regions include retained connected regions or bundles. "

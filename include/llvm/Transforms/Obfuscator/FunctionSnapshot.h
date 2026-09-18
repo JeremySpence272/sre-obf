@@ -11,10 +11,12 @@ class FunctionSnapshot {
   Function &Original;
   Function *Body;
   GlobalValue::LinkageTypes Linkage;
+  bool DSOLocal;
   ValueToValueMapTy Forward;
 
 public:
-  explicit FunctionSnapshot(Function &F) : Original(F), Linkage(F.getLinkage()) {
+  explicit FunctionSnapshot(Function &F)
+      : Original(F), Linkage(F.getLinkage()), DSOLocal(F.isDSOLocal()) {
     Body = CloneFunction(&F, Forward);
     Body->setLinkage(GlobalValue::InternalLinkage);
   }
@@ -43,6 +45,9 @@ public:
     SmallVector<ReturnInst *, 8> Returns;
     CloneFunctionInto(&Original, Body, Back,
                       CloneFunctionChangeType::LocalChangesOnly, Returns);
+    // Making the saved body internal also makes it dso_local. Cloning that
+    // body back must not change preemption of the original exported symbol.
+    Original.setDSOLocal(DSOLocal);
     Original.setAttributes(Body->getAttributes());
     for (BasicBlock &BB : *Body)
       if (BB.hasAddressTaken())

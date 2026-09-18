@@ -19,6 +19,11 @@ is 12,000 incoming instructions.
 The explicit [larger-tile experiment](NATIVE_WIDE_TILES_V1.md) permits N=5..8
 under the same ownership and growth limits. It is not the default policy.
 
+The optional [closed private borrowing path](NATIVE_OBJECT_CALLS_V1.md) extends
+ownership to one proved leaf callee. It passes the actual encoded backing and
+updates both bodies transactionally. Without that option, pointer calls remain
+outside the local-only contract described here.
+
 The complete object-use walk accepts exact-width, nonvolatile, nonatomic scalar
 loads/stores and root-relative inbounds GEPs. It also accepts bounded fixed-vector
 reads of whole elements as explicitly decoded output boundaries (not encoded

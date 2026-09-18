@@ -35,6 +35,7 @@ def main():
     workload.add_argument("--predicate", action="store_true", help="predicate_run case with matched off arms and exact positive inputs")
     parser.add_argument("--call-output-ablation", action="store_true", help="private-calls disabled arms turn off outputs, leaving inputs on")
     parser.add_argument("--joint-call-ablation", action="store_true", help="private-calls controls retain consumers with independent argument pairs")
+    parser.add_argument("--object-call-ablation", action="store_true", help="tile workload, private borrower root, matched pointer-contract off arms")
     parser.add_argument("--control-ablation", action="store_true", help="loop disabled arms retain flattening without bundle control")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
@@ -48,6 +49,8 @@ def main():
         parser.error("--joint-call-ablation requires --private-calls and excludes --call-output-ablation")
     if args.control_ablation and not args.loop:
         parser.error("--control-ablation requires --loop")
+    if args.object_call_ablation and not args.tile:
+        parser.error("--object-call-ablation requires --tile")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out, args.case), timeout=180)
@@ -56,6 +59,7 @@ def main():
               "hardness_evaluated": False, "semantic_recovery": "not_measured", "arms": {}}
     if args.private_calls:
         result["private_ablation"] = "joint-arguments" if args.joint_call_ablation else "outputs" if args.call_output_ablation else "inputs"
+    if args.object_call_ablation: result["private_borrower"] = "tile_step"
     try:
         driver = out / "driver.o"
         driver_source = "tile_driver.c" if args.tile or args.immutable or args.private_calls else "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
@@ -71,6 +75,7 @@ def main():
                     str(FIXTURES / driver_source), "-o", str(driver)])
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}
+        if args.object_call_ablation: selected["post-o2"] = args.case / "post-o2.ll"
         if args.tile or args.immutable or args.private_calls or args.control_ablation or args.predicate:
             if args.predicate: name = "predicate"
             elif args.control_ablation: name = "control"
@@ -78,6 +83,7 @@ def main():
             else: name = "immutable" if args.immutable else "tiles"
             stem = "disabled" if args.predicate else args.stem + "-disabled"
             if args.joint_call_ablation: stem = args.stem + "-joint-off"
+            if args.object_call_ablation: name, stem = "object-calls", "off"
             selected[name + "-off"] = args.case / (stem + ".ll")
             selected[name + "-off-post-o2"] = args.case / (stem + "-post-o2.ll")
         expected = None
@@ -97,7 +103,8 @@ def main():
             if expected is None: expected = output
             if output != expected: raise ToolFailure("stripped binary differential failed")
             target = ("recur" if name == "clean" else "recur.sre.encoded") if args.private_calls else "kernel"
-            offset = private_offset((out / name / "symbols.txt").read_text(), target) if args.private_calls else target_offset(artifact["link_map"], target)
+            if args.object_call_ablation: target = "tile_step"
+            offset = private_offset((out / name / "symbols.txt").read_text(), target) if args.private_calls or args.object_call_ablation else target_offset(artifact["link_map"], target)
             recovered = decompile(runner, artifact["binary"], artifact["link_map"],
                 out / (name + "-decompiled.json"), args, offset)
             if recovered.get("status") != "ok": raise ToolFailure("decompiler control did not export the callable root")

@@ -17,6 +17,7 @@
 #include "llvm/Support/KnownBits.h"
 #include <algorithm>
 #include <optional>
+#include <memory>
 
 using namespace llvm;
 namespace llvm::obf {
@@ -61,6 +62,7 @@ struct Access {
   bool Store = false, Initializer = false;
   unsigned Elements = 1;
   std::string Origin;
+  std::string Owner;
 };
 struct Step { unsigned Opcode; std::string Origin; };
 struct Plan {
@@ -76,6 +78,8 @@ struct Plan {
 struct Binding {
   Function *F = nullptr;
   AllocaInst *Object = nullptr;
+  CallInst *Borrow = nullptr;
+  Argument *BorrowedRoot = nullptr;
   Plan P;
   SmallVector<GetElementPtrInst *, 16> Pointers;
   SmallVector<Instruction *, 16> Memory;
@@ -91,6 +95,55 @@ struct Binding {
   std::string Reason;
 };
 
+SmallVector<Function *, 2> owners(const Binding &B) {
+  SmallVector<Function *, 2> Result{B.F};
+  if (B.BorrowedRoot) Result.push_back(B.BorrowedRoot->getParent());
+  return Result;
+}
+
+bool pointerABI(const AttributeList &Attrs, unsigned N) {
+  for (auto Kind : {Attribute::ByVal, Attribute::ByRef, Attribute::InAlloca,
+                    Attribute::Preallocated, Attribute::StructRet, Attribute::Nest,
+                    Attribute::SwiftError, Attribute::SwiftSelf})
+    if (Attrs.hasParamAttr(N, Kind)) return false;
+  return true;
+}
+
+// One exact private borrowing context, no cloning or guessed alias summary.
+// The original callee body itself will consume the owner's encoded storage.
+bool planBorrow(Binding &B) {
+  auto fail = [&](StringRef Reason) { B.Reason = Reason.str(); return false; };
+  for (Instruction &I : instructions(*B.F)) {
+    auto *C = dyn_cast<CallInst>(&I);
+    if (!C || isa<IntrinsicInst>(C) || !llvm::is_contained(C->args(), B.Object)) continue;
+    if (B.Borrow) return fail("requires-single-private-borrow");
+    Function *G = C->getCalledFunction();
+    if (!G || G == B.F || !G->hasLocalLinkage() || G->hasAddressTaken() || !G->hasOneUse() ||
+        !G->hasFnAttribute("sre.native.original") || !safe(*G) || C->hasOperandBundles() || C->isMustTailCall() ||
+        C->getFunctionType() != G->getFunctionType()) return fail("unproved-private-borrow");
+    if (!G->getReturnType()->isVoidTy() && !G->getReturnType()->isIntegerTy())
+      return fail("unsupported-borrow-signature");
+    Argument *Root = nullptr;
+    for (Argument &A : G->args()) {
+      if (!A.getType()->isPointerTy()) {
+        if (!A.getType()->isIntegerTy()) return fail("unsupported-borrow-signature");
+        continue;
+      }
+      if (Root || C->getArgOperand(A.getArgNo()) != B.Object || A.getType()->getPointerAddressSpace() ||
+          !pointerABI(G->getAttributes(), A.getArgNo()) || !pointerABI(C->getAttributes(), A.getArgNo()))
+        return fail("unsupported-borrow-signature");
+      Root = &A;
+    }
+    if (!Root) return fail("unsupported-borrow-signature");
+    // No callbacks, nested borrowing, lifetime markers or stack observations
+    // inside this first leaf contract. The normal local-tile path is broader.
+    for (Instruction &J : instructions(*G))
+      if (isa<CallBase>(&J) && !isa<DbgInfoIntrinsic>(&J)) return fail("unsupported-borrow-effect");
+    B.Borrow = C; B.BorrowedRoot = Root;
+  }
+  return true;
+}
+
 bool planLifetime(Binding &B, const DominatorTree &DT) {
   auto fail = [&](StringRef Reason) { B.Reason = Reason.str(); return false; };
   if (B.Lifetimes.empty()) return true;
@@ -103,9 +156,14 @@ bool planLifetime(Binding &B, const DominatorTree &DT) {
   if (Starts != 1 || B.LifetimeStart->getParent() != &B.F->getEntryBlock())
     return fail("requires-single-entry-lifetime");
   if (Ends > 8) return fail("lifetime-end-limit");
-  for (Instruction *I : B.Memory)
-    if (!DT.dominates(B.LifetimeStart, I)) return fail("lifetime-start-does-not-dominate");
-  SmallPtrSet<Instruction *, 32> Accesses(B.Memory.begin(), B.Memory.end());
+  SmallPtrSet<Instruction *, 32> Accesses;
+  for (Instruction *I : B.Memory) {
+    // The closed leaf can only touch this object during the proved call.
+    // Project remote accesses to that call for the caller's lifetime CFG.
+    Instruction *Site = I->getFunction() == B.F ? I : B.Borrow;
+    if (!DT.dominates(B.LifetimeStart, Site)) return fail("lifetime-start-does-not-dominate");
+    Accesses.insert(Site);
+  }
   SmallPtrSet<Instruction *, 16> Markers(B.Lifetimes.begin(), B.Lifetimes.end());
   for (LifetimeIntrinsic *End : B.Lifetimes) {
     if (End == B.LifetimeStart) continue;
@@ -147,12 +205,17 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
   if (!llvm::is_contained(ArrayRef<unsigned>{8, 16, 32, 64}, B.P.Width))
     return fail("unsupported-width");
   Type *E = T->getElementType();
+  if (O.ObjectCalls && !planBorrow(B)) return false;
+  DominatorTree BorrowDT;
+  if (B.BorrowedRoot) BorrowDT.recalculate(*B.BorrowedRoot->getParent());
+  SmallVector<Value *, 2> Roots{A};
+  if (B.BorrowedRoot) Roots.push_back(B.BorrowedRoot);
   DenseMap<Value *, Value *> Index;
-  Index[A] = ConstantInt::get(Type::getInt32Ty(A->getContext()), 0);
+  for (Value *Root : Roots) Index[Root] = ConstantInt::get(Type::getInt32Ty(A->getContext()), 0);
   // Root-relative GEPs only, including constant byte offsets emitted by O2.
   // A byte-addressed pointer is not permission for bytewise observation.
-  for (User *U : A->users()) if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
-    if (!G->isInBounds() || G->getPointerOperand() != A)
+  for (Value *Root : Roots) for (User *U : Root->users()) if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
+    if (!G->isInBounds() || G->getPointerOperand() != Root)
       return fail("unsupported-pointer-layout");
     Value *V = nullptr;
     if (G->getSourceElementType() == T && G->getNumIndices() == 2) {
@@ -169,18 +232,18 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
       V = ConstantInt::get(Type::getInt64Ty(A->getContext()), Offset->getZExtValue() / Bytes);
     } else return fail("unsupported-pointer-layout");
     if (!V->getType()->isIntegerTy()) return fail("unproved-index");
-    KnownBits K = computeKnownBits(V, A->getModule()->getDataLayout(), nullptr, G, &DT);
+    KnownBits K = computeKnownBits(V, A->getModule()->getDataLayout(), nullptr, G, Root == A ? &DT : &BorrowDT);
     if (!K.isNonNegative() || !K.getMaxValue().ult(B.P.Cells)) return fail("unproved-index");
     Index[G] = V;
   }
-  SmallVector<Value *, 16> PointerOrder{A};
-  for (Instruction &I : instructions(*B.F))
+  SmallVector<Value *, 16> PointerOrder(Roots.begin(), Roots.end());
+  for (Function *F : owners(B)) for (Instruction &I : instructions(*F))
     if (auto *G = dyn_cast<GetElementPtrInst>(&I); G && Index.contains(G)) {
       PointerOrder.push_back(G); B.Pointers.push_back(G);
     }
   for (Value *Pointer : PointerOrder) for (User *U : Pointer->users()) {
     if (auto *G = dyn_cast<GetElementPtrInst>(U)) {
-      if (Pointer == A && Index.contains(G)) continue;
+      if (llvm::is_contained(Roots, Pointer) && Index.contains(G)) continue;
       return fail("derived-pointer");
     }
     if (auto *L = dyn_cast<LoadInst>(U)) {
@@ -196,22 +259,26 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
     } else if (auto *S = dyn_cast<StoreInst>(U)) {
       if (S->getPointerOperand() != Pointer || S->getValueOperand()->getType() != E || !S->isSimple())
         return fail("partial-volatile-or-atomic-access");
+    } else if (U == B.Borrow && Pointer == A) {
+      continue;
     } else if (auto *I = dyn_cast<LifetimeIntrinsic>(U)) {
       if (Pointer != A || I->arg_size() != 1 || I->getArgOperand(0) != A || I->hasOperandBundles())
         return fail("requires-root-lifetime-marker");
     } else return fail("pointer-escape-or-observation");
   }
   // Deterministic order independent of pointer use lists / hash iteration.
-  for (Instruction &I : instructions(*B.F)) {
+  for (Function *F : owners(B)) for (Instruction &I : instructions(*F)) {
     if (auto *L = dyn_cast<LifetimeIntrinsic>(&I); L && L->getArgOperand(0) == A)
       B.Lifetimes.push_back(L);
     Value *Ptr = nullptr;
     if (auto *L = dyn_cast<LoadInst>(&I)) Ptr = L->getPointerOperand();
     if (auto *S = dyn_cast<StoreInst>(&I)) Ptr = S->getPointerOperand();
     if (!Ptr || !Index.contains(Ptr)) continue;
-    if (!DT.isReachableFromEntry(I.getParent())) return fail("unreachable-access");
+    const DominatorTree &OwnerDT = F == B.F ? DT : BorrowDT;
+    if (!OwnerDT.isReachableFromEntry(I.getParent())) return fail("unreachable-access");
     Access M;
     M.Store = isa<StoreInst>(I); M.Origin = origin(I);
+    M.Owner = F->getName().str();
     if (auto *V = dyn_cast<FixedVectorType>(I.getType())) {
       M.Elements = V->getNumElements();
       ++B.VectorOutputs; B.VectorUses += I.getNumUses(); B.VectorLanes += M.Elements;
@@ -232,11 +299,13 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
         return fail("requires-complete-entry-initialization");
       B.Initializers[*M.Constant] = S; B.LastInitializer = S;
       M.Initializer = true; ++Initialized;
-    } else if (!DT.dominates(B.LastInitializer, B.Memory[K])) {
+    } else if (!DT.dominates(B.LastInitializer, B.Memory[K]->getFunction() == B.F ? B.Memory[K] : B.Borrow)) {
       return fail("initialization-does-not-dominate");
     }
   }
   if (Initialized != B.P.Cells) return fail("requires-complete-entry-initialization");
+  if (B.Borrow && (!DT.isReachableFromEntry(B.Borrow->getParent()) || !DT.dominates(B.LastInitializer, B.Borrow)))
+    return fail("initialization-does-not-dominate");
 
   SmallPtrSet<Instruction *, 32> Forward, Useful;
   SmallVector<Instruction *, 32> Queue;
@@ -260,7 +329,7 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
     if (I && Forward.contains(I) && Useful.insert(I).second) Queue.push_back(I);
   }
   SmallPtrSet<Instruction *, 32> Members;
-  for (Instruction &I : instructions(*B.F)) {
+  for (Function *F : owners(B)) for (Instruction &I : instructions(*F)) {
     if (isa<LoadInst>(I) && Forward.contains(&I)) Members.insert(&I);
     else if (Useful.contains(&I)) {
       Members.insert(&I); B.Nodes.push_back(&I);
@@ -268,6 +337,9 @@ bool planObject(Binding &B, const NativeBundleOptions &O, const DominatorTree &D
     }
   }
   if (B.Nodes.size() < 4) return fail("no-useful-encoded-update");
+  if (B.Borrow && llvm::count_if(B.Nodes, [&](Instruction *I) {
+        return I->getFunction() == B.BorrowedRoot->getParent(); }) < 4)
+    return fail("borrow-no-useful-update");
   SmallPtrSet<Value *, 32> Inputs;
   auto input = [&](Value *V) {
     if (!isa<Constant>(V) && !Members.contains(dyn_cast<Instruction>(V))) Inputs.insert(V);
@@ -307,7 +379,8 @@ class Lowering {
   SmallPtrSet<Instruction *, 32> Members;
   ConstantInt *c(uint64_t X) { return ConstantInt::get(B.getIntNTy(P.Width), X); }
   Value *pointer(Value *K) {
-    return B.CreateInBoundsGEP(StorageType, Storage, {B.getInt32(0), K});
+    Value *Base = B.GetInsertBlock()->getParent() == Bound.F ? cast<Value>(Storage) : Bound.BorrowedRoot;
+    return B.CreateInBoundsGEP(StorageType, Base, {B.getInt32(0), K});
   }
   Value *pointer(unsigned K) {
     return pointer(B.getInt32(K));
@@ -367,7 +440,7 @@ public:
   void run() {
     Function &F = *Bound.F;
     SmallPtrSet<Instruction *, 32> Original;
-    for (Instruction &I : instructions(F)) Original.insert(&I);
+    for (Function *Owner : owners(Bound)) for (Instruction &I : instructions(*Owner)) Original.insert(&I);
     MDNode *Tag = MDNode::get(F.getContext(), MDString::get(F.getContext(), "native-object-bundle-v1"));
     IRBuilder<> Entry(getAllocaIP(F));
     StorageType = ArrayType::get(B.getIntNTy(P.Width), P.Cells + 1 + unsigned(P.Phases));
@@ -375,6 +448,19 @@ public:
     // Retargeted lifetime argument attributes may promise the original
     // alignment. Preserve that promise on the larger private allocation.
     Storage->setAlignment(std::max(Storage->getAlign(), Bound.Object->getAlign()));
+    if (Bound.Borrow) {
+      unsigned N = Bound.BorrowedRoot->getArgNo();
+      Function *Callee = Bound.BorrowedRoot->getParent();
+      Storage->setAlignment(std::max(Storage->getAlign(),
+          std::max(Callee->getParamAlign(N).valueOrOne(), Bound.Borrow->getParamAlign(N).valueOrOne())));
+      Bound.Borrow->setArgOperand(N, Storage);
+      Bound.Borrow->setMemoryEffects(MemoryEffects::unknown());
+      Bound.Borrow->removeFnAttr(Attribute::Speculatable);
+      Callee->setMemoryEffects(MemoryEffects::unknown());
+      Callee->removeFnAttr(Attribute::Speculatable);
+      Bound.Borrow->setMetadata("sre.native.object.borrow", MDNode::get(F.getContext(), {
+          MDString::get(F.getContext(), F.getName()), MDString::get(F.getContext(), Callee->getName())}));
+    }
     Storage->setMetadata("sre.native.value", MDNode::get(F.getContext(), {}));
     // LLVM 22 lifetimes name the whole alloca, not a byte-size argument.
     // Retarget in place: no marker motion, deletion, or new intrinsic callee.
@@ -418,7 +504,8 @@ public:
     // Preserve function order for named boundary emission and destruction even
     // for objects with many loads and a small useful arithmetic region.
     SmallVector<Instruction *, 64> OrderedMembers;
-    for (Instruction &I : instructions(F)) if (Members.contains(&I)) OrderedMembers.push_back(&I);
+    for (Function *Owner : owners(Bound)) for (Instruction &I : instructions(*Owner))
+      if (Members.contains(&I)) OrderedMembers.push_back(&I);
     for (Instruction *I : Bound.Nodes) { B.SetInsertPoint(I); read(I); }
     for (unsigned K = 0; K < Bound.Memory.size(); ++K) {
       auto *S = dyn_cast<StoreInst>(Bound.Memory[K]);
@@ -449,7 +536,7 @@ public:
     // Indices are also scalar boundaries: generated comparisons still refer
     // to their original SSA value and are rewritten here before it is erased.
     for (Instruction *I : OrderedMembers) {
-      if (CallOutputs) supplyNativeBundleCalls(F, I, Pairs.lookup(I), P.Coordinates);
+      if (CallOutputs) supplyNativeBundleCalls(*I->getFunction(), I, Pairs.lookup(I), P.Coordinates);
       auto external = [&](Use &U) {
         auto *User = dyn_cast<Instruction>(U.getUser());
         return !Members.contains(User) && !llvm::is_contained(Bound.Memory, User);
@@ -469,7 +556,8 @@ public:
     for (Instruction *I : OrderedMembers) I->eraseFromParent();
     for (GetElementPtrInst *G : Bound.Pointers) G->eraseFromParent();
     Bound.Object->eraseFromParent();
-    for (Instruction &I : instructions(F)) if (!Original.contains(&I)) I.setMetadata(TagName, Tag);
+    for (Function *Owner : owners(Bound)) for (Instruction &I : instructions(*Owner))
+      if (!Original.contains(&I)) I.setMetadata(TagName, Tag);
   }
 };
 
@@ -482,14 +570,16 @@ json::Object describe(const Binding &B) {
   unsigned Loads = 0, Stores = 0, Dynamic = 0;
   for (const Access &A : P.Accesses) {
     Loads += !A.Store; Stores += A.Store; Dynamic += !A.Constant;
-    Accesses.push_back(json::Object{{"kind", A.Store ? "store" : "load"}, {"initializer", A.Initializer},
+    json::Object Row{{"kind", A.Store ? "store" : "load"}, {"initializer", A.Initializer},
         {"index", A.Constant ? json::Value(*A.Constant) : json::Value(nullptr)},
         {"bounds", A.Constant ? "constant" : "known-bits-nonnegative-in-range"},
-        {"elements", A.Elements}, {"input_origin", A.Origin}});
+        {"elements", A.Elements}, {"input_origin", A.Origin}};
+    if (B.Borrow) Row["function"] = A.Owner;
+    Accesses.push_back(std::move(Row));
   }
   for (const Step &S : P.Steps) Steps.push_back(json::Object{
       {"opcode", Instruction::getOpcodeName(S.Opcode)}, {"input_origin", S.Origin}});
-  return json::Object{{"width", P.Width}, {"cells", P.Cells},
+  json::Object Result{{"width", P.Width}, {"cells", P.Cells},
       {"family", P.Coordinates == Family::Xor ? "triangular-xor-v1" : "triangular-additive-v1"},
       {"law", "closed-initialized-tile-v1"}, {"phase_mode", P.Phases ? "store-toggle-v1" : "static"},
       {"phase_contract", json::Object{{"states", P.Phases ? 2 : 1}, {"entry", 0},
@@ -498,7 +588,8 @@ json::Object describe(const Binding &B) {
           {"layout", P.Phases ? "rotate-logical-slots-by-phase" : "seeded-permutation"},
           {"static_update_sites", P.Phases ? Stores - P.Cells : 0},
           {"bytes_reencoded_per_update", P.Phases ? (P.Cells + 2) * P.Width / 8 : 0}}},
-      {"ownership", "closed-entry-alloca"}, {"initialization", "complete-entry-stores-dominate-accesses"},
+      {"ownership", B.Borrow ? "closed-private-borrow" : "closed-entry-alloca"},
+      {"initialization", B.Borrow ? "complete-entry-stores-dominate-accesses-and-call" : "complete-entry-stores-dominate-accesses"},
       {"physical_slots", std::move(Physical)}, {"salts_hex", std::move(Salts)}, {"rotations", std::move(Rotations)},
       {"source_loads", Loads}, {"source_stores", Stores}, {"dynamic_accesses", Dynamic},
       {"physical_loads", (Loads + Stores - P.Cells) * (P.Cells + 1 + unsigned(P.Phases))},
@@ -515,6 +606,14 @@ json::Object describe(const Binding &B) {
           {"translated_markers", B.Lifetimes.size()},
           {"proof", "start-dominates-accesses-no-access-or-marker-reachable-after-end"}}},
       {"accesses", std::move(Accesses)}, {"steps", std::move(Steps)}};
+  if (B.Borrow) Result["closed_call"] = json::Object{
+      {"contract", "sole-private-leaf-borrow-v1"}, {"caller", B.F->getName().str()},
+      {"callee", B.BorrowedRoot->getParent()->getName().str()}, {"pointer_argument", B.BorrowedRoot->getArgNo()},
+      {"direct_sites", 1}, {"layout_words", P.Cells + 1 + unsigned(P.Phases)},
+      {"callee_operations", llvm::count_if(B.Nodes, [&](Instruction *I) {
+          return I->getFunction() == B.BorrowedRoot->getParent(); })},
+      {"proof", "sole-use-leaf-single-pointer-closed-accesses-initialization-dominates-call"}};
+  return Result;
 }
 }
 
@@ -547,9 +646,9 @@ json::Array encodeNativeObjectBundles(Module &M, uint64_t Seed, const NativeBund
   unsigned Remaining = O.GrowthBudget;
   for (unsigned K : Order) {
     Binding &B = Work[K];
-    if (Owners.contains(B.F)) B.Reason = "one-object-per-function";
+    if (llvm::any_of(owners(B), [&](Function *F) { return Owners.contains(F); })) B.Reason = "one-object-per-function";
     else if (B.P.Cost > Remaining) B.Reason = "module-unit-budget";
-    else { Owners.insert(B.F); Remaining -= B.P.Cost; }
+    else { for (Function *F : owners(B)) Owners.insert(F); Remaining -= B.P.Cost; }
   }
   json::Array Report;
   // Describe all rejected objects BEFORE mutation; later bindings may contain
@@ -560,6 +659,7 @@ json::Array encodeNativeObjectBundles(Module &M, uint64_t Seed, const NativeBund
         {"growth_allocation", B.Reason.empty() ? B.P.Cost : 0}, {"module_growth_limit", O.GrowthBudget},
         {"attempted_operations", 0}, {"retained_operations", 0}, {"rolled_back_operations", 0},
         {"pins", O.Pin}, {"max_cells", O.ObjectMaxCells}, {"hardness_evaluated", false}};
+    Row["retained_growth_limit"] = B.Reason.empty() ? std::min(B.P.Cost, O.ObjectRetainedGrowth) : 0;
     if (B.Reason.empty()) {
       Rng R = Rng(Seed).fork("native-object-bundles-v1").fork(B.F->getName()).fork(B.P.ID);
       B.P.Coordinates = O.Family == "additive" || (O.Family == "seeded" && (R.u64() & 1))
@@ -577,20 +677,31 @@ json::Array encodeNativeObjectBundles(Module &M, uint64_t Seed, const NativeBund
     Binding &B = Work[K];
     if (!B.Reason.empty()) continue;
     auto &Row = *Report[K].getAsObject();
-    unsigned Before = B.F->getInstructionCount();
+    auto count = [&]() {
+      unsigned Total = 0;
+      for (Function *F : owners(B)) Total += F->getInstructionCount();
+      return Total;
+    };
+    unsigned Before = count();
     FunctionSnapshot Snapshot(*B.F);
+    std::unique_ptr<FunctionSnapshot> CalleeSnapshot;
+    if (B.Borrow) CalleeSnapshot = std::make_unique<FunctionSnapshot>(*B.BorrowedRoot->getParent());
     Lowering(B, O.Pin, O.CallInputs, O.CallOutputs).run();
-    unsigned Attempted = B.F->getInstructionCount();
-    if (verifyFunction(*B.F, &errs())) report_fatal_error("native object bundle produced invalid IR");
-    bool Rollback = Attempted > uint64_t(Before) + B.P.Cost;
-    if (Rollback) Snapshot.restore();
+    unsigned Attempted = count();
+    for (Function *F : owners(B))
+      if (verifyFunction(*F, &errs())) report_fatal_error("native object bundle produced invalid IR");
+    bool Rollback = Attempted > uint64_t(Before) + std::min(B.P.Cost, O.ObjectRetainedGrowth);
+    if (Rollback) {
+      Snapshot.restore();
+      if (CalleeSnapshot) CalleeSnapshot->restore();
+    }
     Row["status"] = Rollback ? "rolled-back" : "encoded";
     Row["reason"] = Rollback ? "growth-budget" : "";
     Row["attempted_operations"] = B.P.Steps.size();
     Row["retained_operations"] = Rollback ? 0 : B.P.Steps.size();
     Row["rolled_back_operations"] = Rollback ? B.P.Steps.size() : 0;
     Row["instructions_before"] = Before; Row["attempted_instructions"] = Attempted;
-    Row["instructions_after"] = B.F->getInstructionCount();
+    Row["instructions_after"] = count();
   }
   return Report;
 }

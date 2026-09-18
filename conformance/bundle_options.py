@@ -6,6 +6,8 @@ def add_options(parser):
     parser.add_argument("--object-bundles", action="store_true")
     parser.add_argument("--object-phases", action="store_true")
     parser.add_argument("--object-max-cells", type=int, choices=(4, 8))
+    parser.add_argument("--object-calls", action="store_true")
+    parser.add_argument("--object-retained-growth", type=int)
     parser.add_argument("--immutable-bundles", action="store_true")
     parser.add_argument("--continuity-priority", action="store_true")
     parser.add_argument("--bundle-call-inputs", action="store_true")
@@ -25,16 +27,21 @@ def add_options(parser):
 def validate(args, connected):
     enabled = getattr(args, "bundles", False)
     choices = any(getattr(args, key, None) is not None
-                  for key in ("transfer_family", "bundle_values", "transfer_nodes", "object_max_cells"))
+                  for key in ("transfer_family", "bundle_values", "transfer_nodes", "object_max_cells", "object_retained_growth"))
     switches = any(getattr(args, key, False) for key in
                    ("no_bundle_pins", "bundle_loops", "bundle_phases", "bundle_loop_boundaries",
-                    "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "joint_call_arguments", "bundle_control", "bundle_predicates"))
+                    "object_bundles", "object_phases", "object_calls", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "joint_call_arguments", "bundle_control", "bundle_predicates"))
     if not enabled and (choices or switches):
         raise ValueError("bundle options require --bundles")
     if getattr(args, "object_phases", False) and not getattr(args, "object_bundles", False):
         raise ValueError("--object-phases requires --object-bundles")
     if getattr(args, "object_max_cells", None) is not None and not getattr(args, "object_bundles", False):
         raise ValueError("--object-max-cells requires --object-bundles")
+    if getattr(args, "object_calls", False) and not getattr(args, "object_bundles", False):
+        raise ValueError("--object-calls requires --object-bundles")
+    growth = getattr(args, "object_retained_growth", None)
+    if growth is not None and (not 1 <= growth <= 65536 or not getattr(args, "object_bundles", False)):
+        raise ValueError("--object-retained-growth requires object bundles and a ceiling in 1..65536")
     if getattr(args, "bundle_call_inputs", False) and not getattr(args, "encoded_calls", False):
         raise ValueError("--bundle-call-inputs requires --encoded-calls")
     if getattr(args, "bundle_call_outputs", False) and not getattr(args, "encoded_calls", False):
@@ -60,21 +67,22 @@ def flags(args):
             f"-native-bundle-values={getattr(args, 'bundle_values', None) or 4}",
             f"-native-transfer-nodes={getattr(args, 'transfer_nodes', None) or 16}",
             f"-native-bundle-pins={int(not getattr(args, 'no_bundle_pins', False))}"] + (
-            [f"-native-object-max-cells={args.object_max_cells}"] if getattr(args, "object_max_cells", None) is not None else []) + [
+            [f"-native-object-max-cells={args.object_max_cells}"] if getattr(args, "object_max_cells", None) is not None else []) + (
+            [f"-native-object-retained-growth={args.object_retained_growth}"] if getattr(args, "object_retained_growth", None) is not None else []) + [
             "-native-" + key.replace("_", "-") + "=1"
             for key in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries",
-                        "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "joint_call_arguments", "bundle_control", "bundle_predicates")
+                        "object_bundles", "object_phases", "object_calls", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "joint_call_arguments", "bundle_control", "bundle_predicates")
             if getattr(args, key, False)]
 
 
 def argv(args):
     if not getattr(args, "bundles", False): return []
     out = ["--bundles"]
-    for name in ("transfer_family", "bundle_values", "transfer_nodes", "object_max_cells"):
+    for name in ("transfer_family", "bundle_values", "transfer_nodes", "object_max_cells", "object_retained_growth"):
         if getattr(args, name, None) is not None:
             out += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     if getattr(args, "no_bundle_pins", False): out.append("--no-bundle-pins")
     for name in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries",
-                 "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "joint_call_arguments", "bundle_control", "bundle_predicates"):
+                 "object_bundles", "object_phases", "object_calls", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "joint_call_arguments", "bundle_control", "bundle_predicates"):
         if getattr(args, name, False): out.append("--" + name.replace("_", "-"))
     return out

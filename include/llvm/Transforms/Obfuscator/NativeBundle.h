@@ -11,6 +11,8 @@ struct NativeBundleOptions {
   std::string Family = "seeded";
   unsigned Values = 4, Nodes = 16, GrowthBudget = 0;
   unsigned ObjectMaxCells = 4;
+  unsigned ObjectRetainedGrowth = 65536;
+  bool ObjectCalls = false;
   bool Pin = true;
   bool Loops = false, Phases = false;
   bool LoopBoundaries = false;

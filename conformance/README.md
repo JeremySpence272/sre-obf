@@ -350,6 +350,14 @@ paired-ABI control. `joint_call_proof` validates actual `interfaces.ll` entry
 slices against supplied descriptors; unknown syntax fails rather than passing.
 See [the supported scope and evidence](../docs/NATIVE_JOINT_CALL_ARGUMENTS_V1.md).
 
+`--object-calls` permits a sole proved private leaf to borrow encoded tile
+storage. `borrow_run` checks full outputs, phase updates, threads, O2, explicit
+rejections, and exact whole-module restoration under a downward-only retained
+growth ceiling. `--c-o2` tests real clang lifetimes and a packed read boundary.
+`bundle_decompile --tile --object-call-ablation --stem native` exports the
+private borrower against matched off arms. See [the ownership contract and
+snapshot-preemption repair](../docs/NATIVE_OBJECT_CALLS_V1.md).
+
 Corpus-lock revision `m0-3` freezes bzip2/cJSON IO manifests under ignored
 `out/v04-frozen-holdouts-20260918/`. Existing seeds and resource caps are unchanged.
 Only unobfuscated reference programs were built during preparation; their

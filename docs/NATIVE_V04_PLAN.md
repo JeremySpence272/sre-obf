@@ -275,8 +275,11 @@ Prioritize numeric arrays and useful state alongside strings.
 Implementation status: the default-off [closed local tile prototype](NATIVE_OBJECT_BUNDLES_V1.md)
 is a bounded increment only. It now has opt-in finite store phases and a separate
 [immutable numeric continuity path](NATIVE_IMMUTABLE_BUNDLES_V1.md), but does not
-yet handle direct-call ownership propagation or the wider layout/lifetime
-contracts below. W3 remains incomplete and is not promoted.
+handle arbitrary direct-call ownership propagation or the wider layout/lifetime
+contracts below. The bounded [sole private leaf borrowing path](NATIVE_OBJECT_CALLS_V1.md)
+now carries encoded storage through a proved pointer edge, including caller
+lifetimes and atomic two-body rollback. Broader pointer contexts remain explicit
+fallbacks. W3 is not promoted by these supported-scope checks.
 It now preserves proved single-entry root lifetimes and supports exact constant
 byte offsets and decoded packed-read boundaries, including ordinary O2 C
 fixtures. This is not an interprocedural ownership or general-layout solution.
@@ -395,7 +398,9 @@ supports encoded argument/result supplies from pure bundles and local tiles.
 A default-off [joint argument-tuple path](NATIVE_JOINT_CALL_ARGUMENTS_V1.md)
 now handles two-to-four same-width private parameters with direct bundle
 consumption/supply and matched paired controls. Mixed-width joint groups,
-joint/aggregate returns and closed-object pointer interfaces remain work.
+joint/aggregate returns remain work. A [closed-object borrowing contract](NATIVE_OBJECT_CALLS_V1.md)
+now covers one exact private leaf context; shared/multiple contexts, special
+pointer ABIs and general escaping ownership remain unsupported.
 
 Resolve merge/fusion/call-encoding competition during planning. For each
 eligible internal group choose exactly one policy: fuse into a useful region,
