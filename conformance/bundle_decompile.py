@@ -18,6 +18,7 @@ def main():
     parser.add_argument("--case", type=Path, required=True, help="width directory from bundle_run")
     parser.add_argument("--stem", default="xor-1-pins-1")
     parser.add_argument("--width", type=int, choices=(8, 16, 32, 64), required=True)
+    parser.add_argument("--loop", action="store_true", help="use a supported bundle_loop_run case and full two-output workload")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
     parser.add_argument("--ghidra-image", required=True)
@@ -28,18 +29,24 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out, args.case), timeout=180)
     result = {"schema": "sre-bundle-decompiler-v1", "passed": False, "scope": "informed-entry",
+              "workload": "loop" if args.loop else "straight-line",
               "hardness_evaluated": False, "semantic_recovery": "not_measured", "arms": {}}
     try:
         driver = out / "driver.o"
-        runner.run(["clang", "-O2", "-c", str(FIXTURES / "bundle_driver.c"), "-o", str(driver)])
+        driver_source = "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
+        runner.run(["clang", "-O2", *(["-pthread"] if args.loop else []), "-c",
+                    str(FIXTURES / driver_source), "-o", str(driver)])
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}
         expected = None
         vectors = inputs(args.width, 1024)
+        if args.loop:
+            from conformance.bundle_loop_run import vectors as loop_vectors
+            vectors = "".join(f"{a} {b} {n}\n" for a, b, n in loop_vectors(args.width, True)).encode()
         for name, source in selected.items():
             archived = out / (name + ".ll")
             shutil.copy2(source, archived)
-            artifact = compile_variant(runner, archived, driver, out / name)
+            artifact = compile_variant(runner, archived, driver, out / name, threaded=args.loop)
             output = runner.run([str(artifact["binary"])], stdin=vectors)
             if expected is None: expected = output
             if output != expected: raise ToolFailure("stripped binary differential failed")

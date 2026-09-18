@@ -1,0 +1,35 @@
+; Joint recurrence fixture; scalar trip count intentionally remains outside it.
+target triple = "x86_64-unknown-linux-gnu"
+define {iWIDTH, iWIDTH} @kernel(iWIDTH %a, iWIDTH %b, i32 %count) noinline {
+entry:
+  %empty = icmp eq i32 %count, 0
+  br i1 %empty, label %exit, label %pre
+pre:
+  br label %loop
+loop:
+  %x = phi iWIDTH [ %a, %pre ], [ %b5, %loop ]
+  %y = phi iWIDTH [ %b, %pre ], [ %a5, %loop ]
+  %i = phi i32 [ 0, %pre ], [ %next, %loop ]
+  %a0 = add iWIDTH %x, %y
+  %b0 = xor iWIDTH %y, 91
+  %a1 = mul iWIDTH %a0, 13
+  %b1 = sub iWIDTH %b0, %a0
+  %a2 = lshr iWIDTH %a1, 3
+  %b2 = shl iWIDTH %b1, 2
+  %a3 = xor iWIDTH %a1, %a2
+  %b3 = or iWIDTH %b1, %b2
+  %a4 = add iWIDTH %a3, %b3
+  %b4 = and iWIDTH %b3, 127
+  %a5 = ashr iWIDTH %a4, 1
+  %b5 = xor iWIDTH %b4, %a4
+  %result0 = freeze iWIDTH %a5
+  %next = add i32 %i, 1
+  %again = icmp ult i32 %next, %count
+  br i1 %again, label %loop, label %exit
+exit:
+  %out0 = phi iWIDTH [ %a, %entry ], [ %result0, %loop ]
+  %out1 = phi iWIDTH [ %b, %entry ], [ %b5, %loop ]
+  %pair0 = insertvalue {iWIDTH, iWIDTH} poison, iWIDTH %out0, 0
+  %pair1 = insertvalue {iWIDTH, iWIDTH} %pair0, iWIDTH %out1, 1
+  ret {iWIDTH, iWIDTH} %pair1
+}

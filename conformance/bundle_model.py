@@ -78,6 +78,26 @@ class Descriptor:
             new[k] = ((old[0] + m - old[1]) if self.additive else (old[0] ^ (old[1] ^ m))) & self.bits
         return tuple(new)
 
+    def rebase(self, state, carrier, next_slots, new_carrier):
+        """Move/rekey output coordinates into canonical recurrence input slots."""
+        if not 2 <= len(next_slots) <= len(state) or any(not 0 <= k < len(state) for k in next_slots):
+            raise ValueError("invalid recurrence mapping")
+        old = [(state[k], self.mask(state, carrier, k)) for k in next_slots]
+        new = []
+        for k in range(len(state)):
+            e, r = old[k] if k < len(old) else (0, 0)
+            m = self.mask(new, new_carrier, k)
+            new.append(((e + m - r) if self.additive else (e ^ (r ^ m))) & self.bits)
+        return tuple(new)
+
+    def next_carrier(self, state, carrier, phase):
+        if phase not in (0, 1):
+            raise ValueError("phase outside the finite graph")
+        x, r = carrier ^ state[-1], self.rotations[-1]
+        rotated = ((x << r) | (x >> (self.width - r))) & self.bits
+        history = (rotated + (state[0] ^ self.salts[-1])) & self.bits
+        return (history ^ ((phase ^ 1) * (self.salts[0] | 1))) & self.bits
+
 
 def scalar(opcode, x, y, width):
     """Independent source semantics, including defined arithmetic right shift."""
@@ -150,3 +170,42 @@ def replay(region, inputs):
         if d.decode(state, carrier) != tuple(values):
             raise AssertionError("bundle transfer differs from independent source semantics")
     return tuple(values[k] for k in region["output_slots"])
+
+
+def replay_loop(region, inputs, iterations):
+    """Informed recurrence control: every transfer/rebase vs scalar semantics.
+
+    Iteration count is supplied, not inferred from a branch. Zero returns entry
+    inputs; positive counts return all scheduled outputs of the last iteration.
+    """
+    if region["loop"]["status"] != "encoded" or iterations < 0:
+        raise ValueError("requires encoded recurrence and nonnegative trip count")
+    if len(inputs) != region["inputs"]:
+        raise ValueError("wrong input count")
+    d = Descriptor.from_plan(region)
+    values = list(inputs) + [0] * (region["lanes"] - len(inputs))
+    r = d.rotations[0]
+    carrier = ((((inputs[0] << r) | (inputs[0] >> (d.width - r))) & d.bits) +
+               (inputs[1] ^ d.salts[0])) & d.bits
+    state, phase = d.encode(values, carrier), 0
+    result = tuple(inputs)
+    for _ in range(iterations):
+        for step in region["steps"]:
+            def read(op):
+                return int(op["constant_hex"], 16) & d.bits if "constant_hex" in op else values[op["slot"]]
+            state = d.update(state, carrier, step["destination"], step["opcode"], step["x"], step["y"])
+            values[step["destination"]] = scalar(step["opcode"], read(step["x"]), read(step["y"]), d.width)
+            if d.decode(state, carrier) != tuple(values):
+                raise AssertionError("recurrence transfer differs from scalar semantics")
+        result = tuple(values[k] for k in region["output_slots"])
+        mapping = region["loop"]["next_input_slots"]
+        new_carrier = carrier
+        if region["loop"]["phase_mode"] == "two-phase":
+            new_carrier = d.next_carrier(state, carrier, phase)
+            phase ^= 1
+        state = d.rebase(state, carrier, mapping, new_carrier)
+        values = [values[k] for k in mapping] + [0] * (region["lanes"] - len(mapping))
+        carrier = new_carrier
+        if d.decode(state, carrier) != tuple(values):
+            raise AssertionError("backedge rebase differs from scalar recurrence")
+    return result

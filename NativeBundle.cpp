@@ -8,6 +8,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Verifier.h"
 #include <algorithm>
 
@@ -65,6 +66,10 @@ struct Program {
   SmallVector<unsigned, 4> OutputSlots;
   SmallVector<uint64_t, 4> Salts;
   SmallVector<unsigned, 4> Rotations;
+  // Canonical next-iteration input slots, expressed in the completed schedule.
+  // Empty means an ordinary straight-line region, including explicit fallback.
+  SmallVector<unsigned, 4> NextSlots;
+  bool Phases = false;
   Family coordinates() const {
     switch (Rep.Fam) {
     case plan::Family::TriangularXor: return Family::Xor;
@@ -78,7 +83,50 @@ struct Binding {
   SmallVector<Instruction *, 32> Nodes, Outputs;
   SmallVector<Value *, 4> Inputs;
   unsigned BoundaryUses = 0;
+  BasicBlock *Preheader = nullptr;
+  SmallVector<PHINode *, 4> Recurrences;
+  std::string LoopReason = "disabled";
 };
+
+void planLoop(Binding &B, const NativeBundleOptions &O) {
+  if (!O.Loops) return;
+  B.LoopReason = "not-single-block-self-loop";
+  BasicBlock *Header = B.Nodes.front()->getParent();
+  auto *Br = dyn_cast<BranchInst>(Header->getTerminator());
+  if (!Br || !Br->isConditional() ||
+      (Br->getSuccessor(0) == Header) == (Br->getSuccessor(1) == Header)) return;
+  B.LoopReason = "requires-unconditional-preheader";
+  SmallVector<BasicBlock *, 4> Preds(predecessors(Header));
+  if (Preds.size() != 2) return;
+  BasicBlock *Pre = Preds[0] == Header ? Preds[1] : Preds[0];
+  auto *Entry = dyn_cast<BranchInst>(Pre->getTerminator());
+  if (!Entry || !Entry->isUnconditional() || Entry->getSuccessor(0) != Header) return;
+  SmallPtrSet<Instruction *, 32> Members(B.Nodes.begin(), B.Nodes.end());
+  SmallVector<PHINode *, 4> Phis;
+  SmallVector<unsigned, 4> Next;
+  for (Value *V : B.Inputs) {
+    B.LoopReason = "input-is-not-header-recurrence";
+    auto *Phi = dyn_cast<PHINode>(V);
+    if (!Phi || Phi->getParent() != Header || Phi->getNumIncomingValues() != 2) return;
+    // This first contract never reconstructs a header scalar for other users.
+    // It also prevents dangling cross-region input bindings when PHIs go away.
+    B.LoopReason = "recurrence-has-external-users";
+    for (User *U : Phi->users())
+      if (!Members.contains(dyn_cast<Instruction>(U))) return;
+    B.LoopReason = "backedge-is-not-region-output";
+    auto It = llvm::find(B.Outputs, Phi->getIncomingValueForBlock(Header));
+    if (It == B.Outputs.end()) return;
+    Phis.push_back(Phi);
+    Next.push_back(B.P.OutputSlots[It - B.Outputs.begin()]);
+  }
+  B.Preheader = Pre;
+  B.Recurrences = std::move(Phis);
+  B.P.NextSlots = std::move(Next);
+  B.P.Phases = O.Phases;
+  B.BoundaryUses -= B.Recurrences.size(); // These uses are now encoded edges.
+  B.P.EstimatedCost += 2048; // Entry, PHIs, phase law and whole-tuple rebase.
+  B.LoopReason.clear();
+}
 
 bool schedule(ArrayRef<Instruction *> Nodes, unsigned Lanes, Binding &Out) {
   if (Nodes.size() < MinNodes) return false;
@@ -167,6 +215,12 @@ bool valid(const Binding &B) {
   }
   for (unsigned K : P.OutputSlots) if (K >= P.Lanes) return false;
   for (unsigned R : P.Rotations) if (!R || R >= P.Width) return false;
+  if (!P.NextSlots.empty()) {
+    if (!B.Preheader || B.Recurrences.size() != B.Inputs.size() ||
+        P.NextSlots.size() != B.Inputs.size()) return false;
+    for (unsigned K : P.NextSlots)
+      if (!llvm::is_contained(P.OutputSlots, K)) return false;
+  }
   return true;
 }
 
@@ -182,6 +236,8 @@ class Lowering {
   IRBuilder<> B;
   SmallVector<Value *, 4> Z;
   Value *M = nullptr;
+  PHINode *CarrierPhi = nullptr, *PhasePhi = nullptr;
+  SmallVector<PHINode *, 4> StatePhis;
   MDNode *Tag;
   bool Pin;
   ConstantInt *c(uint64_t X) { return ConstantInt::get(B.getIntNTy(P.Width), X); }
@@ -215,15 +271,13 @@ class Lowering {
       if (K < P.Lanes) Z[K] = L; else M = L;
     }
   }
-public:
-  Lowering(Function &F, const Binding &Bound, bool Pin)
-      : F(F), P(Bound.P), B(Bound.Nodes.front()),
-        Tag(MDNode::get(F.getContext(), MDString::get(F.getContext(),
-            plan::originId(F.getName(), "native-bundle", P.ID)))), Pin(Pin) {}
-  void run(const Binding &Bound) {
-    Instruction *First = Bound.Nodes.front(), *Prev = First->getPrevNode();
+  void markRange(Instruction *Prev, Instruction *End) {
+    for (Instruction *I = Prev ? Prev->getNextNode() : &End->getParent()->front();
+         I != End; I = I->getNextNode()) I->setMetadata(BundleTag, Tag);
+  }
+  void enter(ArrayRef<Value *> Values) {
     SmallVector<Value *, 4> Inputs;
-    for (Value *V : Bound.Inputs) Inputs.push_back(B.CreateFreeze(V));
+    for (Value *V : Values) Inputs.push_back(B.CreateFreeze(V));
     M = B.CreateAdd(rotate(Inputs[0], P.Rotations[0]),
                     B.CreateXor(Inputs[1], c(P.Salts[0])));
     for (unsigned K = 0; K < P.Lanes; ++K) {
@@ -231,7 +285,62 @@ public:
       Value *R = mask(Z, K);
       Z.push_back(P.coordinates() == Family::Xor ? B.CreateXor(X, R) : B.CreateAdd(X, R));
     }
-    pin(); // Compiler pinning is an independently removable control, not hardness.
+    pin(); // Compiler pinning is a removable control, not hardness evidence.
+  }
+  void enterLoop(const Binding &Bound) {
+    Instruction *Term = Bound.Preheader->getTerminator(), *Prev = Term->getPrevNode();
+    B.SetInsertPoint(Term);
+    SmallVector<Value *, 4> Inputs;
+    for (PHINode *Phi : Bound.Recurrences)
+      Inputs.push_back(Phi->getIncomingValueForBlock(Bound.Preheader));
+    enter(Inputs);
+    markRange(Prev, Term);
+    BasicBlock *Header = Bound.Nodes.front()->getParent();
+    auto phi = [&](Value *Initial, StringRef Name) {
+      auto *Phi = PHINode::Create(B.getIntNTy(P.Width), 2, Name, Header->begin());
+      Phi->addIncoming(Initial, Bound.Preheader);
+      Phi->setMetadata(BundleTag, Tag);
+      return Phi;
+    };
+    for (Value *&V : Z) {
+      PHINode *Phi = phi(V, "sre.bundle.loop.state");
+      StatePhis.push_back(Phi); V = Phi;
+    }
+    CarrierPhi = phi(M, "sre.bundle.loop.carrier"); M = CarrierPhi;
+    if (P.Phases) PhasePhi = phi(c(0), "sre.bundle.loop.phase");
+    B.SetInsertPoint(Bound.Nodes.front());
+  }
+  void backedge(const Binding &Bound) {
+    // Capture source pairs BEFORE replacing the carrier or predecessor slots.
+    SmallVector<Pair, 4> Old;
+    for (unsigned K : P.NextSlots) Old.push_back({Z[K], mask(Z, K)});
+    if (P.Phases) {
+      Value *NextPhase = B.CreateXor(PhasePhi, c(1));
+      Value *History = B.CreateAdd(rotate(B.CreateXor(M, Z.back()), P.Rotations.back()),
+                                  B.CreateXor(Z.front(), c(P.Salts.back())));
+      M = B.CreateXor(History, B.CreateMul(NextPhase, c(P.Salts[0] | 1)));
+      PhasePhi->addIncoming(NextPhase, Bound.Nodes.front()->getParent());
+    }
+    // Reorder/rekey directly in encoded coordinates, with no reconstructed
+    // recurrence scalar. Unused logical slots reset to zero, not fake entropy.
+    Z.clear();
+    for (unsigned K = 0; K < P.Lanes; ++K) {
+      Pair V = K < Old.size() ? Old[K] : Pair{c(0), c(0)};
+      Z.push_back(transfer::remask(B, V, P.coordinates(), mask(Z, K)));
+    }
+    pin();
+    BasicBlock *Header = Bound.Nodes.front()->getParent();
+    for (unsigned K = 0; K < P.Lanes; ++K) StatePhis[K]->addIncoming(Z[K], Header);
+    CarrierPhi->addIncoming(M, Header);
+  }
+public:
+  Lowering(Function &F, const Binding &Bound, bool Pin)
+      : F(F), P(Bound.P), B(Bound.Nodes.front()),
+        Tag(MDNode::get(F.getContext(), MDString::get(F.getContext(),
+            plan::originId(F.getName(), "native-bundle", P.ID)))), Pin(Pin) {}
+  void run(const Binding &Bound) {
+    Instruction *First = Bound.Nodes.front(), *Prev = First->getPrevNode();
+    if (Bound.Preheader) enterLoop(Bound); else enter(Bound.Inputs);
     for (const Step &S : P.Steps) {
       Pair X = read(S.X), Y = read(S.Y), Out = X;
       Value *Fresh = B.CreateXor(M, Z.back());
@@ -247,9 +356,16 @@ public:
         Z[K] = transfer::remask(B, V, P.coordinates(), mask(Z, K));
       }
     }
-    pin();
+    if (!Bound.Preheader) pin();
+    SmallPtrSet<Instruction *, 32> Members(Bound.Nodes.begin(), Bound.Nodes.end());
+    for (PHINode *Phi : Bound.Recurrences) Members.insert(Phi);
     SmallVector<Value *, 4> Outputs;
-    for (unsigned K : P.OutputSlots) {
+    for (unsigned N = 0; N < P.OutputSlots.size(); ++N) {
+      bool Needed = llvm::any_of(Bound.Outputs[N]->users(), [&](User *U) {
+        return !Members.contains(dyn_cast<Instruction>(U));
+      });
+      if (!Needed) { Outputs.push_back(nullptr); continue; }
+      unsigned K = P.OutputSlots[N];
       Value *R = mask(Z, K);
       Value *X = P.coordinates() == Family::Xor ? B.CreateXor(Z[K], R, "sre.bundle.boundary")
                                     : B.CreateSub(Z[K], R, "sre.bundle.boundary");
@@ -257,21 +373,22 @@ public:
         I->setMetadata("sre.native.boundary", MDNode::get(F.getContext(), MDString::get(F.getContext(), "bundle-exit")));
       Outputs.push_back(X);
     }
-    for (Instruction *I = Prev ? Prev->getNextNode() : &First->getParent()->front(); I != First; I = I->getNextNode())
-      I->setMetadata(BundleTag, Tag);
-    SmallPtrSet<Instruction *, 32> Members(Bound.Nodes.begin(), Bound.Nodes.end());
+    if (Bound.Preheader) backedge(Bound);
+    markRange(Prev, First);
     for (unsigned K = 0; K < Bound.Outputs.size(); ++K)
-      Bound.Outputs[K]->replaceUsesWithIf(Outputs[K], [&](Use &U) {
+      if (Outputs[K]) Bound.Outputs[K]->replaceUsesWithIf(Outputs[K], [&](Use &U) {
         auto *I = dyn_cast<Instruction>(U.getUser());
         return !I || !Members.contains(I);
       });
+    for (PHINode *Phi : Bound.Recurrences) Phi->dropAllReferences();
     for (Instruction *I : llvm::reverse(Bound.Nodes)) I->eraseFromParent();
+    for (PHINode *Phi : Bound.Recurrences) Phi->eraseFromParent();
   }
 };
 
 json::Object report(const Binding &B) {
   const Program &P = B.P;
-  json::Array Steps, Outputs, Salts, Rotations;
+  json::Array Steps, Outputs, Salts, Rotations, NextSlots;
   auto operand = [](const Operand &O) {
     return O.Constant ? json::Object{{"constant_hex", utohexstr(O.Bits)}}
                       : json::Object{{"slot", O.Slot}};
@@ -283,6 +400,7 @@ json::Object report(const Binding &B) {
   for (unsigned K : P.OutputSlots) Outputs.push_back(K);
   for (uint64_t S : P.Salts) Salts.push_back(utohexstr(S));
   for (unsigned R : P.Rotations) Rotations.push_back(R);
+  for (unsigned K : P.NextSlots) NextSlots.push_back(K);
   return json::Object{{"id", P.ID}, {"width", P.Width}, {"lanes", P.Lanes},
       {"family", plan::familyVersion(P.Rep.Fam, P.Rep.Rev)},
       {"representation", json::Object{{"family", plan::name(P.Rep.Fam)}, {"revision", P.Rep.Rev},
@@ -292,6 +410,12 @@ json::Object report(const Binding &B) {
       {"law", "triangular-slot-update-v1"}, {"verification", "algebraic"},
       {"useful_operations", P.Steps.size()}, {"inputs", B.Inputs.size()},
       {"outputs", B.Outputs.size()}, {"scalar_output_uses", B.BoundaryUses},
+      {"loop", json::Object{{"status", B.Preheader ? "encoded" : "straight-line"},
+          {"reason", B.LoopReason}, {"law", "triangular-recurrence-rebase-v1"},
+          {"phase_mode", P.Phases ? "two-phase" : "static"},
+          {"phase_count", P.Phases ? 2 : 1}, {"initial_phase", 0},
+          {"backedge_uses", B.Recurrences.size()}, {"scalar_input_uses", 0},
+          {"next_input_slots", std::move(NextSlots)}}},
       {"estimated_cost", P.EstimatedCost}, {"steps", std::move(Steps)},
       {"output_slots", std::move(Outputs)}, {"salts_hex", std::move(Salts)},
       {"rotations", std::move(Rotations)}};
@@ -350,6 +474,8 @@ FunctionPlan planFunction(Function &F, uint64_t Seed, const NativeBundleOptions 
           Binding B;
           if (256 + N * 1200 > FunctionCostLimit - Estimated ||
               !schedule(ArrayRef<Instruction *>(Run).slice(Start, N), O.Values, B)) continue;
+          planLoop(B, O);
+          if (B.P.EstimatedCost > FunctionCostLimit - Estimated) continue;
           B.P.ID = Plans.size();
           Rng R = Rng(Seed).fork("native-bundles-v1").fork(F.getName()).fork(B.P.ID);
           B.P.Rep.Fam = O.Family == "additive" || (O.Family == "seeded" && (R.u64() & 1))
@@ -426,7 +552,8 @@ json::Array encodeNativeBundles(Module &M, uint64_t Seed, const NativeBundleOpti
         {"module_growth_limit", O.GrowthBudget}, {"allocation_policy", "coherent-weighted-v1"},
         {"candidate_regions", W.Candidates.size()},
         {"graph_scope", "pre-bundle-lowering"}, {"source_lineage", "input-ir-metadata"},
-        {"pins", O.Pin}, {"instructions_before", Before}};
+        {"pins", O.Pin}, {"loops", O.Loops}, {"phases", O.Phases},
+        {"instructions_before", Before}};
     if (W.Blocked) {
       Row["status"] = "skipped"; Row["reason"] = "structure-or-size";
       Row["retained_operations"] = 0; Row["instructions_after"] = Before;

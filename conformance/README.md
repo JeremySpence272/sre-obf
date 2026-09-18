@@ -276,6 +276,15 @@ The experimental descriptor-driven bundle emitter, supported scope, flags and
 exact checkpoint evidence are documented in
 [`NATIVE_BUNDLE_V1.md`](../docs/NATIVE_BUNDLE_V1.md). It does not complete v04.
 
+`bundle_loop_run` adds the narrow joint-recurrence matrix and explicit unsupported
+shape controls. `--bundle-loops` and `--bundle-phases` also round-trip through the
+fixture/whole/scale drivers. The phase arm and static-phase ablation share the
+same representation family. Complete byte input pairs at two iterations are
+optional; zero/one/many iterations, all-width edges, full two-word outputs,
+reentry, concurrent calls and post-O2 checks are always part of the loop fixture.
+`bundle_decompile --loop` exports matched stripped informed-entry controls;
+successful export does not establish semantic recovery or protection strength.
+
 Corpus-lock revision `m0-3` freezes bzip2/cJSON IO manifests under ignored
 `out/v04-frozen-holdouts-20260918/`. Existing seeds and resource caps are unchanged.
 Only unobfuscated reference programs were built during preparation; their

@@ -11,6 +11,8 @@ def bundle_summary(report):
     steps = [step for r in retained for region in r["regions"] for step in region["steps"]]
     ancestry = {s["input_origin"] for s in steps if s["input_origin"] is not None}
     sources = report["bundle_input_inventory"]
+    loops = [region["loop"] for r in retained for region in r["regions"]
+             if region.get("loop", {}).get("status") == "encoded"]
     return {"functions": len(retained), "regions": sum(len(r["regions"]) for r in retained),
             "input_ir_instructions": sum(s["instructions"] for s in sources),
             "input_eligible_pure_operations": (sum(s["eligible_pure_operations"] for s in sources)
@@ -20,6 +22,9 @@ def bundle_summary(report):
             "retained_steps_without_input_ancestry": sum(s["input_origin"] is None for s in steps),
             "rolled_back_step_instances": sum(r.get("rolled_back_operations", 0) for r in rows),
             "reserved_growth": sum(r["growth_allocation"] for r in rows),
+            "persistent_backedges": len(loops),
+            "encoded_recurrence_uses": sum(loop["backedge_uses"] for loop in loops),
+            "two_phase_backedges": sum(loop["phase_mode"] == "two-phase" for loop in loops),
             "actual_growth": sum(max(0, r["instructions_after"] - r["instructions_before"]) for r in rows),
             "final_surviving_semantic_coverage": None,
             "scope": "pre-bundle operation instances and deduplicated input-IR ancestry; "
@@ -97,6 +102,7 @@ def bundle_violations(report):
                 errors.append(f"{name}: output ownership mismatch")
             for slot in region["output_slots"]:
                 if not 0 <= slot < lanes: errors.append(f"{name}: invalid output slot")
+            errors.extend(loop_violations(region, row, report.get("features", {}), name))
             for step in region["steps"]:
                 if step["opcode"] not in OPCODES or not 0 <= step["destination"] < lanes:
                     errors.append(f"{name}: unsupported transfer")
@@ -114,4 +120,38 @@ def bundle_violations(report):
                     owner, number = step["input_origin"].rsplit("/input-op/", 1)
                     if owner not in sources or not 0 <= int(number) < sources[owner]:
                         errors.append(f"{name}: invented input lineage")
+    return errors
+
+
+def loop_violations(region, row, features, name):
+    loop = region.get("loop")
+    enabled = features.get("bundle_loops", False)
+    phases = features.get("bundle_phases", False)
+    errors = []
+    if phases and not enabled:
+        errors.append(f"{name}: phases enabled without loops")
+    if loop is None:
+        return errors + ([f"{name}: missing recurrence report"] if enabled else [])
+    if row.get("loops", False) != enabled or row.get("phases", False) != phases:
+        errors.append(f"{name}: recurrence options disagree with feature report")
+    if loop["status"] == "encoded":
+        mapping = loop["next_input_slots"]
+        if (not enabled or loop["reason"] or loop["law"] != "triangular-recurrence-rebase-v1" or
+                len(mapping) != region["inputs"] or loop["backedge_uses"] != len(mapping) or
+                any(k not in region["output_slots"] for k in mapping) or loop["scalar_input_uses"] != 0):
+            errors.append(f"{name}: invalid persistent recurrence contract")
+        if (loop["phase_mode"] != ("two-phase" if phases else "static") or
+                loop["phase_count"] != (2 if phases else 1) or loop["initial_phase"] != 0):
+            errors.append(f"{name}: finite phase graph disagrees with lowering options")
+    elif loop["status"] == "straight-line":
+        reasons = {"disabled", "not-single-block-self-loop", "requires-unconditional-preheader",
+                   "input-is-not-header-recurrence", "recurrence-has-external-users",
+                   "backedge-is-not-region-output"}
+        if (loop["next_input_slots"] or loop["backedge_uses"] or not loop["reason"] or
+                loop["phase_mode"] != "static" or loop["phase_count"] != 1 or
+                loop["initial_phase"] != 0 or loop["scalar_input_uses"] != 0 or
+                loop["reason"] not in reasons or (loop["reason"] == "disabled") == enabled):
+            errors.append(f"{name}: fallback claims persistent state")
+    else:
+        errors.append(f"{name}: unknown recurrence status")
     return errors
