@@ -377,6 +377,37 @@ class CombinedTransferTests(unittest.TestCase):
     transfer = nlcarry(lanes=3).build("combined")
     self.assertLess(len(tm.live_steps(transfer)), 600)
 
+  def test_tricouple_couples_the_lanes_with_a_genuinely_nonlinear_term(self):
+    """W1 item 3 asks for cross-value nonlinear terms. In `tricouple` lane one
+    decodes through a kernel of lane zero's state word, so with the mask held
+    fixed X1 is a nonlinear function of lane zero. A GF(2)-affine fit of that
+    kernel in the bits of z0 must fail; the same fit on a linear carrier must
+    succeed, so the test cannot pass vacuously."""
+    site = tm.TriCouple(IR, 7)
+    mask_value = 0xA5
+    system = tm.Gf2System()
+    monos = tm.monomials(IR, 1)
+    for z0 in range(1 << IR):
+      system.add(tm.features(z0, monos),
+                 site.link_carrier(z0, mask_value, reference=True))
+    wrong = sum(1 for z0 in range(1 << IR)
+                if system.predict(tm.features(z0, monos)) !=
+                site.link_carrier(z0, mask_value, reference=True))
+    self.assertGreater(wrong, 0, "the coupling kernel is affine in lane zero")
+    linear = tm.Gf2System()
+    for z0 in range(1 << IR):
+      linear.add(tm.features(z0, monos), tm.ref_rotl(z0, 3, IR) ^ mask_value)
+    self.assertTrue(all(linear.predict(tm.features(z0, monos)) ==
+                        tm.ref_rotl(z0, 3, IR) ^ mask_value
+                        for z0 in range(1 << IR)), "the control must be fitted")
+
+  def test_a_consumer_of_lane_one_must_read_lane_zero(self):
+    site = tm.TriCouple(IR, 7)
+    base = site.reference_encode([1, 2], [7])
+    moved = dict(base, z0=base["z0"] ^ 1)
+    self.assertNotEqual(site.reference_decode(base)[1],
+                        site.reference_decode(moved)[1])
+
   def test_tricouple_joins_two_state_words_for_one_logical_update(self):
     """One logical value changes; two state words must be rewritten."""
     transfer = tm.TriCouple(IR, 7).build("addc0")
