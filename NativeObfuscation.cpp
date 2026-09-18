@@ -78,6 +78,13 @@ cl::opt<std::string> NativeStageDir("native-stage-dir", cl::desc("Private direct
 cl::opt<unsigned> NativeModuleInsts("native-module-insts", cl::desc("Explicit module IR instruction cap (10000..5000000)"), cl::init(250000));
 cl::opt<bool> NativeScaleBudget("native-scale-budget", cl::desc("Opt-in fair connected/application/helper growth allocations; reports all coverage losses"), cl::init(false));
 cl::opt<bool> NativeScaleStructure("native-scale-structure", cl::desc("Reserve usable CFF transactions before fair expression allocation"), cl::init(false));
+cl::opt<bool> NativePlan("native-plan",
+    cl::desc("M1: record and publish the private typed connected plan and its boundary inventory"),
+    cl::init(false));
+cl::opt<unsigned> NativeSemanticBudget("native-semantic-budget",
+    cl::desc("M1: percent of the connected component cost limit reserved for components that own "
+             "encoded storage (0..50; 0 reserves nothing)"),
+    cl::init(0));
 
 void saveNativeStage(const Module &M, StringRef Stage) {
   if (NativeStageDir.empty()) return;
@@ -204,6 +211,10 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-scale-budget requires connected regions");
   if (NativeScaleStructure && !NativeScaleBudget)
     report_fatal_error("native-scale-structure requires native-scale-budget");
+  if (NativeSemanticBudget > 50)
+    report_fatal_error("native-semantic-budget must be 0..50");
+  if ((NativePlan || NativeSemanticBudget) && NativeRegionPlan != "connected")
+    report_fatal_error("native-plan and native-semantic-budget require native-region-plan=connected");
   if (NativeRegionPlan == "connected" && (!NativeValues || !NativeWide))
     report_fatal_error("connected regions require native-values and native-values-wide");
   if ((NativeMemorySSA || NativePredicateRegions || NativeRegionalFamilies || NativeSupportRegions ||
@@ -344,6 +355,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.CoupleState = NativeCoupledState;
     Options.Invariant = NativeInvariant;
     Options.LaneTransitions = obf::nativeLaneTransitions();
+    Options.Plan = NativePlan;
+    Options.StructuralReserve = NativeSemanticBudget;
     if (NativeScaleBudget) {
       checkModuleBudget(M, "before-connected-allocation");
       Options.BoundedGrowth = true;
@@ -579,6 +592,18 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
           {"lane_keyed_dispatcher_reads", LaneReads},
           {"remaining_named_comparisons", Comparisons}});
     }
+    // Helper rows are measured when each helper is processed, but later passes
+    // keep growing them. Restate each helper's count at the final stage so the
+    // per-owner support charge and the module total describe the same IR.
+    // Neither number is rescaled to the other; a helper that no longer exists
+    // reports null, never zero.
+    for (json::Value &Row : HelperCoverage)
+      if (auto *Entry = Row.getAsObject())
+        if (auto Name = Entry->getString("function")) {
+          const Function *H = M.getFunction(*Name);
+          (*Entry)["final_instructions"] = H && !H->isDeclaration()
+              ? json::Value(H->getInstructionCount()) : json::Value(nullptr);
+        }
     std::error_code EC;
     raw_fd_ostream OS(NativeReport, EC, sys::fs::OF_Text);
     if (EC) report_fatal_error(Twine("native report: ") + EC.message());
@@ -600,6 +625,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"module_instruction_limit", NativeModuleInsts.getValue()},
                             {"scale_budget", NativeScaleBudget.getValue()}, {"helper_limit", HelperLimit},
                             {"scale_structure", NativeScaleStructure.getValue()},
+                            {"plan", NativePlan.getValue()},
+                            {"semantic_budget", NativeSemanticBudget.getValue()},
                             {"memory_ssa", NativeMemorySSA.getValue()}, {"predicate_regions", NativePredicateRegions.getValue()},
                             {"regional_families", NativeRegionalFamilies.getValue()}, {"support_regions", NativeSupportRegions.getValue()},
                             {"connected_shards", NativeConnectedShards.getValue()},

@@ -82,6 +82,7 @@ set(OBF_SOURCES
   NativeConnected.cpp
   NativeCall.cpp
   NativeBudget.cpp
+  NativePlan.cpp
   Utils.cpp
   OpaqueUtils.cpp
   ObfDebug.cpp

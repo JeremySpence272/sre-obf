@@ -1,10 +1,12 @@
 #include "llvm/Transforms/Obfuscator/NativeConnected.h"
+#include "llvm/Transforms/Obfuscator/NativePlan.h"
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
 #include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/Utils.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Dominators.h"
@@ -113,6 +115,15 @@ const char *const JointNodeSkipName[JN_Count] = {
 const char *const JointPairSkipName[JP_Count] = {
     "width-mismatch", "family-mismatch", "no-dominance", "shared-dependency",
     "identical-dependencies", "no-dominated-use", "already-grouped"};
+// The object walk's precise rejection reasons, classified into the fixed M0
+// vocabulary. The verbatim walk reason is kept beside this classification in
+// the plan: the vocabulary is what the inventory counts, the walk reason is
+// what a person diagnoses from, and neither one replaces the other.
+plan::Boundary objectBoundary(StringRef Reason) {
+  if (Reason.starts_with("address-escape") || Reason == "pointer-compare") return plan::Boundary::ObjectEscape;
+  if (Reason == "object-budget" || Reason == "component-budget") return plan::Boundary::ComponentLimit;
+  return plan::Boundary::UnsupportedOperation;
+}
 // Normalize a dependency root so that two reloads of one object, or a cast of
 // one value, are not mistaken for two distinct live dependencies.
 Value *rootKey(Value *V) {
@@ -160,13 +171,156 @@ class Encoder {
   unsigned FamilyConversions = 0, MixedComponents = 0;
   unsigned OversizedComponents = 0, ShardedComponents = 0, SelectedShards = 0, ShardLostNodes = 0;
   unsigned EligibleCost = 0, SelectedCost = 0, SkippedCost = 0, ShardLostCost = 0;
+  unsigned ReserveDenied = 0, ReserveDeniedCost = 0;
   unsigned CostLimit = 0, ShardCostLimit = 0;
   DominatorTree DT;
+  // The private typed plan. It records the decisions this planner already
+  // makes; it never makes one of its own and never emits an instruction, so
+  // the protected IR does not depend on whether it is being built.
+  plan::Plan ThePlan;
+  DenseMap<const Instruction *, unsigned> OpIndex;
+  SmallVector<Instruction *, 64> OpNodeInst;
+  SmallVector<unsigned, 8> ObjectPlan;
+  DenseMap<const AllocaInst *, unsigned> AllocaPlan;
+  // Useful work per planned operation, computed once when the plan is sealed.
+  SmallVector<unsigned, 64> UsefulWorkOf;
+  // Distinct (value, reason) pairs already counted as a boundary origin. Used
+  // only to decide whether a count is new; never iterated, so no hash order
+  // reaches the output.
+  DenseSet<std::pair<const Value *, unsigned>> BoundaryOrigins;
+  unsigned StructuralReserve = 0;
   SmallVector<JointGroup, 8> JointGroups;
   unsigned JointCandidates = 0, JointCoupled = 0, JointRewrittenUses = 0, JointPairTests = 0;
   unsigned JointNodeSkips[JN_Count] = {}, JointPairSkips[JP_Count] = {};
   json::Array ObjectReport;
 
+  std::string seedNamespace() const {
+    return ("native-connected-v1/" + F.getName()).str();
+  }
+  static plan::NodeKind kindOf(const Instruction *I) {
+    if (isa<LoadInst>(I)) return plan::NodeKind::Load;
+    if (isa<ICmpInst>(I)) return plan::NodeKind::Compare;
+    if (isa<PHINode>(I)) return plan::NodeKind::Phi;
+    if (isa<SelectInst>(I)) return plan::NodeKind::Select;
+    if (isa<CastInst>(I)) return plan::NodeKind::Cast;
+    return plan::NodeKind::Pure;
+  }
+  // The single place a representation family is described. A verified offline
+  // family is added by declaring its lanes, carrier width, valid-state
+  // invariant, seed namespace and how its laws were established, not by
+  // threading another boolean through the emitter.
+  unsigned representation(bool Affine) {
+    plan::Representation R;
+    R.Fam = Affine ? plan::Family::AdditivePair : plan::Family::XorPrefixPair;
+    R.Rev = 1;
+    R.Lanes = 2;
+    // A region carries several widths at once, so the width fields belong to
+    // the individual values and live on the operation nodes. 0 here means
+    // mixed, and is published as unknown rather than as a zero width.
+    R.LogicalWidth = 0;
+    R.LaneWidth = 0;
+    R.Invariant = Affine ? "difference-of-lanes" : "xor-of-lanes";
+    R.SeedNamespace = seedNamespace();
+    // Derived algebraically and cross-checked against the independent
+    // conformance model. Not SMT-proved in tree, which is what this says.
+    R.Verified = plan::Verification::Algebraic;
+    return ThePlan.intern(R);
+  }
+  unsigned recordObject(AllocaInst *A, StringRef ID, StringRef Layout, uint64_t Elements,
+                        uint64_t Leaves, unsigned Width, StringRef SkipReason) {
+    if (!O.Plan) return plan::Invalid;
+    plan::ObjectNode N;
+    N.Origin = ID.str();
+    N.Name = A->getName().str();
+    N.Layout = Layout.str();
+    N.Elements = Elements;
+    N.Leaves = Leaves;
+    N.ElementWidth = Width;
+    N.Owned = SkipReason.empty();
+    N.SkipReason = SkipReason.str();
+    if (!SkipReason.empty()) N.Reason = objectBoundary(SkipReason);
+    ThePlan.Objects.push_back(std::move(N));
+    AllocaPlan[A] = ThePlan.Objects.size() - 1;
+    return ThePlan.Objects.size() - 1;
+  }
+  void recordBoundary(plan::Boundary B, const Value *Origin, unsigned Edges = 1) {
+    if (!O.Plan) return;
+    ThePlan.Inventory.record(B, Edges, BoundaryOrigins.insert({Origin, unsigned(B)}).second);
+  }
+  // Which storage a load or store this pass does not own belongs to. The
+  // object walk already decided why it was not owned; reuse that answer rather
+  // than inventing a second one.
+  plan::Boundary storageBoundary(Value *Pointer) {
+    if (auto *A = dyn_cast<AllocaInst>(getUnderlyingObject(Pointer)))
+      if (auto It = AllocaPlan.find(A); It != AllocaPlan.end() &&
+          ThePlan.Objects[It->second].Reason != plan::Boundary::Count)
+        return ThePlan.Objects[It->second].Reason;
+    return plan::Boundary::ObjectEscape;
+  }
+  // Where one scalar entering a region came from, in the fixed vocabulary.
+  plan::Boundary entryBoundary(Value *V) {
+    if (isa<Argument>(V)) return plan::Boundary::ExternalABI;
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I) return plan::Boundary::UnsupportedOperation;
+    for (StringRef Tag : {"sre.native.call.arg", "sre.native.call.split", "sre.native.call.result"})
+      if (I->getMetadata(Tag)) return plan::Boundary::InterfaceMismatch;
+    // An eligible operation the planner dropped is a selection loss, not an
+    // unsupported one: say which loss it was.
+    if (auto It = OpIndex.find(I); It != OpIndex.end() && ThePlan.Ops[It->second].Reason != plan::Boundary::Count)
+      return ThePlan.Ops[It->second].Reason;
+    if (auto *L = dyn_cast<LoadInst>(I)) return storageBoundary(L->getPointerOperand());
+    if (auto *C = dyn_cast<CallBase>(I)) {
+      Function *G = C->getCalledFunction();
+      return G && !G->isDeclaration() && G->hasLocalLinkage() ? plan::Boundary::InterfaceMismatch
+                                                              : plan::Boundary::ExternalABI;
+    }
+    return plan::Boundary::UnsupportedOperation;
+  }
+  // Which kind of crossing one scalar consumer is. Order matters: a consumer
+  // that is itself an eligible operation the planner dropped is a selection
+  // loss, and must not be reported as an unsupported operation.
+  plan::Boundary exitBoundary(Instruction *User) {
+    if (auto It = OpIndex.find(User); It != OpIndex.end() && ThePlan.Ops[It->second].Reason != plan::Boundary::Count)
+      return ThePlan.Ops[It->second].Reason;
+    if (isa<GetElementPtrInst>(User)) return plan::Boundary::AddressExposure;
+    if (isa<ReturnInst>(User))
+      return F.hasLocalLinkage() ? plan::Boundary::InterfaceMismatch : plan::Boundary::ExternalABI;
+    if (auto *C = dyn_cast<CallBase>(User)) {
+      Function *G = C->getCalledFunction();
+      return G && !G->isDeclaration() && G->hasLocalLinkage() ? plan::Boundary::InterfaceMismatch
+                                                              : plan::Boundary::ExternalABI;
+    }
+    if (auto *S = dyn_cast<StoreInst>(User)) return storageBoundary(S->getPointerOperand());
+    return plan::Boundary::UnsupportedOperation;
+  }
+  unsigned contractFor(StringRef Interface) {
+    for (unsigned K = 0; K < ThePlan.Calls.size(); ++K)
+      if (ThePlan.Calls[K].Interface == Interface) return K;
+    plan::CallContract C;
+    C.Origin = plan::originId(F.getName(), "call", ThePlan.Calls.size());
+    C.Interface = Interface.str();
+    // Encoded pairs cross a private interface in the XOR family; a contract
+    // that carried another family would have to say so here.
+    C.Rep = representation(false);
+    C.Status = "boundary";
+    ThePlan.Calls.push_back(std::move(C));
+    return ThePlan.Calls.size() - 1;
+  }
+  void recordEntry(Value *V, unsigned RegionID) {
+    if (!O.Plan) return;
+    ThePlan.transfer(ThePlan.Regions[RegionID].Origin, plan::TransferKind::Entry, plan::Invalid,
+                     ThePlan.Regions[RegionID].Rep, plan::Verification::Algebraic);
+    // A build constant exposes no program data, so it is counted apart from
+    // the reason table rather than padding it.
+    if (isa<Constant>(V)) { ++ThePlan.Inventory.ConstantEntries; return; }
+    recordBoundary(entryBoundary(V), V);
+  }
+  void markSkipped(ArrayRef<Instruction *> Dropped, plan::Boundary B) {
+    if (!O.Plan) return;
+    for (Instruction *I : Dropped)
+      if (auto It = OpIndex.find(I); It != OpIndex.end() && !ThePlan.Ops[It->second].Selected)
+        ThePlan.Ops[It->second].Reason = B;
+  }
   ConstantInt *constant(Type *T, uint64_t X) {
     return ConstantInt::get(F.getContext(), APInt(T->getIntegerBitWidth(), X, false, true));
   }
@@ -209,6 +363,10 @@ class Encoder {
   Pair convertFamily(IRBuilder<> &B, Pair X, bool FromAffine, bool ToAffine) {
     if (FromAffine == ToAffine) return X;
     ++FamilyConversions;
+    if (O.Plan)
+      ThePlan.transfer(plan::originId(F.getName(), "conversion", 0), plan::TransferKind::Family,
+                       representation(FromAffine), representation(ToAffine),
+                       plan::Verification::Algebraic);
     Type *T = X.E->getType();
     if (ToAffine) {
       // e xor r = e + r - 2*(e & r). Add a fresh second coordinate
@@ -308,6 +466,7 @@ class Encoder {
                            Regions[RegionID].Affine);
     }
     ++Inputs;
+    recordEntry(V, RegionID);
     Value *X = B.CreateFreeze(V);
     Value *R = B.CreateXor(rotate(B, X, 3), constant(V->getType(), RNG.fork(Site++).u64()));
     return {Regions[RegionID].Affine ? B.CreateAdd(X, R) : B.CreateXor(X, R), R};
@@ -379,6 +538,7 @@ class Encoder {
       if (auto *AT = dyn_cast<ArrayType>(T)) { E = AT->getElementType(); N = AT->getNumElements(); }
       auto Skip = [&](StringRef Reason) {
         ObjectReport.push_back(json::Object{{"object", A->getName().str()}, {"origin", ID}, {"status", "skipped"}, {"reason", Reason.str()}});
+        recordObject(A, ID, "", N, 0, width(E) ? E->getIntegerBitWidth() : 0, Reason);
       };
       bool Narrow = width(E) && N && N <= 64;
       if (!Narrow && !O.Aggregates) { Skip("unsupported-layout"); continue; }
@@ -404,6 +564,13 @@ class Encoder {
         }
         if (Safe && !Obj.Loads.empty() && !Obj.Stores.empty()) {
           EligibleMemoryLeaves += Obj.Leaves;
+          unsigned Slot = recordObject(A, ID, N > 1 ? "flat-array" : "scalar", N, Obj.Leaves,
+                                       E->getIntegerBitWidth(), "");
+          if (Slot != plan::Invalid) {
+            ThePlan.Objects[Slot].Loads = Obj.Loads.size();
+            ThePlan.Objects[Slot].Stores = Obj.Stores.size();
+          }
+          ObjectPlan.push_back(Slot);
           for (LoadInst *L : Obj.Loads) MemoryLoads[L] = Objects.size();
           Objects.push_back(std::move(Obj));
           continue;
@@ -496,9 +663,113 @@ class Encoder {
     if (!Reason.empty()) return Reason;
     EligibleMemoryLeaves += Obj.Leaves;
     ++EligibleAggregateObjects;
+    unsigned Slot = recordObject(A, ID, "aggregate-leaves", Leaves.size(), Obj.Leaves, 0, "");
+    if (Slot != plan::Invalid) {
+      ThePlan.Objects[Slot].Loads = Obj.Loads.size();
+      ThePlan.Objects[Slot].Stores = Obj.Stores.size();
+    }
+    ObjectPlan.push_back(Slot);
     for (LoadInst *L : Obj.Loads) MemoryLoads[L] = Objects.size();
     Objects.push_back(std::move(Obj));
     return "";
+  }
+  // The original operation and effect graph, recorded before any expansion.
+  // Only original instructions are walked and only original operand edges are
+  // added, so a generated instruction can neither enter a denominator nor
+  // present itself as a new independent dependency.
+  void recordOriginGraph(ArrayRef<Instruction *> Candidates) {
+    ThePlan.Function = F.getName().str();
+    ThePlan.Seed = RNG.baseSeed();
+    ThePlan.SeedNamespace = seedNamespace();
+    ThePlan.EligibleNodes = Candidates.size();
+    for (unsigned K = 0; K < Candidates.size(); ++K) {
+      Instruction *I = Candidates[K];
+      OpIndex[I] = K;
+      OpNodeInst.push_back(I);
+      plan::OpNode N;
+      N.Origin = plan::originId(F.getName(), "op", K);
+      N.Kind = kindOf(I);
+      N.LogicalWidth = I->getType()->isIntegerTy() ? I->getType()->getIntegerBitWidth() : 0;
+      N.EstimatedCost = nodeCost(I);
+      N.Score = nodeScore(I);
+      if (auto *L = dyn_cast<LoadInst>(I); L && MemoryLoads.count(L)) {
+        N.Effects |= plan::EffectReadsObject;
+        N.Object = ObjectPlan[MemoryLoads.lookup(L)];
+      }
+      ThePlan.Ops.push_back(std::move(N));
+    }
+    for (unsigned K = 0; K < Candidates.size(); ++K)
+      for (Value *V : Candidates[K]->operands())
+        if (auto *Q = dyn_cast<Instruction>(V))
+          if (auto It = OpIndex.find(Q); It != OpIndex.end()) ThePlan.Ops[K].Operands.push_back(It->second);
+    // Effects visible only from the use side: a value stored into an object
+    // this pass owns, and a value crossing a private call interface.
+    for (unsigned J = 0; J < Objects.size(); ++J)
+      for (StoreInst *S : Objects[J].Stores)
+        if (auto *V = dyn_cast<Instruction>(S->getValueOperand()))
+          if (auto It = OpIndex.find(V); It != OpIndex.end()) {
+            ThePlan.Ops[It->second].Effects |= plan::EffectWritesObject;
+            if (ThePlan.Ops[It->second].Object == plan::Invalid) ThePlan.Ops[It->second].Object = ObjectPlan[J];
+          }
+    for (unsigned K = 0; K < Candidates.size(); ++K) {
+      for (Value *V : Candidates[K]->operands())
+        if (auto *Q = dyn_cast<Instruction>(V); Q && Q->getMetadata("sre.native.call.arg"))
+          ThePlan.Ops[K].Effects |= plan::EffectCallArgument;
+      for (User *U : Candidates[K]->users())
+        if (auto *X = dyn_cast<Instruction>(U);
+            X && (X->getMetadata("sre.native.call.split") || X->getMetadata("sre.native.call.result")))
+          ThePlan.Ops[K].Effects |= plan::EffectCallResult;
+    }
+  }
+  // Close the original-graph half of the plan: control joins, the scalar-use
+  // edges each selected operation still has, and the planner's own cost model.
+  // Nothing structural is added after this point.
+  void recordJoinsAndSeal() {
+    DominatorTree Local;
+    Local.recalculate(F);
+    for (Instruction *I : Nodes) if (auto *Phi = dyn_cast<PHINode>(I)) {
+      plan::LoopJoin J;
+      J.Origin = plan::originId(F.getName(), "join", ThePlan.Joins.size());
+      J.Node = OpIndex.lookup(Phi);
+      J.Rep = ThePlan.Regions[RegionOf.lookup(Phi)].Rep;
+      J.Incoming = Phi->getNumIncomingValues();
+      for (BasicBlock *B : Phi->blocks())
+        if (Local.dominates(Phi->getParent(), B)) J.Backedge = true;
+      ThePlan.Joins.push_back(std::move(J));
+    }
+    // A store into an object this pass encodes is not a scalar use: the value
+    // stays in its representation across it.
+    SmallPtrSet<const Instruction *, 32> EncodedStores;
+    for (const Object &Obj : Objects)
+      if (RegionOf.count(Obj.Loads.front()))
+        for (StoreInst *S : Obj.Stores) EncodedStores.insert(S);
+    for (unsigned K = 0; K < ThePlan.Ops.size(); ++K) {
+      if (!ThePlan.Ops[K].Selected) continue;
+      unsigned Crossings = 0;
+      for (const User *U : OpNodeInst[K]->users()) {
+        if (const auto *X = dyn_cast<Instruction>(U)) {
+          if (auto It = OpIndex.find(X); It != OpIndex.end() && ThePlan.Ops[It->second].Selected) continue;
+          if (EncodedStores.contains(X)) continue;
+        }
+        ++Crossings;
+      }
+      ThePlan.Ops[K].ScalarUses = Crossings;
+    }
+    ThePlan.EligibleMemoryEdges = EligibleMemoryEdges;
+    ThePlan.EligibleObjects = Objects.size();
+    ThePlan.Cost.EligibleEstimated = EligibleCost;
+    ThePlan.Cost.SelectedEstimated = SelectedCost;
+    ThePlan.Cost.SkippedEstimated = SkippedCost;
+    ThePlan.Cost.LostEstimated = ShardLostCost;
+    ThePlan.Cost.ComponentLimit = CostLimit;
+    ThePlan.Cost.ShardLimit = O.Shards ? ShardCostLimit : 0;
+    ThePlan.Cost.ReservedStructural = StructuralReserve;
+    ThePlan.Cost.ReserveDenied = ReserveDenied;
+    ThePlan.Cost.ReserveDeniedCost = ReserveDeniedCost;
+    ThePlan.Sealed = true;
+    // One pass for the whole function, so a function with many exposures does
+    // not pay a dependency walk per exposure.
+    ThePlan.usefulWorkAll(UsefulWorkOf);
   }
   void plan() {
     findObjects();
@@ -509,6 +780,7 @@ class Encoder {
       Index[&I] = Candidates.size(); Candidates.push_back(&I);
     }
     EligibleNodes = Candidates.size();
+    if (O.Plan) recordOriginGraph(Candidates);
     std::vector<unsigned> Parent(Candidates.size()); std::iota(Parent.begin(), Parent.end(), 0);
     auto Root = [&](unsigned I) { while (Parent[I] != I) { Parent[I] = Parent[Parent[I]]; I = Parent[I]; } return I; };
     auto Unite = [&](unsigned A, unsigned B) { A = Root(A); B = Root(B); if (A != B) Parent[B] = A; };
@@ -574,6 +846,20 @@ class Encoder {
           Part->Cost += nodeCost(I); Part->Score += nodeScore(I);
           RegionOf[I] = Part->ID; Nodes.push_back(I);
         }
+        if (O.Plan) {
+          plan::RegionDescriptor D;
+          D.Origin = plan::originId(F.getName(), "region", Part->ID);
+          D.Component = Origin; D.Shard = Shard; D.Sharded = Sharded;
+          D.Rep = representation(Part->Affine);
+          D.Nodes = Part->Nodes.size();
+          D.EstimatedCost = Part->Cost; D.Score = Part->Score;
+          for (Instruction *I : Part->Nodes)
+            if (auto It = OpIndex.find(I); It != OpIndex.end()) {
+              ThePlan.Ops[It->second].Selected = true;
+              ThePlan.Ops[It->second].Region = Part->ID;
+            }
+          ThePlan.Regions.push_back(std::move(D));
+        }
         Regions.push_back(std::move(*Part));
       }
       SelectedCost += PartCost;
@@ -581,18 +867,45 @@ class Encoder {
     CostLimit = O.BoundedGrowth ? std::min(20000u, O.GrowthBudget) : 20000;
     // Shards divide the same component limit; they never raise it.
     ShardCostLimit = std::min(CostLimit, std::max(2048u, CostLimit / 4));
+    // Hold back part of the component limit from components that own no
+    // encoded storage, so a coherent structural unit is still affordable after
+    // a cheap expression component. A zero reserve leaves Limit equal to
+    // CostLimit for every component, which is exactly the previous selection.
+    StructuralReserve = unsigned(uint64_t(CostLimit) * std::min(O.StructuralReserve, 50u) / 100);
     for (unsigned N = 0; N < Planned.size(); ++N) {
       Region &R = Planned[N];
-      if (R.Nodes.size() < 2) { ++SkippedComponents; SkippedCost += R.Cost; continue; }
+      if (R.Nodes.size() < 2) {
+        ++SkippedComponents; SkippedCost += R.Cost;
+        markSkipped(R.Nodes, plan::Boundary::ComponentLimit);
+        continue;
+      }
+      bool Owns = llvm::any_of(R.Nodes, [&](Instruction *I) {
+        auto *L = dyn_cast<LoadInst>(I);
+        return L && MemoryLoads.count(L);
+      });
+      unsigned Limit = Owns || StructuralReserve >= CostLimit ? CostLimit : CostLimit - StructuralReserve;
       SawAffine = SawXor = false;
-      if (Nodes.size() + R.Nodes.size() <= O.Nodes && Cost + R.Cost <= CostLimit) {
+      if (Nodes.size() + R.Nodes.size() <= O.Nodes && Cost + R.Cost > Limit && Cost + R.Cost <= CostLimit) {
+        // Denied only by the structural reserve: it would have fit the
+        // component limit. That is a selection loss with its own term, not an
+        // oversized component, and it is never silently folded into one.
+        ++SkippedComponents; SkippedCost += R.Cost;
+        ++ReserveDenied; ReserveDeniedCost += R.Cost;
+        markSkipped(R.Nodes, plan::Boundary::BudgetLoss);
+        continue;
+      }
+      if (Nodes.size() + R.Nodes.size() <= O.Nodes && Cost + R.Cost <= Limit) {
         select(R.Nodes, N, 0, false, R.Cost, R.Score);
         Cost += R.Cost; ++Component;
         if (SawAffine && SawXor) ++MixedComponents;
         continue;
       }
       ++OversizedComponents;
-      if (!O.Shards) { ++SkippedComponents; SkippedCost += R.Cost; continue; }
+      if (!O.Shards) {
+        ++SkippedComponents; SkippedCost += R.Cost;
+        markSkipped(R.Nodes, plan::Boundary::ComponentLimit);
+        continue;
+      }
       // Bounded shards in stable instruction order. A unit is one node, except
       // that all loads of one encoded object form a single atomic unit:
       // prepareMemory() redirects every store of an encoded object, so a load
@@ -629,6 +942,7 @@ class Encoder {
           Cost += ShardCost; ++SelectedShards;
         } else {
           ShardLostNodes += Current.size(); ShardLostCost += ShardCost;
+          markSkipped(Current, plan::Boundary::BudgetLoss);
         }
         Current.clear(); ShardCost = ShardScore = 0;
         Target = extent(Shard);
@@ -637,13 +951,17 @@ class Encoder {
         if (U.Cost > ShardCostLimit) {
           // A memory unit is indivisible. It must not silently exceed the
           // reported shard ceiling after flushing a smaller prefix.
-          ShardLostNodes += U.Nodes.size(); ShardLostCost += U.Cost; continue;
+          ShardLostNodes += U.Nodes.size(); ShardLostCost += U.Cost;
+          markSkipped(U.Nodes, plan::Boundary::BudgetLoss);
+          continue;
         }
         if (Nodes.size() + Current.size() + U.Nodes.size() > O.Nodes ||
-            Cost + ShardCost + U.Cost > CostLimit || ShardCost + U.Cost > Target) {
+            Cost + ShardCost + U.Cost > Limit || ShardCost + U.Cost > Target) {
           flush();
-          if (Nodes.size() + U.Nodes.size() > O.Nodes || Cost + U.Cost > CostLimit) {
-            ShardLostNodes += U.Nodes.size(); ShardLostCost += U.Cost; continue;
+          if (Nodes.size() + U.Nodes.size() > O.Nodes || Cost + U.Cost > Limit) {
+            ShardLostNodes += U.Nodes.size(); ShardLostCost += U.Cost;
+            markSkipped(U.Nodes, plan::Boundary::BudgetLoss);
+            continue;
           }
         }
         Current.append(U.Nodes.begin(), U.Nodes.end());
@@ -656,6 +974,7 @@ class Encoder {
       } else ++SkippedComponents;
     }
     planJointOutputs();
+    if (O.Plan) recordJoinsAndSeal();
   }
   // Bounded pairing of selected nodes into joint-output groups, decided on the
   // pre-emission IR in stable instruction order. Nothing here depends on
@@ -733,6 +1052,16 @@ class Encoder {
       }
       if (!Found) ++JointNodeSkips[Budget ? JN_TestBudget : JN_NoPartner];
     }
+    if (!O.Plan) return;
+    for (unsigned K = 0; K < JointGroups.size(); ++K) {
+      plan::Bundle B;
+      B.Origin = plan::originId(F.getName(), "bundle", K);
+      for (Instruction *M : {JointGroups[K].First, JointGroups[K].Second})
+        if (auto It = OpIndex.find(M); It != OpIndex.end()) B.Members.push_back(It->second);
+      B.Rep = ThePlan.Regions[RegionOf.lookup(JointGroups[K].First)].Rep;
+      B.Status = "planned";
+      ThePlan.Bundles.push_back(std::move(B));
+    }
   }
   unsigned redirect(Value *Old, Value *New, Instruction *Anchor) {
     SmallVector<Use *, 16> Uses;
@@ -746,9 +1075,13 @@ class Encoder {
   // dominated by the unmix and redirected, or left on the original lanes and
   // counted as ungoverned.
   void coupleJointOutputs() {
-    for (const JointGroup &G : JointGroups) {
+    for (unsigned K = 0; K < JointGroups.size(); ++K) {
+      const JointGroup &G = JointGroups[K];
       Pair X = Encoded.lookup(G.First), Y = Encoded.lookup(G.Second);
-      if (!X.E || !Y.E) continue;
+      if (!X.E || !Y.E) {
+        if (O.Plan) ThePlan.Bundles[K].RejectReason = "no-encoded-pair";
+        continue;
+      }
       bool Affine = Regions[RegionOf.lookup(G.First)].Affine;
       IRBuilder<> B(G.Second);
       // U = X + Y and V = X + 2Y are the only quantities that cross the pinned
@@ -762,10 +1095,15 @@ class Encoder {
       // G.Second still sits after everything emitted above, so it is an exact
       // anchor for "the unmix dominates this use". Encoded is deliberately not
       // updated: its pairs are valid everywhere, these are not.
-      JointRewrittenUses += redirect(X.E, RX.E, G.Second);
-      JointRewrittenUses += redirect(X.R, RX.R, G.Second);
-      JointRewrittenUses += redirect(Y.E, RY.E, G.Second);
-      JointRewrittenUses += redirect(Y.R, RY.R, G.Second);
+      unsigned Governed = redirect(X.E, RX.E, G.Second);
+      Governed += redirect(X.R, RX.R, G.Second);
+      Governed += redirect(Y.E, RY.E, G.Second);
+      Governed += redirect(Y.R, RY.R, G.Second);
+      JointRewrittenUses += Governed;
+      if (O.Plan) {
+        ThePlan.Bundles[K].Status = "coupled";
+        ThePlan.Bundles[K].GovernedUses = Governed;
+      }
       ++JointCoupled;
     }
   }
@@ -774,6 +1112,12 @@ class Encoder {
       Object &Obj = Objects[N];
       if (!RegionOf.count(Obj.Loads.front())) {
         ObjectReport.push_back(json::Object{{"object", Obj.A->getName().str()}, {"origin", Obj.ID}, {"status", "skipped"}, {"reason", "component-budget"}});
+        // Proved closed but not encoded: ownership and the reason it went
+        // unused are separate facts and both stay in the plan.
+        if (O.Plan && ObjectPlan[N] != plan::Invalid) {
+          ThePlan.Objects[ObjectPlan[N]].SkipReason = "component-budget";
+          ThePlan.Objects[ObjectPlan[N]].Reason = plan::Boundary::ComponentLimit;
+        }
         continue;
       }
       IRBuilder<> B(Obj.A);
@@ -790,6 +1134,21 @@ class Encoder {
       }
       for (auto *S : Obj.Stores) MemoryStores.insert(S);
       MemoryEdges += Obj.Loads.size() + Obj.Stores.size();
+      if (O.Plan && ObjectPlan[N] != plan::Invalid) {
+        plan::StorageMap Map;
+        Map.Origin = Obj.ID;
+        Map.Mapping = "parallel-lane-allocas";
+        Map.Object = ObjectPlan[N];
+        Map.Rep = ThePlan.Regions[RegionOf.lookup(Obj.Loads.front())].Rep;
+        Map.LoadEdges = Obj.Loads.size();
+        Map.StoreEdges = Obj.Stores.size();
+        // Accesses whose address is computed at run time. A CPU eventually
+        // requires an address; this says how often one is built here.
+        for (auto *G : Obj.GEPs) if (!G->hasAllConstantIndices()) ++Map.AddressExposures;
+        ThePlan.Objects[ObjectPlan[N]].Storage = ThePlan.Storage.size();
+        ThePlan.Objects[ObjectPlan[N]].Region = RegionOf.lookup(Obj.Loads.front());
+        ThePlan.Storage.push_back(std::move(Map));
+      }
       if (Obj.Aggregate) {
         ++AggregateObjects;
         AggregateMemoryEdges += Obj.Loads.size() + Obj.Stores.size();
@@ -807,6 +1166,10 @@ class Encoder {
   Pair emit(Instruction *I) {
     if (auto It = Encoded.find(I); It != Encoded.end()) return It->second;
     unsigned ID = RegionOf.lookup(I); bool Affine = Regions[ID].Affine;
+    if (O.Plan)
+      ThePlan.transfer(ThePlan.Regions[ID].Origin,
+                       isa<LoadInst>(I) ? plan::TransferKind::Storage : plan::TransferKind::Operation,
+                       ThePlan.Regions[ID].Rep, ThePlan.Regions[ID].Rep, plan::Verification::Algebraic);
     IRBuilder<> B(I); Pair Out;
     if (auto *L = dyn_cast<LoadInst>(I)) {
       Object &Obj = Objects[MemoryLoads.lookup(L)];
@@ -898,10 +1261,17 @@ public:
     Item["skipped_estimated_cost"] = SkippedCost;
     Item["shard_lost_estimated_cost"] = ShardLostCost;
     Item["component_estimated_cost_limit"] = CostLimit;
+    // The object walk's own ceilings, so a per-object cap is a number in the
+    // report rather than an unknown a consumer has to guess.
+    Item["object_leaf_limit"] = MaxLeaves;
+    Item["object_leaf_depth_limit"] = MaxLeafDepth;
     Item["shard_estimated_cost_limit"] = O.Shards ? ShardCostLimit : 0;
     Item["shard_policy"] = O.Shards ? "instruction-order-units-with-atomic-memory-objects"
                                     : "whole-component-only";
     Item["normalized_copies"] = Copies;
+    Item["reserved_structural_cost"] = StructuralReserve;
+    Item["reserve_denied_components"] = ReserveDenied;
+    Item["reserve_denied_estimated_cost"] = ReserveDeniedCost;
     // Joint-output accounting. Candidates are the selected nodes that could be
     // a group member at all; every rejection carries a fixed reason, and the
     // rewritten-use count is measured, not estimated.
@@ -917,11 +1287,33 @@ public:
     Item["joint_node_skips"] = std::move(NodeSkips);
     Item["joint_pair_skips"] = std::move(PairSkips);
   }
+  // Measured totals, filled once emission is complete. The inventory is only
+  // marked measured here, so a consumer never reads a partial count as a zero.
+  void finalizePlan() {
+    if (!O.Plan) return;
+    ThePlan.Inventory.ProtectedOps = Nodes.size();
+    ThePlan.Inventory.Exposures = ThePlan.Decodes.size();
+    for (const plan::DecodeSite &D : ThePlan.Decodes) {
+      ThePlan.Inventory.UsefulWorkTotal += D.UsefulWork;
+      ThePlan.Inventory.UsefulWorkMax = std::max(ThePlan.Inventory.UsefulWorkMax, D.UsefulWork);
+    }
+    ThePlan.Inventory.Measured = true;
+  }
+  // Published by the caller, which alone knows the actual instruction counts
+  // and whether the body it produced was kept.
+  json::Value planJSON(unsigned Before, unsigned After, bool RolledBack) {
+    ThePlan.Cost.InstructionsBefore = Before;
+    ThePlan.Cost.InstructionsAfter = After;
+    ThePlan.Cost.RolledBack = RolledBack;
+    return ThePlan.toJSON();
+  }
   json::Object run() {
     if (Nodes.empty()) {
       json::Object Item{{"function", F.getName().str()}, {"status", "skipped"},
+          {"origin", plan::originId(F.getName(), "function", 0)},
           {"reason", O.Shards && OversizedComponents ? "no-shard-within-budget"
                                                      : "no-whole-component-within-budget"}};
+      finalizePlan();
       accounting(Item);
       Item["objects"] = std::move(ObjectReport);
       return Item;
@@ -964,6 +1356,10 @@ public:
       for (unsigned N = 0; N < P->getNumIncomingValues(); ++N) {
         auto *Pred = P->getIncomingBlock(N); IRBuilder<> B(Pred->getTerminator());
         if (!Incoming.count(Pred)) Incoming[Pred] = input(B, P->getIncomingValue(N), RegionOf.lookup(I));
+        if (O.Plan)
+          ThePlan.transfer(ThePlan.Regions[RegionOf.lookup(I)].Origin, plan::TransferKind::Join,
+                           ThePlan.Regions[RegionOf.lookup(I)].Rep,
+                           ThePlan.Regions[RegionOf.lookup(I)].Rep, plan::Verification::Algebraic);
         cast<PHINode>(Encoded[I].E)->addIncoming(Incoming[Pred].E, Pred);
         cast<PHINode>(Encoded[I].R)->addIncoming(Incoming[Pred].R, Pred);
       }
@@ -1006,7 +1402,12 @@ public:
       // Both coordinates have to move together, so the mask must be the
       // private activation read this pair hides behind and nothing else: one
       // use here and one in the call or the returned struct.
-      if (!Mask || Owner.empty() || RegionOf.count(Mask) || !Mask->hasNUses(2)) continue;
+      if (!Mask || Owner.empty() || RegionOf.count(Mask) || !Mask->hasNUses(2)) {
+        // The pair could not be supplied to the interface, so the plaintext
+        // reconstruction stays. That is a boundary, whatever the metadata says.
+        recordBoundary(plan::Boundary::InterfaceMismatch, X);
+        continue;
+      }
       IRBuilder<> B(X);
       Pair P = convertFamily(B, Encoded.lookup(I), Regions[RegionOf.lookup(I)].Affine, false);
       X->replaceAllUsesWith(P.E);
@@ -1025,6 +1426,15 @@ public:
         D->eraseFromParent();
       }
       ++Absorbed[Owner].Results;
+      if (O.Plan) {
+        plan::CallContract &C = ThePlan.Calls[contractFor(Owner)];
+        C.CarriesResult = true;
+        ++C.SuppliedPairs;
+        C.Status = "absorbed";
+        ++ThePlan.Inventory.AbsorbedEdges;
+        ThePlan.transfer(C.Origin, plan::TransferKind::Interface,
+                         ThePlan.Regions[RegionOf.lookup(I)].Rep, C.Rep, plan::Verification::Algebraic);
+      }
     }
     // Capture AFTER emitting memory GEPs: their new scalar index uses must
     // also receive an explicit address boundary before originals are erased.
@@ -1034,13 +1444,37 @@ public:
       if (User && !RegionOf.count(User) && !(isa<StoreInst>(User) && MemoryStores.contains(cast<StoreInst>(User)))) Exits.push_back(&U);
     }
     DenseMap<std::pair<Instruction *, Instruction *>, Value *> DecodedAt;
+    DenseMap<std::pair<Instruction *, Instruction *>, unsigned> DecodeIndex;
     for (Use *U : Exits) {
       auto *I = cast<Instruction>(U->get()), *User = cast<Instruction>(U->getUser());
       Instruction *IP = User;
       if (auto *P = dyn_cast<PHINode>(User)) IP = P->getIncomingBlock(U->getOperandNo())->getTerminator();
       auto Key = std::make_pair(I, IP);
+      // Every use edge is counted, whether or not it reuses a decode that
+      // already exists: the scalar this consumer reads is a real crossing.
+      plan::Boundary Crossing = O.Plan ? exitBoundary(User) : plan::Boundary::Count;
+      if (O.Plan) recordBoundary(Crossing, I);
       if (auto Found = DecodedAt.find(Key); Found != DecodedAt.end()) {
+        if (O.Plan) ++ThePlan.Decodes[DecodeIndex.lookup(Key)].Uses;
         U->set(Found->second); ++Outputs; continue;
+      }
+      if (O.Plan) {
+        plan::DecodeSite D;
+        D.Origin = ThePlan.Ops[OpIndex.lookup(I)].Origin;
+        D.Consumer = isa<BranchInst>(User) ? "branch-choice"
+            : isa<GetElementPtrInst>(User) ? "address"
+            : isa<ReturnInst>(User) ? "return"
+            : isa<CallBase>(User) ? "call"
+            : isa<StoreInst>(User) ? "store"
+            : isa<PHINode>(User) ? "phi" : "unsupported-consumer";
+        D.Reason = Crossing;
+        D.Uses = 1;
+        D.UsefulWork = UsefulWorkOf[OpIndex.lookup(I)];
+        DecodeIndex[Key] = ThePlan.Decodes.size();
+        ThePlan.Decodes.push_back(std::move(D));
+        ThePlan.transfer(ThePlan.Regions[RegionOf.lookup(I)].Origin, plan::TransferKind::Exit,
+                         ThePlan.Regions[RegionOf.lookup(I)].Rep, plan::Invalid,
+                         plan::Verification::Algebraic);
       }
       IRBuilder<> B(IP); Pair X = Encoded.lookup(I);
       Value *Plain = Regions[RegionOf.lookup(I)].Affine ? B.CreateSub(X.E, X.R, "sre.connected.output")
@@ -1055,10 +1489,12 @@ public:
       DecodedAt[Key] = Plain;
     }
     coupleJointOutputs();
+    finalizePlan();
     json::Array RegionReport;
     // component is the original connected component's stable planning index;
     // shard identifies the bounded part of it that this region belongs to.
     for (const Region &R : Regions) RegionReport.push_back(json::Object{{"id", R.ID}, {"component", R.Component},
+        {"origin", plan::originId(F.getName(), "region", R.ID)},
         {"shard", R.Shard}, {"sharded", R.Sharded}, {"nodes", R.Nodes.size()},
         {"estimated_cost", R.Cost}, {"representation", R.Affine ? "additive-pair-v1" : "xor-prefix-pair-v1"}});
     // Distinct integer widths this function actually encoded, ascending, read
@@ -1082,11 +1518,26 @@ public:
     for (Instruction *I : AbsorbedParameters) {
       if (I->use_empty()) {
         ++Absorbed[F.getName()].Arguments;
+        if (O.Plan) {
+          plan::CallContract &C = ThePlan.Calls[contractFor(F.getName())];
+          C.CarriesArguments = true;
+          ++C.AbsorbedArguments;
+          if (C.Status != "partial") C.Status = "absorbed";
+          ++ThePlan.Inventory.AbsorbedEdges;
+        }
         I->eraseFromParent();
       } else {
         // At least one encoded consumer used the pair, but an unsupported
-        // consumer still needs the scalar reconstruction. Report it separately.
+        // consumer still needs the scalar reconstruction. Report it separately,
+        // and count the surviving reconstruction as the boundary it is.
         ++Absorbed[F.getName()].PartialArguments;
+        if (O.Plan) {
+          plan::CallContract &C = ThePlan.Calls[contractFor(F.getName())];
+          C.CarriesArguments = true;
+          ++C.PartialArguments;
+          C.Status = "partial";
+        }
+        recordBoundary(plan::Boundary::InterfaceMismatch, I);
       }
     }
     for (Object &Obj : Objects) if (!Obj.EP.empty()) {
@@ -1096,6 +1547,7 @@ public:
     }
     F.setMemoryEffects(MemoryEffects::unknown()); F.removeFnAttr(Attribute::Speculatable);
     json::Object Item{{"function", F.getName().str()}, {"status", "encoded"}, {"nodes", Nodes.size()},
+        {"origin", plan::originId(F.getName(), "function", 0)},
         {"regions", std::move(RegionReport)}, {"widths", std::move(WidthReport)},
         {"phi_pairs", PhiPairs},
         {"persistent_edges", PersistentEdges}, {"memory_edges", MemoryEdges}, {"predicates", Predicates},
@@ -1134,7 +1586,8 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
     Encoder Encode(*F, Seed, Local);
     auto Item = Encode.run();
     unsigned After = F->getInstructionCount();
-    if (Snapshot && After > uint64_t(Before) + Local.GrowthBudget) {
+    bool RolledBack = Snapshot && After > uint64_t(Before) + Local.GrowthBudget;
+    if (RolledBack) {
       // Connected encoding creates only local instructions/allocas, no module
       // globals or callees. This body-only rollback is therefore complete.
       Snapshot->restore();
@@ -1143,12 +1596,22 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
       // Planning denominators describe eligibility, so they survive a rollback.
       for (StringRef Key : {"eligible_nodes", "eligible_memory_edges", "eligible_memory_objects",
                             "eligible_aggregate_memory_objects", "eligible_memory_leaves",
-                            "memory_layout_policy",
+                            "memory_layout_policy", "origin",
                             "eligible_estimated_cost", "oversized_components",
                             "component_estimated_cost_limit", "shard_estimated_cost_limit",
+                            "object_leaf_limit", "object_leaf_depth_limit",
+                            "reserved_structural_cost", "reserve_denied_components",
+                            "reserve_denied_estimated_cost",
                             "shard_policy", "joint_output_candidates", "joint_policy",
                             "joint_dependency_test", "joint_node_skips", "joint_pair_skips"})
         if (auto *Value = Item.get(Key)) Rolled[Key] = std::move(*Value);
+      // Selection loss inside a rolled-back function is not rollback loss.
+      // Keeping only the eligible total and the attempted selection would
+      // charge this function's genuine skips and shard losses to the rollback.
+      if (auto *Value = Item.get("skipped_estimated_cost"))
+        Rolled["attempted_skipped_estimated_cost"] = std::move(*Value);
+      if (auto *Value = Item.get("shard_lost_estimated_cost"))
+        Rolled["attempted_shard_lost_estimated_cost"] = std::move(*Value);
       if (auto *Value = Item.get("joint_output_groups")) Rolled["attempted_joint_output_groups"] = std::move(*Value);
       if (auto *Value = Item.get("joint_lane_uses_rewritten"))
         Rolled["attempted_joint_lane_uses_rewritten"] = std::move(*Value);
@@ -1164,6 +1627,9 @@ json::Array encodeNativeConnected(Module &M, uint64_t Seed, const NativeConnecte
     Snapshot.reset();
     Item["instructions_before"] = Before;
     Item["instructions_after"] = F->getInstructionCount();
+    // The plan is published after the rollback decision, so its actual costs
+    // describe the body that was kept, not the one that was undone.
+    if (Local.Plan) Item["plan"] = Encode.planJSON(Before, F->getInstructionCount(), RolledBack);
     Item["bounded_growth"] = O.BoundedGrowth;
     if (O.BoundedGrowth) Item["growth_allocation"] = Local.GrowthBudget;
     Report.push_back(std::move(Item));
