@@ -18,7 +18,9 @@ def main():
     parser.add_argument("--case", type=Path, required=True, help="width directory from bundle_run")
     parser.add_argument("--stem", default="xor-1-pins-1")
     parser.add_argument("--width", type=int, choices=(8, 16, 32, 64), required=True)
-    parser.add_argument("--loop", action="store_true", help="use a supported bundle_loop_run case and full two-output workload")
+    workload = parser.add_mutually_exclusive_group()
+    workload.add_argument("--loop", action="store_true", help="use a supported bundle_loop_run case and full two-output workload")
+    workload.add_argument("--tile", action="store_true", help="use a supported tile_run case and all four output cells")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
     parser.add_argument("--ghidra-image", required=True)
@@ -29,15 +31,19 @@ def main():
     out.mkdir(parents=True, exist_ok=False)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out, args.case), timeout=180)
     result = {"schema": "sre-bundle-decompiler-v1", "passed": False, "scope": "informed-entry",
-              "workload": "loop" if args.loop else "straight-line",
+              "workload": "tile" if args.tile else "loop" if args.loop else "straight-line",
               "hardness_evaluated": False, "semantic_recovery": "not_measured", "arms": {}}
     try:
         driver = out / "driver.o"
-        driver_source = "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
-        runner.run(["clang", "-O2", *(["-pthread"] if args.loop else []), "-c",
+        driver_source = "tile_driver.c" if args.tile else "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
+        threaded = args.loop or args.tile
+        runner.run(["clang", "-O2", *(["-pthread"] if threaded else []), "-c",
                     str(FIXTURES / driver_source), "-o", str(driver)])
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}
+        if args.tile:
+            selected["tiles-off"] = args.case / (args.stem + "-disabled.ll")
+            selected["tiles-off-post-o2"] = args.case / (args.stem + "-disabled-post-o2.ll")
         expected = None
         vectors = inputs(args.width, 1024)
         if args.loop:
@@ -46,7 +52,7 @@ def main():
         for name, source in selected.items():
             archived = out / (name + ".ll")
             shutil.copy2(source, archived)
-            artifact = compile_variant(runner, archived, driver, out / name, threaded=args.loop)
+            artifact = compile_variant(runner, archived, driver, out / name, threaded=threaded)
             output = runner.run([str(artifact["binary"])], stdin=vectors)
             if expected is None: expected = output
             if output != expected: raise ToolFailure("stripped binary differential failed")

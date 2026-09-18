@@ -4,6 +4,11 @@ This implements a bounded first M2 emitter, not the complete v04 plan or a
 promoted preset. It is IR-only and off by default. It adds no interpreter,
 environment checks, dynamic secrets, source-specific checks or post-link work.
 
+The separate default-off [closed local object increment](NATIVE_OBJECT_BUNDLES_V1.md)
+adds bounded joint memory-to-computation transfers before this pure-register
+pass. It shares arithmetic and the existing growth allowance, not its loop
+phase contract. It does not complete the v04 memory workstream.
+
 ## Supported scope
 
 `-native-bundles` runs before the existing connected encoder. It schedules

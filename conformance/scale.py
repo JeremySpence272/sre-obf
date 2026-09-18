@@ -16,6 +16,7 @@ from conformance.whole import build, parser as build_parser
 from conformance.run import ROOT
 from conformance.connected_check import SHARD_ACCOUNTING, cost_accounting, report_violations
 from conformance.bundle_check import bundle_summary
+from conformance.tile_check import tile_summary
 
 
 # Reports that actually emit connected planning denominators. An older report
@@ -78,6 +79,7 @@ def source_ledger(report):
     selection = {row["function"]: row for row in report.get("functions", []) or []}
     planner = {row["function"]: row for row in report.get("connected_regions", []) or []}
     bundled = {row["function"] for row in report.get("bundles", []) if row["retained_operations"]}
+    tiled = {row["function"] for row in report.get("object_bundles", []) if row["retained_operations"]}
     final = {row["function"] for row in (report.get("final_inventory", {}).get("functions") or [])}
     owners = merge_owners(report)
     encoded = {row["function"]: row["encoded_function"]
@@ -97,7 +99,7 @@ def source_ledger(report):
         plan = planner.get(owner)
         if name in selection and not selection[name].get("selected", True):
             state = "not-selected"
-        elif owner in bundled:
+        elif owner in bundled or owner in tiled:
             state = "encoded"
         elif plan is None:
             if name in selection or name in owners:
@@ -145,6 +147,7 @@ def source_ledger(report):
             "unaccounted_examples": unaccounted,
             "selection_rows": len(selection), "planner_rows": len(planner),
             "bundle_owners": len(bundled),
+            "object_bundle_owners": len(tiled),
             "scope": "input IR before fusion, merging and every pass; a merged origin is "
                      "credited to its current owner, including encoded-interface renames. "
                      "Selected regions include retained connected regions or bundles. "
@@ -442,6 +445,7 @@ def coverage(report):
     ledger, objects = source_ledger(report), object_ledger(report)
     measured = {"source_ledger": ledger, "object_ledger": objects,
             "bundles": bundle_summary(report),
+            "object_bundles": tile_summary(report),
             "support_charge": support_charge(report), "cap_ledger": cap_ledger(report),
             "loss_ledger": loss_ledger(report),
             "coverage_views": coverage_views(report, ledger, objects),

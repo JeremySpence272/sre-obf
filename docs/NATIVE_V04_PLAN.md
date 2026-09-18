@@ -265,6 +265,11 @@ the consumer's representation directly. The existing array encoder must not
 automatically create one scalar decoder that becomes a reusable accessor.
 Prioritize numeric arrays and useful state alongside strings.
 
+Implementation status: the default-off [closed local tile prototype](NATIVE_OBJECT_BUNDLES_V1.md)
+is a first bounded increment only. It does not yet handle immutable backing,
+object phases, direct-call ownership propagation, or the wider layout/lifetime
+contracts below. W3 remains incomplete and is not promoted.
+
 Existing flat-array encoding already accepts some runtime indices and carries
 two lanes through loads/stores; the aggregate leaf extension accepts constant
 offsets. v04 must preserve that support and add joint tiles, phase transitions

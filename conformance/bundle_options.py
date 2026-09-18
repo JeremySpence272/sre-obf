@@ -3,6 +3,7 @@
 
 def add_options(parser):
     parser.add_argument("--bundles", action="store_true")
+    parser.add_argument("--object-bundles", action="store_true")
     parser.add_argument("--transfer-family", choices=("xor", "additive", "seeded"))
     parser.add_argument("--bundle-values", type=int, choices=(2, 3, 4))
     parser.add_argument("--transfer-nodes", type=int, choices=range(8, 33))
@@ -17,7 +18,7 @@ def validate(args, connected):
     choices = any(getattr(args, key, None) is not None
                   for key in ("transfer_family", "bundle_values", "transfer_nodes"))
     switches = any(getattr(args, key, False) for key in
-                   ("no_bundle_pins", "bundle_loops", "bundle_phases", "bundle_loop_boundaries"))
+                   ("no_bundle_pins", "bundle_loops", "bundle_phases", "bundle_loop_boundaries", "object_bundles"))
     if not enabled and (choices or switches):
         raise ValueError("bundle options require --bundles")
     if getattr(args, "bundle_phases", False) and not getattr(args, "bundle_loops", False):
@@ -36,7 +37,7 @@ def flags(args):
             f"-native-transfer-nodes={getattr(args, 'transfer_nodes', None) or 16}",
             f"-native-bundle-pins={int(not getattr(args, 'no_bundle_pins', False))}"] + [
             "-native-" + key.replace("_", "-") + "=1"
-            for key in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries")
+            for key in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries", "object_bundles")
             if getattr(args, key, False)]
 
 
@@ -47,6 +48,6 @@ def argv(args):
         if getattr(args, name, None) is not None:
             out += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     if getattr(args, "no_bundle_pins", False): out.append("--no-bundle-pins")
-    for name in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries"):
+    for name in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries", "object_bundles"):
         if getattr(args, name, False): out.append("--" + name.replace("_", "-"))
     return out

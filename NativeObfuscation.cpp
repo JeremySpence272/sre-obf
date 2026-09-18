@@ -90,6 +90,8 @@ cl::opt<unsigned> NativeSemanticBudget("native-semantic-budget",
     cl::init(0));
 cl::opt<bool> NativeBundles("native-bundles",
     cl::desc("Experimental planned multi-output triangular native transfers"), cl::init(false));
+cl::opt<bool> NativeObjectBundles("native-object-bundles",
+    cl::desc("Experimental closed, initialized local integer tiles"), cl::init(false));
 cl::opt<std::string> NativeTransferFamily("native-transfer-family",
     cl::desc("Bundle representation: xor, additive, or seeded"), cl::init("seeded"));
 cl::opt<unsigned> NativeBundleValues("native-bundle-values",
@@ -241,7 +243,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   if (!NativeBundles && (NativeTransferFamily.getNumOccurrences() || NativeBundleValues.getNumOccurrences() ||
                          NativeTransferNodes.getNumOccurrences() || NativeBundlePins.getNumOccurrences() ||
                          NativeBundleLoops.getNumOccurrences() || NativeBundlePhases.getNumOccurrences() ||
-                         NativeBundleLoopBoundaries.getNumOccurrences()))
+                         NativeBundleLoopBoundaries.getNumOccurrences() || NativeObjectBundles.getNumOccurrences()))
     report_fatal_error("native bundle options require native-bundles");
   if (NativeBundlePhases && !NativeBundleLoops)
     report_fatal_error("native-bundle-phases requires native-bundle-loops");
@@ -397,7 +399,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   for (Function &F : M)
     if (F.hasFnAttribute("sre.native.original"))
       SourceWeights.emplace_back(&F, std::clamp(F.getInstructionCount(), 32u, 4096u));
-  json::Array GrowthCoverage, BundleCoverage;
+  json::Array GrowthCoverage, BundleCoverage, ObjectBundleCoverage;
   if (NativeBundles) {
     checkModuleBudget(M, "before-bundle-allocation");
     obf::NativeBundleOptions Options;
@@ -411,6 +413,19 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     // One bounded share of remaining headroom. Connected/CFF/helper passes
     // allocate against the remaining module, never the pre-bundle total.
     Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
+    if (NativeObjectBundles) {
+      unsigned Total = Options.GrowthBudget, Before = moduleInstructions(M);
+      // Tiles and pure bundles share the existing one-third allowance. Reserve
+      // at most half for atomic object units, then reuse unspent actual growth.
+      Options.GrowthBudget = Total / 2;
+      ObjectBundleCoverage = obf::encodeNativeObjectBundles(M, PreparedCache.ModuleSeed, Options);
+      unsigned After = moduleInstructions(M);
+      unsigned Used = After > Before ? After - Before : 0;
+      if (Used > Options.GrowthBudget) report_fatal_error("native object bundle exceeded its module allowance");
+      Options.GrowthBudget = Total - Used;
+      if (verifyModule(M, &errs())) report_fatal_error("native object bundles produced invalid IR");
+      saveNativeStage(M, "object-bundles.ll");
+    }
     BundleCoverage = obf::encodeNativeBundles(M, PreparedCache.ModuleSeed, Options);
     AM.invalidate(M, PreservedAnalyses::none());
     if (verifyModule(M, &errs())) report_fatal_error("native bundles produced invalid IR");
@@ -701,6 +716,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"scale_structure", NativeScaleStructure.getValue()},
                             {"plan", NativePlan.getValue()},
                             {"bundles", NativeBundles.getValue()},
+                            {"object_bundles", NativeObjectBundles.getValue()},
                             {"transfer_family", NativeTransferFamily.getValue()},
                             {"bundle_values", NativeBundleValues.getValue()},
                             {"transfer_nodes", NativeTransferNodes.getValue()},
@@ -733,6 +749,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     if (NativeBundles) {
       Result["bundle_input_inventory"] = std::move(BundleOrigins);
       Result["bundles"] = std::move(BundleCoverage);
+      if (NativeObjectBundles) Result["object_bundles"] = std::move(ObjectBundleCoverage);
     }
     // Absent, not empty, when no arbitration ran: an unplanned denominator is
     // unknown rather than zero.

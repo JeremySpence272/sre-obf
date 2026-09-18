@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/NativeBundle.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleMath.h"
 #include "llvm/Transforms/Obfuscator/NativeTransfer.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
 #include "llvm/Transforms/Obfuscator/NativePlan.h"
@@ -30,22 +31,12 @@ std::string origin(const Instruction &I) {
   return {}; // Never silently relabel generated code as a frontend operation.
 }
 bool supported(const Instruction &I) {
-  if (!I.getType()->isIntegerTy() || I.getMetadata(BundleTag)) return false;
-  unsigned W = I.getType()->getIntegerBitWidth();
-  if (!llvm::is_contained(ArrayRef<unsigned>{8, 16, 32, 64}, W)) return false;
+  if (!bundle::operationSupported(I) || I.getMetadata(BundleTag)) return false;
   // Do not steal encoded-call coordinates from their current owner.
   for (StringRef Tag : {"sre.native.call.arg", "sre.native.call.split",
                         "sre.native.call.result", "sre.native.call.state"})
     if (I.getMetadata(Tag)) return false;
-  switch (I.getOpcode()) {
-  case Instruction::Add: case Instruction::Sub: case Instruction::Mul:
-  case Instruction::And: case Instruction::Or: case Instruction::Xor: return true;
-  case Instruction::Shl: case Instruction::LShr: case Instruction::AShr: {
-    const auto *C = dyn_cast<ConstantInt>(I.getOperand(1));
-    return C && C->getValue().ult(W);
-  }
-  default: return false;
-  }
+  return true;
 }
 
 // The executable plan is a bounded register schedule, not an observation of an
@@ -289,11 +280,7 @@ class Lowering {
     return B.CreateOr(B.CreateShl(X, R), B.CreateLShr(X, P.Width - R));
   }
   Value *mask(ArrayRef<Value *> State, unsigned K) {
-    Value *A = K ? State[K - 1] : M;
-    // Seeded reversible ARX kernel is a mask function, not a secret key and
-    // not itself a claim of inversion resistance.
-    Value *T = B.CreateAdd(B.CreateXor(A, c(P.Salts[K])), M);
-    return B.CreateXor(rotate(T, P.Rotations[K]), B.CreateMul(A, c(P.Salts[K] | 1)));
+    return bundle::mask(B, State, M, K, P.Salts[K], P.Rotations[K]);
   }
   Pair read(const Operand &O) {
     if (O.Constant) return {c(O.Bits), c(0)};
@@ -407,12 +394,7 @@ public:
     for (const Step &S : P.Steps) {
       Pair X = read(S.X), Y = read(S.Y), Out = X;
       Value *Fresh = B.CreateXor(M, Z.back());
-      if (S.Opcode == Instruction::Shl || S.Opcode == Instruction::LShr || S.Opcode == Instruction::AShr) {
-        if (P.coordinates() == Family::Additive) X = transfer::toXor(B, X, Fresh);
-        auto Op = static_cast<Instruction::BinaryOps>(S.Opcode);
-        Out = {B.CreateBinOp(Op, X.E, c(S.Y.Bits)), B.CreateBinOp(Op, X.R, c(S.Y.Bits))};
-        if (P.coordinates() == Family::Additive) Out = transfer::toAdditive(B, Out, Fresh);
-      } else Out = transfer::operation(B, S.Opcode, X, Y, P.coordinates(), Fresh);
+      Out = bundle::operation(B, S.Opcode, X, Y, P.coordinates(), Fresh);
       SmallVector<Value *, 4> Old = Z;
       for (unsigned K = S.Destination; K < P.Lanes; ++K) {
         Pair V = K == S.Destination ? Out : Pair{Old[K], mask(Old, K)};
