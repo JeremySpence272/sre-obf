@@ -10,8 +10,19 @@ inline BinaryOperator *immutablePair(Value *V) {
   return I && I->getMetadata("sre.native.immutable.pair") &&
          (I->getOpcode() == Instruction::Xor || I->getOpcode() == Instruction::Sub) ? I : nullptr;
 }
-inline transfer::Pair importPair(IRBuilder<> &B, Value *V, transfer::Family Family) {
-  if (auto *I = immutablePair(V)) {
+inline BinaryOperator *inputPair(Value *V, bool CallInputs) {
+  if (auto *I = immutablePair(V)) return I;
+  auto *I = dyn_cast<BinaryOperator>(V);
+  return CallInputs && I && I->getOpcode() == Instruction::Xor &&
+         I->getMetadata("sre.native.call.arg") ? I : nullptr;
+}
+inline transfer::Pair importPair(IRBuilder<> &B, Value *V, transfer::Family Family,
+                                 bool CallInputs = false) {
+  if (auto *I = inputPair(V, CallInputs)) {
+    // The owning body snapshot also owns this marker. A rolled-back bundle
+    // must not leave an absorption claim on the scalar reconstruction.
+    if (I->getMetadata("sre.native.call.arg"))
+      I->setMetadata("sre.native.call.bundle-input", MDNode::get(I->getContext(), {}));
     transfer::Pair P{B.CreateFreeze(I->getOperand(0)), B.CreateFreeze(I->getOperand(1))};
     if (I->getOpcode() == Instruction::Xor && Family == transfer::Family::Additive)
       return transfer::toAdditive(B, P, P.R);

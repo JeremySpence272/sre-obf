@@ -371,6 +371,10 @@ Implementation increment: [direct self-recursive activations](NATIVE_SELF_RECURS
 are available behind an explicit flag, with shared policy/emitter eligibility,
 actual merge coexistence, independent-output and rejection tests. This does not
 complete the joint bundle or closed-object pointer contracts below.
+An additional default-off [private-input continuity path](NATIVE_BUNDLE_CALL_INPUTS_V1.md)
+lets selected bundles consume encoded integer arguments without an intervening
+scalar reconstruction, with distinct partial/full accounting. Result supplies
+and closed-object pointer interfaces remain separate work.
 
 Resolve merge/fusion/call-encoding competition during planning. For each
 eligible internal group choose exactly one policy: fuse into a useful region,

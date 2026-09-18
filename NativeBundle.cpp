@@ -274,7 +274,7 @@ class Lowering {
   PHINode *CarrierPhi = nullptr, *PhasePhi = nullptr;
   SmallVector<PHINode *, 4> StatePhis;
   MDNode *Tag;
-  bool Pin;
+  bool Pin, CallInputs;
   ConstantInt *c(uint64_t X) { return ConstantInt::get(B.getIntNTy(P.Width), X); }
   Value *rotate(Value *X, unsigned R) {
     return B.CreateOr(B.CreateShl(X, R), B.CreateLShr(X, P.Width - R));
@@ -307,9 +307,9 @@ class Lowering {
          I != End; I = I->getNextNode()) I->setMetadata(BundleTag, Tag);
   }
   void enter(ArrayRef<Value *> Values) {
-    if (llvm::any_of(Values, [](Value *V) { return bundle::immutablePair(V) != nullptr; })) {
+    if (llvm::any_of(Values, [&](Value *V) { return bundle::inputPair(V, CallInputs) != nullptr; })) {
       SmallVector<Pair, 4> Inputs;
-      for (Value *V : Values) Inputs.push_back(bundle::importPair(B, V, P.coordinates()));
+      for (Value *V : Values) Inputs.push_back(bundle::importPair(B, V, P.coordinates(), CallInputs));
       M = B.CreateAdd(rotate(Inputs[0].E, P.Rotations[0]),
           B.CreateXor(B.CreateAdd(Inputs[1].E, Inputs[1].R), c(P.Salts[0])));
       for (unsigned K = 0; K < P.Lanes; ++K) {
@@ -392,10 +392,10 @@ class Lowering {
     CarrierPhi->addIncoming(M, Bound.Latches[Edge]);
   }
 public:
-  Lowering(Function &F, const Binding &Bound, bool Pin)
+  Lowering(Function &F, const Binding &Bound, bool Pin, bool CallInputs)
       : F(F), P(Bound.P), B(Bound.Nodes.front()),
         Tag(MDNode::get(F.getContext(), MDString::get(F.getContext(),
-            plan::originId(F.getName(), "native-bundle", P.ID)))), Pin(Pin) {}
+            plan::originId(F.getName(), "native-bundle", P.ID)))), Pin(Pin), CallInputs(CallInputs) {}
   void run(const Binding &Bound) {
     Instruction *First = Bound.Nodes.front(), *Prev = First->getPrevNode();
     if (Bound.Preheader) enterLoop(Bound);
@@ -655,7 +655,7 @@ json::Array encodeNativeBundles(Module &M, uint64_t Seed, const NativeBundleOpti
       FunctionSnapshot Snapshot(*F);
       // Backwards emission keeps later bindings alive when an earlier output
       // feeds a later region's entry. RAUW updates the already-emitted use.
-      for (const Binding &B : llvm::reverse(Plans)) Lowering(*F, B, O.Pin).run(B);
+      for (const Binding &B : llvm::reverse(Plans)) Lowering(*F, B, O.Pin, O.CallInputs).run(B);
       After = F->getInstructionCount();
       Rollback = After > uint64_t(Before) + Budget;
       if (verifyFunction(*F, &errs())) report_fatal_error("native bundle lowering produced invalid IR");

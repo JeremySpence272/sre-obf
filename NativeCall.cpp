@@ -630,6 +630,39 @@ json::Array encodeNativeCalls(Module &M, uint64_t Seed, const NativeCallOptions 
   return Interfaces(M, Seed, O).run();
 }
 
+json::Array nativeBundleCallInputs(const Module &M) {
+  json::Array Rows;
+  for (const Function &F : M) {
+    unsigned Full = 0, Partial = 0, Uses = 0;
+    for (const Instruction &I : instructions(F))
+      if (I.getMetadata("sre.native.call.bundle-input")) {
+        if (I.use_empty()) ++Full; else ++Partial;
+        Uses += I.getNumUses();
+      }
+    if (Full + Partial) Rows.push_back(json::Object{{"function", F.getName().str()},
+        {"contract", "bundle-call-input-v1"}, {"stage", "after-bundles-before-regions"},
+        {"imported_arguments", Full + Partial}, {"fully_absorbed_arguments", Full},
+        {"partially_absorbed_arguments", Partial}, {"remaining_scalar_uses", Uses}});
+  }
+  return Rows;
+}
+
+void finishNativeBundleCallInputs(Module &M, StringMap<NativeCallAbsorption> &Absorbed) {
+  for (Function &F : M) {
+    SmallVector<Instruction *, 8> Dead;
+    for (Instruction &I : instructions(F))
+      if (I.getMetadata("sre.native.call.bundle-input")) {
+        // Connected lowering clears the marker only when its own accounting
+        // owns it. Its rollback restores both the marker and the old users.
+        I.setMetadata("sre.native.call.bundle-input", nullptr);
+        auto &Count = Absorbed[F.getName()];
+        if (I.use_empty()) { ++Count.Arguments; Dead.push_back(&I); }
+        else ++Count.PartialArguments;
+      }
+    for (Instruction *I : Dead) I->eraseFromParent();
+  }
+}
+
 void recordNativeCallAbsorption(json::Array &Rows,
                                 const StringMap<NativeCallAbsorption> &Absorbed) {
   for (json::Value &Value : Rows) {

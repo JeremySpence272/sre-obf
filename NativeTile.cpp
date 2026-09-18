@@ -298,7 +298,7 @@ class Lowering {
   IRBuilder<> B;
   AllocaInst *Storage;
   ArrayType *StorageType;
-  bool Pin;
+  bool Pin, CallInputs;
   DenseMap<Value *, Pair> Pairs;
   SmallPtrSet<Instruction *, 32> Members;
   ConstantInt *c(uint64_t X) { return ConstantInt::get(B.getIntNTy(P.Width), X); }
@@ -349,7 +349,7 @@ class Lowering {
   Pair read(Value *V) {
     if (auto It = Pairs.find(V); It != Pairs.end()) return It->second;
     auto *I = dyn_cast<Instruction>(V);
-    if (!I || !Members.contains(I)) return bundle::importPair(B, V, P.Coordinates);
+    if (!I || !Members.contains(I)) return bundle::importPair(B, V, P.Coordinates, CallInputs);
     IRBuilderBase::InsertPointGuard Guard(B);
     B.SetInsertPoint(I);
     Pair X = read(I->getOperand(0)), Y = read(I->getOperand(1));
@@ -358,8 +358,8 @@ class Lowering {
     return Out;
   }
 public:
-  Lowering(Binding &Bound, bool Pin) : Bound(Bound), P(Bound.P),
-      B(Bound.LastInitializer), Pin(Pin) {}
+  Lowering(Binding &Bound, bool Pin, bool CallInputs) : Bound(Bound), P(Bound.P),
+      B(Bound.LastInitializer), Pin(Pin), CallInputs(CallInputs) {}
   void run() {
     Function &F = *Bound.F;
     SmallPtrSet<Instruction *, 32> Original;
@@ -573,7 +573,7 @@ json::Array encodeNativeObjectBundles(Module &M, uint64_t Seed, const NativeBund
     auto &Row = *Report[K].getAsObject();
     unsigned Before = B.F->getInstructionCount();
     FunctionSnapshot Snapshot(*B.F);
-    Lowering(B, O.Pin).run();
+    Lowering(B, O.Pin, O.CallInputs).run();
     unsigned Attempted = B.F->getInstructionCount();
     if (verifyFunction(*B.F, &errs())) report_fatal_error("native object bundle produced invalid IR");
     bool Rollback = Attempted > uint64_t(Before) + B.P.Cost;

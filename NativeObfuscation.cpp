@@ -96,6 +96,8 @@ cl::opt<unsigned> NativeSemanticBudget("native-semantic-budget",
     cl::init(0));
 cl::opt<bool> NativeBundles("native-bundles",
     cl::desc("Experimental planned multi-output triangular native transfers"), cl::init(false));
+cl::opt<bool> NativeBundleCallInputs("native-bundle-call-inputs",
+    cl::desc("Import private encoded arguments directly into persistent bundles"), cl::init(false));
 cl::opt<bool> NativeObjectBundles("native-object-bundles",
     cl::desc("Experimental closed, initialized local integer tiles"), cl::init(false));
 cl::opt<bool> NativeObjectPhases("native-object-phases",
@@ -248,6 +250,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native bundle limits require 2..4 values and 8..32 transfer nodes");
   if (NativeBundles && NativeRegionPlan != "connected")
     report_fatal_error("native-bundles requires native-region-plan=connected");
+  if (NativeBundleCallInputs && (!NativeBundles || !NativeEncodedCalls))
+    report_fatal_error("native-bundle-call-inputs requires native-bundles and native-encoded-calls");
   if (NativeImmutableBundles && (!NativeBundles || !NativeData))
     report_fatal_error("native-immutable-bundles requires native-bundles and native-data");
   if (NativeContinuityPriority && !NativeBundles)
@@ -422,6 +426,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     if (F.hasFnAttribute("sre.native.original"))
       SourceWeights.emplace_back(&F, std::clamp(F.getInstructionCount(), 32u, 4096u));
   json::Array GrowthCoverage, BundleCoverage, ObjectBundleCoverage, ImmutableContinuity, ImmutableConnected;
+  json::Array BundleCallInputs;
   if (NativeBundles) {
     checkModuleBudget(M, "before-bundle-allocation");
     obf::NativeBundleOptions Options;
@@ -433,6 +438,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     Options.Phases = NativeBundlePhases;
     Options.LoopBoundaries = NativeBundleLoopBoundaries;
     Options.ObjectPhases = NativeObjectPhases;
+    Options.CallInputs = NativeBundleCallInputs;
     // One bounded share of remaining headroom. Connected/CFF/helper passes
     // allocate against the remaining module, never the pre-bundle total.
     Options.GrowthBudget = (NativeModuleInsts - moduleInstructions(M)) / 3;
@@ -457,6 +463,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   }
   if (NativeImmutableBundles) ImmutableContinuity = obf::nativeImmutableContinuity(
       M, "after-bundles-before-legacy-lowering", false);
+  if (NativeBundleCallInputs) BundleCallInputs = obf::nativeBundleCallInputs(M);
   if (NativeRegionPlan == "connected") {
     obf::NativeConnectedOptions Options;
     Options.Nodes = NativeConnectedNodes;
@@ -480,6 +487,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     StringMap<obf::NativeCallAbsorption> Absorbed;
     ConnectedCoverage = obf::encodeNativeConnected(M, PreparedCache.ModuleSeed, Options,
                                                    NativeEncodedCalls ? &Absorbed : nullptr);
+    if (NativeBundleCallInputs) obf::finishNativeBundleCallInputs(M, Absorbed);
     // Pairs the region planner consumed without a scalar decode belong in the
     // interface rows that carry them, not in a separate total nobody reads.
     obf::recordNativeCallAbsorption(CallCoverage, Absorbed);
@@ -746,6 +754,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"bundles", NativeBundles.getValue()},
                             {"object_bundles", NativeObjectBundles.getValue()},
                             {"immutable_bundles", NativeImmutableBundles.getValue()},
+                            {"bundle_call_inputs", NativeBundleCallInputs.getValue()},
                             {"continuity_priority", NativeContinuityPriority.getValue()},
                             {"immutable_continuity_contract", 2},
                             {"object_bundle_contract", 3},
@@ -783,6 +792,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     if (NativeBundles) {
       Result["bundle_input_inventory"] = std::move(BundleOrigins);
       Result["bundles"] = std::move(BundleCoverage);
+      if (NativeBundleCallInputs) Result["bundle_call_inputs"] = std::move(BundleCallInputs);
       if (NativeObjectBundles) Result["object_bundles"] = std::move(ObjectBundleCoverage);
       if (NativeImmutableBundles) Result["immutable_continuity"] = std::move(ImmutableContinuity);
       if (NativeImmutableBundles) Result["immutable_connected_continuity"] = std::move(ImmutableConnected);

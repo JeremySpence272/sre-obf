@@ -10,7 +10,7 @@ from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, FIXTURES, opt_command
 
 
-def fixture(width):
+def fixture(width, straight_line=False):
     ty = f"i{width}"
     lines = ['target triple = "x86_64-unknown-linux-gnu"',
              'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"',
@@ -44,12 +44,22 @@ def fixture(width):
     for k, helper in ((2, "ptr_a"), (3, "ptr_b")):
         lines += [f"  %r{k} = call i64 @{helper}(ptr %out{k - 2})",
                   f"  %out{k} = getelementptr inbounds i64, ptr %out, i32 {k}", f"  store i64 %r{k}, ptr %out{k}"]
-    return "\n".join(lines + ["  ret void", "}"]) + "\n"
+    source = "\n".join(lines + ["  ret void", "}"]) + "\n"
+    if straight_line:
+        source = source.replace("  %stop = icmp eq i32 %depth, 0\n  br i1 %stop, label %base, label %step\nbase:\n" +
+            f"  %initial = xor {ty} %x, %y\n  ret {ty} %initial\nstep:", "  br label %step\nstep:", 1)
+        source = source.replace("  %next = sub i32 %depth, 1\n" +
+            f"  %child = notail call {ty} @recur({ty} %v6, {ty} %v7, i32 %next)\n" +
+            f"  %result = xor {ty} %child, %v6\n  ret {ty} %result",
+            f"  %zero = icmp eq {ty} %v6, 0\n  %fallback = xor {ty} %v7, 11\n" +
+            f"  %mixed = xor {ty} %v6, %v7\n  %result = select i1 %zero, {ty} %fallback, {ty} %mixed\n  ret {ty} %result", 1)
+    return source
 
 
-def oracle(a, b, width):
+def oracle(a, b, width, straight_line=False):
     mask = (1 << width) - 1
     def recurse(x, y, depth):
+        if straight_line: depth = 1
         parents = []
         for _ in range(depth):
             v2 = (((x + y) & mask) * 3) & mask
@@ -58,6 +68,7 @@ def oracle(a, b, width):
             v7 = ((v2 ^ v3) + v6) & mask
             parents.append(v6)
             x, y = v6, v7
+        if straight_line: return (y ^ 11) if x == 0 else (x ^ y)
         out = x ^ y
         for value in reversed(parents): out ^= value
         return out
@@ -75,7 +86,14 @@ def main():
     parser.add_argument("--random-inputs", type=int, default=256)
     parser.add_argument("--merge", action="store_true", help="require actual coexistence with a separately merged pointer group")
     parser.add_argument("--ablation-plugin", type=Path, help="require feature-off IR equality with this prior plugin")
+    parser.add_argument("--bundle-call-inputs", action="store_true")
+    parser.add_argument("--straight-line", action="store_true", help="nonrecursive all-input-absorption control")
+    parser.add_argument("--transfer-family", choices=("xor", "additive", "seeded"), default="seeded")
+    parser.add_argument("--no-bundle-pins", action="store_true")
+    parser.add_argument("--connected-nodes", type=int, default=128)
     args = parser.parse_args()
+    if args.ablation_plugin and (args.straight_line or args.bundle_call_inputs):
+        parser.error("recursion prior-plugin ablation is separate from bundle-input controls")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     plugin = out / "Obfuscator.so"
@@ -87,9 +105,13 @@ def main():
              "-native-passes=constenc,fmerge" if args.merge else "-native-passes=constenc",
              "-native-strings=0", "-native-data=0", "-native-helper-hardening=0", "-native-late-constants=0",
              f"-native-merge={int(args.merge)}", "-native-values=1", "-native-values-wide=1",
-             "-native-region-plan=connected", "-native-connected-nodes=128", "-native-predicate-regions=1",
+             "-native-region-plan=connected", f"-native-connected-nodes={args.connected_nodes}", "-native-predicate-regions=1",
              "-native-encoded-calls=1", "-native-self-recursion=1", "-native-call-policy=1", "-native-plan=1",
              "-native-regional-families=1", "-obf-deterministic", "-obf-verify"]
+    if args.bundle_call_inputs:
+        flags += ["-native-bundles=1", "-native-bundle-call-inputs=1",
+                  f"-native-transfer-family={args.transfer_family}",
+                  f"-native-bundle-pins={int(not args.no_bundle_pins)}"]
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
@@ -97,10 +119,10 @@ def main():
             case = out / f"i{width}"
             case.mkdir()
             source = case / "clean.ll"
-            source.write_text(fixture(width))
+            source.write_text(fixture(width, args.straight_line))
             vectors = inputs(width, args.random_inputs)
             pairs = [tuple(map(int, line.split())) for line in vectors.splitlines()]
-            expected = "".join(" ".join(f"{v:016x}" for v in oracle(a, b, width)) + "\n" for a, b in pairs).encode()
+            expected = "".join(" ".join(f"{v:016x}" for v in oracle(a, b, width, args.straight_line)) + "\n" for a, b in pairs).encode()
             clean = case / "clean"
             runner.run(["clang", str(source), str(driver), "-pthread", "-o", str(clean)])
             if runner.run([str(clean)], stdin=vectors) != expected: raise ToolFailure("clean recursion oracle mismatch")
@@ -114,8 +136,15 @@ def main():
                 if errors: raise ToolFailure("; ".join(errors))
                 row = next(r for r in data["encoded_calls"] if r["function"] == "recur")
                 policy = next(r for r in data["call_policy"] if r["function"] == "recur")
-                if row["status"] != "encoded" or row["recursive_calls_rewritten"] != 1 or row["call_sites_rewritten"] != 3:
+                recursive = not args.straight_line
+                if row["status"] != "encoded" or row["recursive_calls_rewritten"] != int(recursive) or row["call_sites_rewritten"] != 2 + int(recursive):
                     raise ToolFailure(f"recursive interface not actually emitted: {row}")
+                if args.bundle_call_inputs:
+                    imported = next((r for r in data["bundle_call_inputs"] if r["function"] == row["encoded_function"]), None)
+                    if not imported or imported["imported_arguments"] < 2:
+                        raise ToolFailure("bundle did not import multiple private arguments")
+                    if args.straight_line and imported["fully_absorbed_arguments"] < 2:
+                        raise ToolFailure("straight-line control retained avoidable scalar inputs")
                 if policy["policy"] != "encoded-interface" or policy["outcome"] != "encoded":
                     raise ToolFailure("recursive arbitration did not retain its interface")
                 if args.merge and not data["merged_groups"]: raise ToolFailure("merge flag did not emit a merged group")
@@ -129,6 +158,21 @@ def main():
                     runner.run(["clang", str(ir), str(driver), "-pthread", "-o", str(binary)])
                     if runner.run([str(binary)], stdin=vectors) != expected: raise ToolFailure(f"recursive mismatch: {arm}")
                     runner.run([str(binary), "--threads"])
+                if args.bundle_call_inputs:
+                    disabled = case / f"seed-{seed}-disabled.ll"
+                    disabled_report = case / f"seed-{seed}-disabled.json"
+                    off_flags = [f for f in flags if f != "-native-bundle-call-inputs=1"]
+                    runner.run(opt_command(plugin) + off_flags + [f"-obf-seed={seed}",
+                        f"-native-report-json={disabled_report}", "-S", str(source), "-o", str(disabled)])
+                    if report_violations(json.loads(disabled_report.read_text())):
+                        raise ToolFailure("invalid bundle-input ablation report")
+                    off_o2 = case / f"seed-{seed}-disabled-post-o2.ll"
+                    runner.run(["opt", "-passes=default<O2>,verify", "-S", str(disabled), "-o", str(off_o2)])
+                    for label, ir in (("disabled", disabled), ("disabled-post-o2", off_o2)):
+                        binary = case / f"seed-{seed}-{label}"
+                        runner.run(["clang", str(ir), str(driver), "-pthread", "-o", str(binary)])
+                        if runner.run([str(binary)], stdin=vectors) != expected:
+                            raise ToolFailure(f"bundle-input ablation mismatch: {label}")
                 if args.ablation_plugin:
                     control = case / f"seed-{seed}-off.ll"
                     control_report = case / f"seed-{seed}-off.json"
@@ -157,7 +201,9 @@ def main():
                     result["ablation_plugin_sha256"] = digest(args.ablation_plugin.resolve())
                 result["cases"].append({"width": width, "seed": seed, "vectors": len(pairs),
                     "merge_requested": args.merge, "merged_groups": len(data["merged_groups"]),
-                    "interface": row, "policy": policy, "passed": True})
+                    "interface": row, "policy": policy, "passed": True,
+                    "straight_line": args.straight_line, "family": args.transfer_family,
+                    "pins": not args.no_bundle_pins, "bundle_call_inputs": data.get("bundle_call_inputs", [])})
                 dump(out / "summary.json", result)
                 print(f"i{width} seed-{seed}: passed", flush=True)
         result["passed"] = True

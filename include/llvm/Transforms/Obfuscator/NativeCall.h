@@ -64,4 +64,8 @@ json::Array encodeNativeCalls(Module &, uint64_t Seed, const NativeCallOptions &
 // keep their zeros when nothing was absorbed.
 void recordNativeCallAbsorption(json::Array &Rows,
                                 const StringMap<NativeCallAbsorption> &Absorbed);
+// Inventory after bundle lowering, before the legacy consumer. The finalizer
+// credits markers not already reconciled by a retained connected transaction.
+json::Array nativeBundleCallInputs(const Module &);
+void finishNativeBundleCallInputs(Module &, StringMap<NativeCallAbsorption> &);
 } // namespace llvm::obf

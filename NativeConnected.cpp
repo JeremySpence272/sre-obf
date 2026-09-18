@@ -1594,6 +1594,7 @@ public:
     // above. One whose every consumer was absorbed is a plaintext parameter
     // kept alive for nothing.
     for (Instruction *I : AbsorbedParameters) {
+      I->setMetadata("sre.native.call.bundle-input", nullptr);
       if (I->use_empty()) {
         ++Absorbed[F.getName()].Arguments;
         if (O.Plan) {
