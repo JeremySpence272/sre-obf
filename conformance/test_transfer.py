@@ -529,6 +529,19 @@ class AttackTests(unittest.TestCase):
         self.assertTrue(report["recovered"])
         self.assertEqual(report["exact"], report["trials"])
 
+  def test_a_fit_too_large_to_run_is_recorded_as_not_attempted(self):
+    """Not attempted is not evidence of resistance, so it is labelled as such
+    with the monomial count rather than reported as a zero."""
+    report = tm.gf2_attack(tm.NlCarry(32, 5, lanes=3, kernel="and"), degree=2)
+    self.assertFalse(report["attempted"])
+    self.assertIsNone(report["bits_recovered"])
+    self.assertFalse(report["broken"])
+    self.assertGreater(report["monomials"], report["budget"])
+
+  def test_the_and_kernel_falls_to_a_quadratic_fit_at_sixteen_bits_too(self):
+    report = tm.gf2_attack(tm.NlCarry(16, 5, lanes=2, kernel="and"), degree=2)
+    self.assertTrue(report["broken"], report)
+
   def test_an_unfittable_model_is_never_reported_as_recovered(self):
     site = tm.NlCarry(IR, 5, lanes=2, kernel="arx")
     report = tm.modular_affine_attack(site)

@@ -1566,11 +1566,28 @@ class Gf2System:
     return rhs
 
 
-def gf2_attack(site, lane=0, degree=1, train=None, test=200, seed=0):
-  """Fit lane bits as a degree-`degree` GF(2) function of the state bits."""
+MONOMIAL_BUDGET = 4000
+
+
+def gf2_attack(site, lane=0, degree=1, train=None, test=200, seed=0,
+               budget=MONOMIAL_BUDGET):
+  """Fit lane bits as a degree-`degree` GF(2) function of the state bits.
+
+  The fit needs one training sample per monomial and an elimination that is
+  quadratic in them, so a degree-two fit over a wide state is not affordable:
+  at thirty-two bit lanes with six state words it is eighteen thousand
+  monomials. That is recorded as not attempted, with the count, rather than run
+  to a timeout or quietly skipped. Not attempted is not evidence of resistance.
+  """
   rng = seeded(("gf2", seed, site.identifier, degree, lane))
   count = site.width * len(site.state_words())
   monos = monomials(count, degree)
+  if len(monos) > budget:
+    return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
+            "width": site.width, "degree": degree, "lane": lane,
+            "attempted": False, "monomials": len(monos), "budget": budget,
+            "reason": "monomial count over the budget", "bits_recovered": None,
+            "bits": site.width, "broken": False}
   size = len(monos) + 1
   train = train if train is not None else size + 32
   system = Gf2System()
@@ -1593,7 +1610,7 @@ def gf2_attack(site, lane=0, degree=1, train=None, test=200, seed=0):
       hits[b] += int(((prediction >> b) & 1) == ((lanes[lane] >> b) & 1))
   recovered = [b for b in range(site.width) if scored and hits[b] == scored]
   return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
-          "width": site.width, "degree": degree, "lane": lane,
+          "width": site.width, "degree": degree, "lane": lane, "attempted": True,
           "train": train, "features": size, "consistent": consistent,
           "scored": scored, "undetermined": undetermined,
           "bits_recovered": len(recovered), "bits": site.width,
@@ -1703,6 +1720,10 @@ def projection_transfer_attack(site, other, lane=0, degree=2, train=None,
   rng = seeded(("transfer", seed, site.identifier))
   count = site.width * len(site.state_words())
   monos = monomials(count, degree)
+  if len(monos) > MONOMIAL_BUDGET:
+    return {"fitted_on": site.identifier, "degree": degree, "attempted": False,
+            "monomials": len(monos), "reason": "monomial count over the budget",
+            "results": {}}
   train = train if train is not None else len(monos) + 33
   system = Gf2System()
   for _ in range(train):
@@ -1742,6 +1763,12 @@ def carrier_fit_attack(site, lane=0, degree=2, train=None, test=200, seed=0):
   rng = seeded(("carrier", seed, site.identifier, degree, lane))
   count = site.width * len(site.mask_words())
   monos = monomials(count, degree)
+  if len(monos) > MONOMIAL_BUDGET:
+    return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
+            "width": site.width, "degree": degree, "lane": lane,
+            "attempted": False, "monomials": len(monos),
+            "reason": "monomial count over the budget", "bits_recovered": None,
+            "broken": False}
   train = train if train is not None else len(monos) + 33
   system = Gf2System()
   def observe():
@@ -1763,7 +1790,7 @@ def carrier_fit_attack(site, lane=0, degree=2, train=None, test=200, seed=0):
   recovered = [b for b in range(site.width) if scored and hits[b] == scored]
   return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
           "width": site.width, "degree": degree, "lane": lane, "train": train,
-          "monomials": len(monos), "scored": scored,
+          "attempted": True, "monomials": len(monos), "scored": scored,
           "bits_recovered": len(recovered), "recovered_bits": recovered,
           "broken": scored > 0 and len(recovered) == site.width}
 
@@ -1950,6 +1977,8 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
     row["constant_readback"] = constant_readback_attack(site, seed=seed)
     row["recovered_by"] = [f"gf2-degree-{d}" for d in degrees
                            if row["gf2_fit"][str(d)] == width]
+    row["not_attempted"] = [f"gf2-degree-{d}" for d in degrees
+                            if row["gf2_fit"][str(d)] is None]
     if row["constant_readback"]["recovered"]:
       row["recovered_by"].append("constant-readback")
     if row["ring_affine_fit"]: row["recovered_by"].append("ring-affine")
