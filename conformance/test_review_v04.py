@@ -107,6 +107,7 @@ class RecoveryReviewTests(unittest.TestCase):
         lock = corpora.load()
         record = lock["corpora"]["bzip2"]
         record["spec_schema"] = "sre-scale-v1"
+        record.pop("manifest_sha256", None)
         spec = {"schema": "sre-scale-v1", "project": "bzip2", **record["acquisition"]}
         with self.assertRaisesRegex(corpora.CorpusError, "manifest hash"):
             corpora.validate_manifest(lock, "bzip2", spec, Path(__file__))

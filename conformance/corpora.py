@@ -78,6 +78,12 @@ def validate(lock):
             violations.append(f"{name}: unknown split {entry.get('split')!r}")
         if not entry.get("family"):
             violations.append(f"{name}: a program family is required")
+        if entry.get("workload_state") == "frozen" and entry.get("split") == "holdout":
+            checksum = entry.get("manifest_sha256", "")
+            if (not isinstance(checksum, str) or len(checksum) != 64 or
+                    any(c not in "0123456789abcdef" for c in checksum) or
+                    entry.get("spec_schema") != "sre-scale-v1" or not entry.get("workload_contract")):
+                violations.append(f"{name}: frozen holdout needs its schema, IO contract and manifest hash")
         acquisition = entry.get("acquisition")
         if not isinstance(acquisition, dict) or not acquisition.get("kind"):
             violations.append(f"{name}: an acquisition record is required")

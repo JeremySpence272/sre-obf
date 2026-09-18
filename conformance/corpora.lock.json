@@ -1,6 +1,6 @@
 {
   "schema": "sre-corpus-lock-v1",
-  "revision": "m0-2",
+  "revision": "m0-3",
   "scope": [
     "The frozen v04 evaluation matrix: which programs, which seeds and which resource limits every later measurement is taken under.",
     "Data, not arguments. A measurement that does not name an entry here is not part of the matrix.",
@@ -174,12 +174,14 @@
         "acquired_at": "2026-09-17",
         "verification": "downloaded twice in one session with identical bytes; the hash also matches the value published with the release"
       },
-      "spec_schema": null,
-      "workload_contract": null,
-      "workload_state": "pending",
+      "spec_schema": "sre-scale-v1",
+      "workload_contract": "Six clean-verified compression/decompression byte-stream cases; frozen 2026-09-18",
+      "workload_state": "frozen",
+      "manifest_sha256": "357fd775c31d0a648936e8aa572f6fb0f386c8c2ad9fc6b6ed7c8a6c0d3b2aed",
+      "manifest_location": "out/v04-frozen-holdouts-20260918/bzip2.json",
       "notes": [
         "Burrows-Wheeler transform, MTF and Huffman coding with bit-level I/O: a different codebase and a different kernel shape from zlib.",
-        "The archive bytes are pinned. The input/output contract is NOT frozen yet, so no holdout result may be reported from this entry until a sre-scale-v1 manifest with expected outputs exists and its hash is recorded here."
+        "Clean references only were compiled while freezing this contract, after the first experimental bundle checkpoint and before protected holdout evaluation. No candidate measurements or protected holdout results were used for tuning."
       ]
     },
     "cjson": {
@@ -195,12 +197,14 @@
         "verification": "downloaded twice in one session with identical bytes",
         "stability_caveat": "A GitHub-generated tag tarball. If upstream regenerates it the hash can change without the source changing. Record the mismatch and re-pin deliberately; never overwrite this value silently."
       },
-      "spec_schema": null,
-      "workload_contract": null,
-      "workload_state": "pending",
+      "spec_schema": "sre-scale-v1",
+      "workload_contract": "Clean-verified line-oriented parse/serialize and invalid-document contracts; frozen 2026-09-18",
+      "workload_state": "frozen",
+      "manifest_sha256": "96fb38060b63021f21c9d23b7f5f3af7ca10f9b9f8559ebc988655acf1d35d10",
+      "manifest_location": "out/v04-frozen-holdouts-20260918/cjson.json",
       "notes": [
         "Recursive-descent parsing and serialization over heap object graphs with aliased pointers: the recursion and aliasing shape that M3 and M5 claim to support, in code that never influenced the design.",
-        "The archive bytes are pinned. The input/output contract is NOT frozen yet, so no holdout result may be reported from this entry until a sre-scale-v1 manifest with expected outputs exists and its hash is recorded here."
+        "The upstream sources are unchanged; a public generic CLI driver defines the protocol. Clean references only were compiled after the first experimental bundle checkpoint and before protected holdout evaluation. No protected holdout measurement was performed."
       ]
     }
   },

@@ -269,3 +269,25 @@ connected `v02` base variant as explicit v04 experiments. Locked scale runs also
 check upstream revision/archive identity; a held-out workload needs a frozen
 manifest hash before it can run. Scale-regression manifests retain their own
 recorded hashes rather than claiming the lock pins their entire source tree.
+
+### Native bundles and frozen holdout contracts
+
+The experimental descriptor-driven bundle emitter, supported scope, flags and
+exact checkpoint evidence are documented in
+[`NATIVE_BUNDLE_V1.md`](../docs/NATIVE_BUNDLE_V1.md). It does not complete v04.
+
+Corpus-lock revision `m0-3` freezes bzip2/cJSON IO manifests under ignored
+`out/v04-frozen-holdouts-20260918/`. Existing seeds and resource caps are unchanged.
+Only unobfuscated reference programs were built during preparation; their
+outputs were checked against independent Python bz2/JSON expectations. No
+protected holdout or candidate-ranking measurement was performed. This freeze
+occurred after the first experimental bundle emitter, not before its authoring;
+the chronology is explicit rather than retroactively relabelled M0 evidence.
+
+`python3 -m conformance.prepare_holdouts --out FRESH --bzip2-archive ARCHIVE
+--cjson-archive ARCHIVE --toolchain-image sre-obf-dev:llvm22` verifies the pinned
+archives, preserves upstream source/header hashes and prepares clean contracts.
+It never updates the corpus lock automatically. Moving or regenerating a
+manifest changes its hash because source roots are bound into the manifest;
+record a deliberate lock revision instead of silently accepting a new hash.
+Neither holdout is authorized for tuning by this preparation step.

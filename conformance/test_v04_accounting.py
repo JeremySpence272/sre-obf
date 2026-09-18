@@ -359,9 +359,18 @@ class CorpusLockTests(unittest.TestCase):
                 corpora.resolve(self.lock, name, "holdout")
 
     def test_a_corpus_without_a_frozen_contract_yields_no_result(self):
+        self.lock["corpora"]["bzip2"].update(workload_state="pending", workload_contract=None)
         with self.assertRaises(corpora.CorpusError) as caught:
             corpora.resolve(self.lock, "bzip2", "holdout")
         self.assertIn("frozen input/output contract", str(caught.exception))
+
+    def test_frozen_holdouts_resolve_but_cannot_lose_their_hash(self):
+        for name in ("bzip2", "cjson"):
+            result = corpora.resolve(self.lock, name, "holdout")
+            self.assertFalse(result["tuning_allowed"])
+            self.assertEqual(result["seed"], 23)
+        self.lock["corpora"]["bzip2"].pop("manifest_sha256")
+        self.assertTrue(any("frozen holdout" in error for error in corpora.validate(self.lock)))
 
     def test_a_seed_outside_its_set_is_refused(self):
         with self.assertRaises(corpora.CorpusError):
