@@ -369,11 +369,13 @@ class Encoder {
                        plan::Verification::Algebraic);
     Type *T = X.E->getType();
     if (ToAffine) {
-      // e xor r = e + r - 2*(e & r). Add a fresh second coordinate
-      // without ever creating the decoded scalar as an SSA value.
+      // e xor r = e + r - 2*(e & r), with the fresh coordinate added to the
+      // FIRST partial sum. Adding it last, as v03 did, leaves e + r - 2*(e & r)
+      // in a register, and that subexpression is exactly the decoded value.
+      // Same function of the same operands; no intermediate is the plaintext.
       Value *R = constant(T, RNG.fork("conversion").fork(Site++).u64());
       Value *TwiceBoth = B.CreateMul(B.CreateAnd(X.E, X.R), constant(T, 2));
-      Value *E = B.CreateAdd(B.CreateSub(B.CreateAdd(X.E, X.R), TwiceBoth), R);
+      Value *E = B.CreateSub(B.CreateAdd(B.CreateAdd(X.E, R), X.R), TwiceBoth);
       return {E, R};
     }
     // Treat each additive coordinate as a separately shared XOR value, then
@@ -1202,9 +1204,12 @@ class Encoder {
         Pair Y = input(B, I->getOperand(1), ID);
         if (Affine) {
           if (I->getOpcode() == Instruction::Mul) {
+            // The output mask joins the FIRST partial product. Adding it last
+            // leaves ex*ey - cross + r*s in a register, which is exactly x*y.
             Value *Mask = B.CreateXor(X.R, Y.R);
             Value *Cross = B.CreateAdd(B.CreateMul(X.E, Y.R), B.CreateMul(Y.E, X.R));
-            Out = {B.CreateAdd(B.CreateAdd(B.CreateSub(B.CreateMul(X.E, Y.E), Cross), B.CreateMul(X.R, Y.R)), Mask), Mask};
+            Out = {B.CreateAdd(B.CreateSub(B.CreateAdd(B.CreateMul(X.E, Y.E), Mask), Cross),
+                               B.CreateMul(X.R, Y.R)), Mask};
           } else {
             auto Op = static_cast<Instruction::BinaryOps>(I->getOpcode());
             Out = {B.CreateBinOp(Op, X.E, Y.E), B.CreateBinOp(Op, X.R, Y.R)};
