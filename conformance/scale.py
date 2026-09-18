@@ -515,7 +515,7 @@ def main():
                         "an unknown accounting then fails instead of passing by omission")
     p.add_argument("--scale-budget", action="store_true", help="Explicit fair growth-allocation experiment; not a promotion flag")
     p.add_argument("--scale-structure", action="store_true")
-    for flag in ("plan", "encoded-calls", "call-policy"):
+    for flag in ("plan", "encoded-calls", "call-policy", "self-recursion"):
         p.add_argument("--" + flag, action="store_true")
     p.add_argument("--semantic-budget", type=int, default=0)
     bundle_options.add_options(p)
@@ -533,10 +533,12 @@ def main():
         bundle_options.validate(args, args.variant == "v02")
     except ValueError as exc:
         p.error(str(exc))
-    if (args.plan or args.encoded_calls or args.call_policy or args.semantic_budget) and args.variant != "v02":
+    if (args.plan or args.encoded_calls or args.call_policy or args.self_recursion or args.semantic_budget) and args.variant != "v02":
         p.error("v04 experiments require the connected v02 base variant")
     if args.call_policy and not args.encoded_calls:
         p.error("--call-policy requires --encoded-calls")
+    if args.self_recursion and not args.encoded_calls:
+        p.error("--self-recursion requires --encoded-calls")
     if not 0 <= args.semantic_budget <= 50:
         p.error("--semantic-budget must be 0..50")
     if args.scale_budget and args.variant != "v02":
@@ -612,7 +614,8 @@ def main():
               "scale_budget": args.scale_budget,
               "scale_structure": args.scale_structure,
               "v04_features": {"plan": args.plan, "encoded_calls": args.encoded_calls,
-                               "call_policy": args.call_policy, "semantic_budget": args.semantic_budget,
+                               "call_policy": args.call_policy, "self_recursion": args.self_recursion,
+                               "semantic_budget": args.semantic_budget,
                                "bundle_flags": bundle_options.flags(args)},
               "connected_shards": args.connected_shards,
               "connected_aggregates": args.connected_aggregates,
@@ -638,7 +641,7 @@ def main():
             if args.scale_structure: argv += ["--scale-structure"]
             if args.connected_shards: argv += ["--connected-shards"]
             if args.connected_aggregates: argv += ["--connected-aggregates"]
-            for name in ("plan", "encoded_calls", "call_policy"):
+            for name in ("plan", "encoded_calls", "call_policy", "self_recursion"):
                 if getattr(args, name): argv += ["--" + name.replace("_", "-")]
             argv += ["--semantic-budget", str(args.semantic_budget)]
             argv += bundle_options.argv(args)

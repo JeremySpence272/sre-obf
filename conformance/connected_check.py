@@ -17,7 +17,7 @@ INTERFACE_ACCOUNTING = ("sre-native-v5", "sre-native-v6")
 # The fixed skip vocabulary of the encoded-call interface pass. A row with any
 # other reason is a reporting bug, not coverage.
 CALL_SKIPS = ("not-original", "exported-or-address-taken", "varargs", "eh-or-personality",
-              "recursive", "unsupported-signature", "unsupported-call-site", "function-budget",
+              "recursive", "recursive-unsupported-effect", "unsupported-signature", "unsupported-call-site", "function-budget",
               "no-callers", "musttail-body", "returns-twice", "no-return", "call-policy-owner")
 
 
@@ -166,6 +166,9 @@ def call_violations(report):
     absorbed pairs than its interface has, fails the gate instead of being read
     as protection.
     """
+    recursive = report.get("features", {}).get("self_recursion", False)
+    if recursive and not report.get("features", {}).get("encoded_calls"):
+        return ["self recursion requires encoded calls"]
     rows = report.get("encoded_calls")
     if rows is None:
         return (["encoded-call feature has no interface report"]
@@ -173,6 +176,14 @@ def call_violations(report):
     violations = []
     for row in rows:
         where = row["function"]
+        if recursive:
+            if row.get("recursion_contract") != "direct-self-activation-v1" or type(row.get("self_recursive")) is not bool:
+                violations.append(f"{where}: missing/unknown recursive activation contract")
+            n = row.get("recursive_calls_rewritten")
+            if type(n) is not int or n < 0 or n > row["call_sites_rewritten"]:
+                violations.append(f"{where}: invalid self-call count")
+            elif bool(n) != (row["status"] == "encoded" and row.get("self_recursive", False)):
+                violations.append(f"{where}: self-call coverage disagrees with recursion disposition")
         if row["status"] not in ("encoded", "skipped"):
             violations.append(f"{where}: unknown interface status {row['status']!r}")
             continue

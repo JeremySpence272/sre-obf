@@ -6,6 +6,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
 
 using namespace llvm;
 namespace llvm::obf {
@@ -44,7 +45,8 @@ StringRef bodyBlocker(const Function &F) {
 // function that is unreachable from any exported root is still detected.
 // Indirect edges are not modeled: a candidate is never address-taken, so no
 // indirect call can name it.
-void findCycles(Module &M, SmallPtrSetImpl<const Function *> &Cyclic) {
+void findCycles(Module &M, SmallPtrSetImpl<const Function *> &Cyclic,
+                SmallPtrSetImpl<const Function *> *Self = nullptr) {
   DenseMap<const Function *, SmallVector<const Function *, 8>> Edges;
   for (Function &F : M) {
     auto &Callees = Edges[&F];
@@ -87,6 +89,7 @@ void findCycles(Module &M, SmallPtrSetImpl<const Function *> &Cyclic) {
       } while (Member != Cur);
       if (Members.size() > 1 || llvm::is_contained(Callees, Cur))
         for (const Function *X : Members) Cyclic.insert(X);
+      if (Self && Members.size() == 1 && llvm::is_contained(Callees, Cur)) Self->insert(Cur);
     }
   }
 }
@@ -97,7 +100,7 @@ void findCycles(Module &M, SmallPtrSetImpl<const Function *> &Cyclic) {
 // then refuse. function-budget is the pass's own running state and stays there.
 std::string interfaceBlocker(const Function &F,
                              const SmallPtrSetImpl<const Function *> &Cyclic,
-                             SmallPtrSetImpl<const Function *> &Callers) {
+                             SmallPtrSetImpl<const Function *> &Callers, bool AllowSelf = false) {
   bool Direct = true;
   for (const Use &U : F.uses()) {
     const auto *C = dyn_cast<CallInst>(U.getUser());
@@ -116,7 +119,18 @@ std::string interfaceBlocker(const Function &F,
   if (F.isVarArg()) return "varargs";
   if (unwinds(F)) return "eh-or-personality";
   if (StringRef Blocker = bodyBlocker(F); !Blocker.empty()) return Blocker.str();
-  if (Cyclic.count(&F)) return "recursive";
+  if (Cyclic.count(&F)) {
+    if (!AllowSelf) return "recursive";
+    // Initial recursive contract: only direct self calls and non-observing
+    // lifetime/debug markers. Unknown callbacks, other callees, inline asm,
+    // stack/frame observation and exception edges are not silently admitted.
+    if (F.hasFnAttribute(Attribute::Naked)) return "recursive-unsupported-effect";
+    for (const Instruction &I : instructions(F)) if (const auto *C = dyn_cast<CallBase>(&I)) {
+      if (C->getCalledFunction() == &F) continue;
+      if (isa<LifetimeIntrinsic, DbgInfoIntrinsic>(I) && !C->hasOperandBundles()) continue;
+      return "recursive-unsupported-effect";
+    }
+  }
   if (!Signature) return "unsupported-signature";
   if (!Direct) return "unsupported-call-site";
   if (Callers.empty()) return "no-callers";
@@ -127,7 +141,7 @@ class Interfaces {
   Module &M;
   Rng RNG;
   NativeCallOptions O;
-  SmallPtrSet<const Function *, 16> Cyclic;
+  SmallPtrSet<const Function *, 16> Cyclic, SelfRecursive;
   // One activation slot per function body. Identity keyed, never iterated, so
   // no pointer order can reach the output. When a host is itself encoded the
   // entry is re-keyed onto the twin its body moved into.
@@ -246,8 +260,10 @@ class Interfaces {
       }
 
     unsigned Site = 0;
+    unsigned SelfSites = 0;
     for (CallInst *C : sites(F)) {
       Function &Host = *C->getFunction();
+      SelfSites += &Host == NF;
       IRBuilder<> CB(C);
       SmallVector<Value *, 16> Args;
       for (unsigned N = 0; N < C->arg_size(); ++N) {
@@ -260,6 +276,7 @@ class Interfaces {
       }
       auto *NC = CB.CreateCall(NF, Args);
       NC->setCallingConv(NF->getCallingConv());
+      if (C->isNoTailCall()) NC->setTailCallKind(CallInst::TCK_NoTail);
       NC->setDebugLoc(C->getDebugLoc());
       if (!Ret->isVoidTy()) {
         Value *E = CB.CreateExtractValue(NC, 0, "sre.call.pair.e");
@@ -279,6 +296,7 @@ class Interfaces {
     // per call site.
     Row["result_rebuilds"] = Returns;
     Row["call_sites_rewritten"] = Site;
+    if (O.SelfRecursion) Row["recursive_calls_rewritten"] = SelfSites;
     Row["activation_allocas"] = Allocas;
     if (!F.use_empty()) report_fatal_error("native encoded call left a plaintext use");
     F.eraseFromParent();
@@ -288,7 +306,7 @@ class Interfaces {
 public:
   Interfaces(Module &M, uint64_t Seed, const NativeCallOptions &O)
       : M(M), RNG(Rng(Seed).fork("native-encoded-calls-v1")), O(O) {
-    findCycles(M, Cyclic);
+    findCycles(M, Cyclic, &SelfRecursive);
   }
 
   json::Array run() {
@@ -312,7 +330,7 @@ public:
       for (unsigned Bits : Seen) Widths.push_back(int64_t(Bits));
 
       SmallPtrSet<const Function *, 8> Callers;
-      std::string Reason = interfaceBlocker(*F, Cyclic, Callers);
+      std::string Reason = interfaceBlocker(*F, Cyclic, Callers, O.SelfRecursion && SelfRecursive.contains(F));
       if (Reason.empty() && F->hasFnAttribute(NativeCallPolicyAttr) &&
           F->getFnAttribute(NativeCallPolicyAttr).getValueAsString() != NativeCallPolicyInterface)
         Reason = "call-policy-owner";
@@ -329,6 +347,11 @@ public:
           {"wrapper_retained", false}, {"representation", "xor-pair-v1"},
           {"encoded_function", ""}, {"activation_allocas", 0},
           {"absorbed_arguments", 0}, {"partially_absorbed_arguments", 0}, {"absorbed_results", 0}};
+      if (O.SelfRecursion) {
+        Row["recursion_contract"] = "direct-self-activation-v1";
+        Row["self_recursive"] = SelfRecursive.contains(F);
+        Row["recursive_calls_rewritten"] = 0;
+      }
       if (Reason.empty()) { Allocas = 0; encode(*F, Row); }
       Report.push_back(std::move(Row));
     }
@@ -367,7 +390,8 @@ std::string mergeGroupLabel(const Function &F) {
 // as acyclic stays acyclic whatever chunking merging picks.
 void buildMergeView(Module &M, const SmallPtrSetImpl<Function *> &Reserved,
                     DenseMap<const Function *, unsigned> &Node,
-                    SmallVectorImpl<SmallVector<unsigned, 4>> &Edges) {
+                    SmallVectorImpl<SmallVector<unsigned, 4>> &Edges,
+                    const SmallPtrSetImpl<const Function *> *AllowedSelf = nullptr) {
   // Module order throughout: no pointer or use-list order reaches a node id.
   StringMap<unsigned> Groups;
   for (Function &F : M) {
@@ -390,10 +414,14 @@ void buildMergeView(Module &M, const SmallPtrSetImpl<Function *> &Reserved,
     unsigned From = Node.find(&F)->second;
     for (Instruction &I : instructions(F))
       if (auto *C = dyn_cast<CallBase>(&I))
-        if (Function *G = C->getCalledFunction())
+        if (Function *G = C->getCalledFunction()) {
+          // Ignore only an already-proved self edge on a reserved standalone
+          // interface. A merge-induced multi-node cycle must still lose.
+          if (G == &F && Reserved.contains(&F) && AllowedSelf && AllowedSelf->contains(&F)) continue;
           if (auto It = Node.find(G);
               It != Node.end() && !llvm::is_contained(Edges[From], It->second))
             Edges[From].push_back(It->second);
+        }
   }
 }
 
@@ -487,8 +515,8 @@ json::Array nativeFusionAbsorption(ArrayRef<std::string> Before, const Module &A
 }
 
 json::Array planNativeCallPolicy(Module &M, const NativeCallPolicyOptions &O) {
-  SmallPtrSet<const Function *, 16> Cyclic;
-  findCycles(M, Cyclic);
+  SmallPtrSet<const Function *, 16> Cyclic, SelfRecursive;
+  findCycles(M, Cyclic, &SelfRecursive);
   // Module order. Source-owned is the denominator the driver stamped before
   // any obfuscation pass ran, so a function neither pass takes still gets a row.
   SmallVector<Function *, 64> Source;
@@ -503,7 +531,7 @@ json::Array planNativeCallPolicy(Module &M, const NativeCallPolicyOptions &O) {
   unsigned Budget = 0;
   for (Function *F : Source) {
     SmallPtrSet<const Function *, 8> Callers;
-    Blocker[F] = interfaceBlocker(*F, Cyclic, Callers);
+    Blocker[F] = interfaceBlocker(*F, Cyclic, Callers, O.SelfRecursion && SelfRecursive.contains(F));
     if (!Blocker[F].empty() || Budget >= O.Interfaces) continue;
     Reserved.insert(F);
     ++Budget;
@@ -517,7 +545,7 @@ json::Array planNativeCallPolicy(Module &M, const NativeCallPolicyOptions &O) {
     Changed = false;
     DenseMap<const Function *, unsigned> Node;
     SmallVector<SmallVector<unsigned, 4>, 64> Edges;
-    buildMergeView(M, Reserved, Node, Edges);
+    buildMergeView(M, Reserved, Node, Edges, O.SelfRecursion ? &SelfRecursive : nullptr);
     SmallVector<bool, 64> OnCycle;
     cyclicNodes(Edges, OnCycle);
     for (Function *F : Source)

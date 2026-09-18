@@ -78,6 +78,8 @@ cl::opt<bool> NativePredicateRegions("native-predicate-regions", cl::desc("Conne
 cl::opt<bool> NativeRegionalFamilies("native-regional-families", cl::desc("Seeded XOR/additive families for whole supported components"), cl::init(false));
 cl::opt<bool> NativeEncodedCalls("native-encoded-calls",
     cl::desc("Private encoded-call interfaces: integer arguments and results cross a private call as (E, R) pairs"), cl::init(false));
+cl::opt<bool> NativeSelfRecursion("native-self-recursion",
+    cl::desc("Allow proved direct self-recursion in private integer interfaces"), cl::init(false));
 cl::opt<bool> NativeCallPolicy("native-call-policy",
     cl::desc("W5: arbitrate merging against encoded private calls before either runs, and record the winner per function"), cl::init(false));
 cl::opt<bool> NativeSupportRegions("native-support-regions", cl::desc("Absorb bounded generated data decoders before region planning"), cl::init(false));
@@ -271,6 +273,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("connected subfeatures require native-region-plan=connected");
   if (NativeCallPolicy && !NativeEncodedCalls)
     report_fatal_error("native-call-policy requires native-encoded-calls");
+  if (NativeSelfRecursion && !NativeEncodedCalls)
+    report_fatal_error("native-self-recursion requires native-encoded-calls");
   if (NativeMemorySSA && !NativeMemory) report_fatal_error("native-memory-ssa requires native-memory");
   if (NativeConnectedAggregates && !NativeMemorySSA)
     report_fatal_error("native-connected-aggregates requires native-memory-ssa");
@@ -348,6 +352,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   json::Array CallPolicy;
   if (NativeCallPolicy) {
     obf::NativeCallPolicyOptions PolicyOptions;
+    PolicyOptions.SelfRecursion = NativeSelfRecursion;
     CallPolicy = obf::planNativeCallPolicy(M, PolicyOptions);
   }
 
@@ -392,6 +397,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   json::Array CallCoverage;
   if (NativeEncodedCalls) {
     obf::NativeCallOptions Options;
+    Options.SelfRecursion = NativeSelfRecursion;
     CallCoverage = obf::encodeNativeCalls(M, PreparedCache.ModuleSeed, Options);
     // Encoding replaces a private definition with its pair-interface twin, so
     // the parsed per-function configuration is rebuilt by identity before any
@@ -759,6 +765,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"joint_outputs", NativeJointOutputs.getValue()},
                             {"lane_transitions", obf::nativeLaneTransitions()},
                             {"encoded_calls", NativeEncodedCalls.getValue()},
+                            {"self_recursion", NativeSelfRecursion.getValue()},
                             {"call_policy", NativeCallPolicy.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},

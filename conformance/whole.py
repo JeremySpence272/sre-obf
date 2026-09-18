@@ -20,7 +20,7 @@ IR_BUDGET_MULTIPLIER, IR_BUDGET_MAX = 50, 30000
 EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "invariant", "outline",
                "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure",
                "connected-shards", "connected-aggregates", "joint-outputs", "encoded-calls",
-               "call-policy", "plan")
+               "call-policy", "self-recursion", "plan")
 
 # P6 useful data/control relation experiment. "stale-relation" is the
 # canonical-repair arm: transitions are keyed on the live encoded-data word
@@ -94,6 +94,8 @@ def build(args):
         raise ValueError("--semantic-budget requires --region-plan connected")
     if args.call_policy and not args.encoded_calls:
         raise ValueError("--call-policy requires --encoded-calls")
+    if args.self_recursion and not args.encoded_calls:
+        raise ValueError("--self-recursion requires --encoded-calls")
     if args.memory_ssa and not args.memory:
         raise ValueError("--memory-ssa requires --memory")
     if args.connected_aggregates and not args.memory_ssa:

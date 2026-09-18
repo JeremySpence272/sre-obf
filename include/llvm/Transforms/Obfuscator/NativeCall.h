@@ -12,7 +12,7 @@ namespace llvm::obf {
 // and an integer result leaves the same way. This moves the decode off the
 // call boundary only when a later pass consumes the pair directly; on its own
 // it MOVES the decode across the boundary rather than removing it.
-struct NativeCallOptions { unsigned Functions = 32; };
+struct NativeCallOptions { unsigned Functions = 32; bool SelfRecursion = false; };
 
 // Pairs a later pass consumed without materializing a scalar, keyed by the
 // encoded callee's symbol name. Zero everywhere until absorption runs.
@@ -30,7 +30,7 @@ constexpr StringLiteral NativeEncodedCallSuffix = ".sre.encoded";
 // the same helper as `recursive`. This decides once, before either pass runs,
 // which one owns each source-owned function, and records the decision instead
 // of letting pass order settle it silently.
-struct NativeCallPolicyOptions { unsigned Interfaces = 32; };
+struct NativeCallPolicyOptions { unsigned Interfaces = 32; bool SelfRecursion = false; };
 
 // The decision travels on the function, so each later pass reads one recorded
 // fact instead of deriving a competing answer. Its value is the policy.

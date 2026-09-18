@@ -367,6 +367,11 @@ canonical reset alone is not evidence; successful repair time is the metric.
 
 ### W5 — coherent fusion, private calls and activation ownership
 
+Implementation increment: [direct self-recursive activations](NATIVE_SELF_RECURSION_V1.md)
+are available behind an explicit flag, with shared policy/emitter eligibility,
+actual merge coexistence, independent-output and rejection tests. This does not
+complete the joint bundle or closed-object pointer contracts below.
+
 Resolve merge/fusion/call-encoding competition during planning. For each
 eligible internal group choose exactly one policy: fuse into a useful region,
 keep an encoded interface, or preserve a recorded scalar boundary. Do not let

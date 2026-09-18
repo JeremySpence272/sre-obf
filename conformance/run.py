@@ -110,7 +110,7 @@ def feature_flags(args: argparse.Namespace) -> list[str]:
             *(f"-native-{name.replace('_', '-')}={int(getattr(args, name, False))}"
               for name in ("memory_ssa", "predicate_regions", "regional_families", "support_regions", "scale_budget",
                            "scale_structure", "connected_shards", "connected_aggregates",
-                           "joint_outputs", "encoded_calls", "call_policy", "plan")),
+                           "joint_outputs", "encoded_calls", "call_policy", "self_recursion", "plan")),
             f"-native-semantic-budget={getattr(args, 'semantic_budget', 0)}",
             f"-native-lane-transitions={LANE_TRANSITIONS[getattr(args, 'lane_transitions', 'off')]}",
             f"-native-family={args.family}"]
@@ -380,7 +380,7 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--connected-nodes", type=int, default=128)
     for name in ("memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget",
                  "scale-structure", "connected-shards", "connected-aggregates",
-                 "joint-outputs", "encoded-calls", "call-policy", "plan"):
+                 "joint-outputs", "encoded-calls", "call-policy", "self-recursion", "plan"):
         p.add_argument("--" + name, action="store_true")
     p.add_argument("--semantic-budget", type=int, default=0)
     bundle_options.add_options(p)
@@ -431,6 +431,8 @@ def main(argv=None) -> int:
         raise SystemExit("connected subfeatures require --region-plan connected")
     if args.call_policy and not args.encoded_calls:
         raise SystemExit("--call-policy requires --encoded-calls")
+    if args.self_recursion and not args.encoded_calls:
+        raise SystemExit("--self-recursion requires --encoded-calls")
     if not 0 <= args.semantic_budget <= 50:
         raise SystemExit("--semantic-budget must be 0..50")
     if args.memory_ssa and not args.memory:

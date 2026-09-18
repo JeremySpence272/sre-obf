@@ -1,0 +1,174 @@
+"""Actual recursive private activations, merge arbitration and all-output gates."""
+import argparse
+import json
+from pathlib import Path
+import shutil
+
+from conformance.bundle_run import inputs
+from conformance.connected_check import report_violations
+from conformance.process import Runner, ToolFailure, digest, dump
+from conformance.run import ROOT, FIXTURES, opt_command
+
+
+def fixture(width):
+    ty = f"i{width}"
+    lines = ['target triple = "x86_64-unknown-linux-gnu"',
+             'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"',
+             f"define internal {ty} @recur({ty} %x, {ty} %y, i32 %depth) noinline {{", "entry:",
+             "  %stop = icmp eq i32 %depth, 0", "  br i1 %stop, label %base, label %step", "base:",
+             f"  %initial = xor {ty} %x, %y", f"  ret {ty} %initial", "step:",
+             f"  %v0 = add {ty} %x, %y", f"  %v1 = xor {ty} %x, 7", f"  %v2 = mul {ty} %v0, 3",
+             f"  %v3 = or {ty} %v1, %y", f"  %v4 = add {ty} %v2, %v3", f"  %v5 = xor {ty} %v2, %v3",
+             f"  %v6 = mul {ty} %v4, 5", f"  %v7 = add {ty} %v5, %v6", "  %next = sub i32 %depth, 1",
+             f"  %child = notail call {ty} @recur({ty} %v6, {ty} %v7, i32 %next)",
+             f"  %result = xor {ty} %child, %v6", f"  ret {ty} %result", "}",
+             "define internal i64 @ptr_a(ptr %p) noinline {", "entry:", "  %x = load i64, ptr %p",
+             "  %a = mul i64 %x, 3", "  %b = add i64 %a, 17", "  ret i64 %b", "}",
+             "define internal i64 @ptr_b(ptr %p) noinline {", "entry:", "  %x = load i64, ptr %p",
+             "  %a = lshr i64 %x, 11", "  %b = xor i64 %a, %x", "  ret i64 %b", "}",
+             "define void @invoke(i64 %a, i64 %b, ptr %out) {", "entry:"]
+    a, b = "%a", "%b"
+    if width != 64:
+        lines += [f"  %a0 = trunc i64 %a to {ty}", f"  %b0 = trunc i64 %b to {ty}"]
+        a, b = "%a0", "%b0"
+    lines += ["  %d0 = and i64 %b, 15", "  %depth0 = trunc i64 %d0 to i32",
+              "  %shift = lshr i64 %a, 5", "  %d1 = and i64 %shift, 7", "  %depth1 = trunc i64 %d1 to i32",
+              f"  %r0 = call {ty} @recur({ty} {a}, {ty} {b}, i32 %depth0)",
+              f"  %r1 = call {ty} @recur({ty} {b}, {ty} {a}, i32 %depth1)"]
+    for k in range(2):
+        value = f"%r{k}"
+        if width != 64:
+            lines.append(f"  %wide{k} = zext {ty} {value} to i64")
+            value = f"%wide{k}"
+        lines += [f"  %out{k} = getelementptr inbounds i64, ptr %out, i32 {k}", f"  store i64 {value}, ptr %out{k}"]
+    for k, helper in ((2, "ptr_a"), (3, "ptr_b")):
+        lines += [f"  %r{k} = call i64 @{helper}(ptr %out{k - 2})",
+                  f"  %out{k} = getelementptr inbounds i64, ptr %out, i32 {k}", f"  store i64 %r{k}, ptr %out{k}"]
+    return "\n".join(lines + ["  ret void", "}"]) + "\n"
+
+
+def oracle(a, b, width):
+    mask = (1 << width) - 1
+    def recurse(x, y, depth):
+        parents = []
+        for _ in range(depth):
+            v2 = (((x + y) & mask) * 3) & mask
+            v3 = (x ^ 7) | y
+            v6 = (((v2 + v3) & mask) * 5) & mask
+            v7 = ((v2 ^ v3) + v6) & mask
+            parents.append(v6)
+            x, y = v6, v7
+        out = x ^ y
+        for value in reversed(parents): out ^= value
+        return out
+    left = recurse(a & mask, b & mask, b & 15)
+    right = recurse(b & mask, a & mask, (a >> 5) & 7)
+    return [left, right, (left * 3 + 17) & ((1 << 64) - 1), right ^ (right >> 11)]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--toolchain-image", required=True)
+    parser.add_argument("--widths", type=int, nargs="+", choices=(8, 16, 32, 64), default=[8, 32])
+    parser.add_argument("--seeds", type=int, nargs="+", default=[1])
+    parser.add_argument("--random-inputs", type=int, default=256)
+    parser.add_argument("--merge", action="store_true", help="require actual coexistence with a separately merged pointer group")
+    parser.add_argument("--ablation-plugin", type=Path, help="require feature-off IR equality with this prior plugin")
+    args = parser.parse_args()
+    out = args.out.resolve()
+    out.mkdir(parents=True, exist_ok=False)
+    plugin = out / "Obfuscator.so"
+    shutil.copy2(ROOT / "build/Obfuscator.so", plugin)
+    runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out,), timeout=240)
+    result = {"schema": "sre-recursive-call-conformance-v1", "passed": False,
+              "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False}
+    flags = ["-passes=native-obfuscation", "-native-level=smoke",
+             "-native-passes=constenc,fmerge" if args.merge else "-native-passes=constenc",
+             "-native-strings=0", "-native-data=0", "-native-helper-hardening=0", "-native-late-constants=0",
+             f"-native-merge={int(args.merge)}", "-native-values=1", "-native-values-wide=1",
+             "-native-region-plan=connected", "-native-connected-nodes=128", "-native-predicate-regions=1",
+             "-native-encoded-calls=1", "-native-self-recursion=1", "-native-call-policy=1", "-native-plan=1",
+             "-native-regional-families=1", "-obf-deterministic", "-obf-verify"]
+    try:
+        driver = out / "driver.o"
+        runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
+        for width in args.widths:
+            case = out / f"i{width}"
+            case.mkdir()
+            source = case / "clean.ll"
+            source.write_text(fixture(width))
+            vectors = inputs(width, args.random_inputs)
+            pairs = [tuple(map(int, line.split())) for line in vectors.splitlines()]
+            expected = "".join(" ".join(f"{v:016x}" for v in oracle(a, b, width)) + "\n" for a, b in pairs).encode()
+            clean = case / "clean"
+            runner.run(["clang", str(source), str(driver), "-pthread", "-o", str(clean)])
+            if runner.run([str(clean)], stdin=vectors) != expected: raise ToolFailure("clean recursion oracle mismatch")
+            for seed in args.seeds:
+                native, report = case / f"seed-{seed}.ll", case / f"seed-{seed}.json"
+                command = opt_command(plugin) + flags + [f"-obf-seed={seed}", f"-native-report-json={report}",
+                                                        "-S", str(source), "-o", str(native)]
+                runner.run(command)
+                data = json.loads(report.read_text())
+                errors = report_violations(data)
+                if errors: raise ToolFailure("; ".join(errors))
+                row = next(r for r in data["encoded_calls"] if r["function"] == "recur")
+                policy = next(r for r in data["call_policy"] if r["function"] == "recur")
+                if row["status"] != "encoded" or row["recursive_calls_rewritten"] != 1 or row["call_sites_rewritten"] != 3:
+                    raise ToolFailure(f"recursive interface not actually emitted: {row}")
+                if policy["policy"] != "encoded-interface" or policy["outcome"] != "encoded":
+                    raise ToolFailure("recursive arbitration did not retain its interface")
+                if args.merge and not data["merged_groups"]: raise ToolFailure("merge flag did not emit a merged group")
+                hashes = digest(native), digest(report)
+                runner.run(command)
+                if hashes != (digest(native), digest(report)): raise ToolFailure("nondeterministic recursive interface")
+                normalized = case / f"seed-{seed}-post-o2.ll"
+                runner.run(["opt", "-passes=default<O2>,verify", "-S", str(native), "-o", str(normalized)])
+                for arm, ir in (("native", native), ("post-o2", normalized)):
+                    binary = case / f"seed-{seed}-{arm}"
+                    runner.run(["clang", str(ir), str(driver), "-pthread", "-o", str(binary)])
+                    if runner.run([str(binary)], stdin=vectors) != expected: raise ToolFailure(f"recursive mismatch: {arm}")
+                    runner.run([str(binary), "--threads"])
+                if args.ablation_plugin:
+                    control = case / f"seed-{seed}-off.ll"
+                    control_report = case / f"seed-{seed}-off.json"
+                    off_flags = [f for f in flags if f != "-native-self-recursion=1"]
+                    runner.run(opt_command(plugin) + off_flags + [f"-obf-seed={seed}",
+                        f"-native-report-json={control_report}", "-S", str(source), "-o", str(control)])
+                    off = json.loads(control_report.read_text())
+                    if report_violations(off): raise ToolFailure("invalid feature-off report")
+                    off_policy = next((r for r in off["call_policy"] if r["function"] == "recur"), None)
+                    if not off_policy or off_policy["interface_blocker"] != "recursive":
+                        raise ToolFailure("feature-off policy did not exclude the recursive interface")
+                    # With the interface excluded, fusion may own and erase
+                    # the original function. Its policy row is the denominator.
+                    off_row = next((r for r in off["encoded_calls"] if r["function"] == "recur"), None)
+                    if off_row and (off_row["status"] != "skipped" or off_row["reason"] != "recursive"):
+                        raise ToolFailure("feature-off emitter did not exclude the recursive interface")
+                    previous = case / f"seed-{seed}-previous.ll"
+                    runner.run(opt_command(args.ablation_plugin.resolve()) + off_flags + [f"-obf-seed={seed}",
+                        "-S", str(source), "-o", str(previous)])
+                    if control.read_bytes() != previous.read_bytes():
+                        raise ToolFailure("feature-off IR differs from the prior plugin")
+                    binary = case / f"seed-{seed}-off"
+                    runner.run(["clang", str(control), str(driver), "-pthread", "-o", str(binary)])
+                    if runner.run([str(binary)], stdin=vectors) != expected:
+                        raise ToolFailure("feature-off oracle mismatch")
+                    result["ablation_plugin_sha256"] = digest(args.ablation_plugin.resolve())
+                result["cases"].append({"width": width, "seed": seed, "vectors": len(pairs),
+                    "merge_requested": args.merge, "merged_groups": len(data["merged_groups"]),
+                    "interface": row, "policy": policy, "passed": True})
+                dump(out / "summary.json", result)
+                print(f"i{width} seed-{seed}: passed", flush=True)
+        result["passed"] = True
+    except (ToolFailure, OSError, ValueError) as exc:
+        result["error"] = str(exc)
+    finally:
+        result["commands"] = runner.records
+        dump(out / "summary.json", result)
+    print(json.dumps({k: result.get(k) for k in ("passed", "error")}))
+    return 0 if result["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
