@@ -34,6 +34,7 @@ def main():
     workload.add_argument("--private-calls", action="store_true", help="recursive_run bundle-input case and matched off arms")
     workload.add_argument("--predicate", action="store_true", help="predicate_run case with matched off arms and exact positive inputs")
     parser.add_argument("--call-output-ablation", action="store_true", help="private-calls disabled arms turn off outputs, leaving inputs on")
+    parser.add_argument("--joint-call-ablation", action="store_true", help="private-calls controls retain consumers with independent argument pairs")
     parser.add_argument("--control-ablation", action="store_true", help="loop disabled arms retain flattening without bundle control")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
@@ -43,6 +44,8 @@ def main():
     args = parser.parse_args()
     if args.call_output_ablation and not args.private_calls:
         parser.error("--call-output-ablation requires --private-calls")
+    if args.joint_call_ablation and (not args.private_calls or args.call_output_ablation):
+        parser.error("--joint-call-ablation requires --private-calls and excludes --call-output-ablation")
     if args.control_ablation and not args.loop:
         parser.error("--control-ablation requires --loop")
     out = args.out.resolve()
@@ -51,7 +54,8 @@ def main():
     result = {"schema": "sre-bundle-decompiler-v1", "passed": False, "scope": "informed-entry",
               "workload": "predicate" if args.predicate else "private-calls" if args.private_calls else "immutable" if args.immutable else "tile" if args.tile else "loop" if args.loop else "straight-line",
               "hardness_evaluated": False, "semantic_recovery": "not_measured", "arms": {}}
-    if args.private_calls: result["private_ablation"] = "outputs" if args.call_output_ablation else "inputs"
+    if args.private_calls:
+        result["private_ablation"] = "joint-arguments" if args.joint_call_ablation else "outputs" if args.call_output_ablation else "inputs"
     try:
         driver = out / "driver.o"
         driver_source = "tile_driver.c" if args.tile or args.immutable or args.private_calls else "bundle_loop_driver.c" if args.loop else "bundle_driver.c"
@@ -70,9 +74,10 @@ def main():
         if args.tile or args.immutable or args.private_calls or args.control_ablation or args.predicate:
             if args.predicate: name = "predicate"
             elif args.control_ablation: name = "control"
-            elif args.private_calls: name = "call-outputs" if args.call_output_ablation else "call-inputs"
+            elif args.private_calls: name = "joint-arguments" if args.joint_call_ablation else "call-outputs" if args.call_output_ablation else "call-inputs"
             else: name = "immutable" if args.immutable else "tiles"
             stem = "disabled" if args.predicate else args.stem + "-disabled"
+            if args.joint_call_ablation: stem = args.stem + "-joint-off"
             selected[name + "-off"] = args.case / (stem + ".ll")
             selected[name + "-off-post-o2"] = args.case / (stem + "-post-o2.ll")
         expected = None

@@ -392,7 +392,10 @@ lets selected bundles consume encoded integer arguments without an intervening
 scalar reconstruction, with distinct partial/full accounting. A separately
 ablated [bundle-to-interface supply path](NATIVE_BUNDLE_CALL_OUTPUTS_V1.md)
 supports encoded argument/result supplies from pure bundles and local tiles.
-Joint multi-value descriptors and closed-object pointer interfaces remain work.
+A default-off [joint argument-tuple path](NATIVE_JOINT_CALL_ARGUMENTS_V1.md)
+now handles two-to-four same-width private parameters with direct bundle
+consumption/supply and matched paired controls. Mixed-width joint groups,
+joint/aggregate returns and closed-object pointer interfaces remain work.
 
 Resolve merge/fusion/call-encoding competition during planning. For each
 eligible internal group choose exactly one policy: fuse into a useful region,

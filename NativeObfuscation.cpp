@@ -81,6 +81,8 @@ cl::opt<bool> NativeEncodedCalls("native-encoded-calls",
     cl::desc("Private encoded-call interfaces: integer arguments and results cross a private call as (E, R) pairs"), cl::init(false));
 cl::opt<bool> NativeSelfRecursion("native-self-recursion",
     cl::desc("Allow proved direct self-recursion in private integer interfaces"), cl::init(false));
+cl::opt<bool> NativeJointCallArguments("native-joint-call-arguments",
+    cl::desc("Bounded same-width private argument tuples with one shared carrier"), cl::init(false));
 cl::opt<bool> NativeCallPolicy("native-call-policy",
     cl::desc("W5: arbitrate merging against encoded private calls before either runs, and record the winner per function"), cl::init(false));
 cl::opt<bool> NativeSupportRegions("native-support-regions", cl::desc("Absorb bounded generated data decoders before region planning"), cl::init(false));
@@ -295,6 +297,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native-call-policy requires native-encoded-calls");
   if (NativeSelfRecursion && !NativeEncodedCalls)
     report_fatal_error("native-self-recursion requires native-encoded-calls");
+  if (NativeJointCallArguments && (!NativeEncodedCalls || !NativeBundles))
+    report_fatal_error("native-joint-call-arguments requires native-encoded-calls and native-bundles");
   if (NativeMemorySSA && !NativeMemory) report_fatal_error("native-memory-ssa requires native-memory");
   if (NativeConnectedAggregates && !NativeMemorySSA)
     report_fatal_error("native-connected-aggregates requires native-memory-ssa");
@@ -418,7 +422,9 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   if (NativeEncodedCalls) {
     obf::NativeCallOptions Options;
     Options.SelfRecursion = NativeSelfRecursion;
+    Options.JointArguments = NativeJointCallArguments;
     CallCoverage = obf::encodeNativeCalls(M, PreparedCache.ModuleSeed, Options);
+    saveNativeStage(M, "interfaces.ll");
     // Encoding replaces a private definition with its pair-interface twin, so
     // the parsed per-function configuration is rebuilt by identity before any
     // later stage looks a function up. Erased originals must not leave a stale
@@ -803,6 +809,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"lane_transitions", obf::nativeLaneTransitions()},
                             {"encoded_calls", NativeEncodedCalls.getValue()},
                             {"self_recursion", NativeSelfRecursion.getValue()},
+                            {"joint_call_arguments", NativeJointCallArguments.getValue()},
                             {"call_policy", NativeCallPolicy.getValue()},
                             {"late_constants", NativeLate.getValue()}}},
                         {"merged_groups", std::move(MergedCoverage)},

@@ -1480,7 +1480,8 @@ public:
       // Both coordinates have to move together, so the mask must be the
       // private activation read this pair hides behind and nothing else: one
       // use here and one in the call or the returned struct.
-      if (!Mask || Owner.empty() || RegionOf.count(Mask) || !Mask->hasNUses(2)) {
+      if (X->getMetadata("sre.native.call.joint-split") ||
+          !Mask || Owner.empty() || RegionOf.count(Mask) || !Mask->hasNUses(2)) {
         // The pair could not be supplied to the interface, so the plaintext
         // reconstruction stays. That is a boundary, whatever the metadata says.
         recordBoundary(plan::Boundary::InterfaceMismatch, X);

@@ -10,7 +10,9 @@ from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, FIXTURES, opt_command
 
 
-def fixture(width, straight_line=False, direct_return=False):
+def fixture(width, straight_line=False, direct_return=False, homogeneous=False, drop_unused_depth=False):
+    if drop_unused_depth and not straight_line:
+        raise ValueError("cannot drop a live recursion depth")
     ty = f"i{width}"
     lines = ['target triple = "x86_64-unknown-linux-gnu"',
              'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"',
@@ -57,6 +59,13 @@ def fixture(width, straight_line=False, direct_return=False):
         source = source.replace(f"  %fallback = xor {ty} %v7, 11\n" +
             f"  %mixed = xor {ty} %v6, %v7\n  %result = select i1 %zero, {ty} %fallback, {ty} %mixed\n  ret {ty} %result",
             f"  br i1 %zero, label %rare, label %done\nrare:\n  ret {ty} 11\ndone:\n  ret {ty} %v7", 1)
+    if drop_unused_depth:
+        source = source.replace(', i32 %depth)', ')').replace(', i32 %depth0)', ')').replace(', i32 %depth1)', ')')
+    if homogeneous and width != 32:
+        source = source.replace("i32 %depth", f"{ty} %depth").replace("i32 %next", f"{ty} %next")
+        for k in (0, 1):
+            source = source.replace(f"%depth{k} = trunc i64 %d{k} to i32",
+                f"%depth{k} = trunc i64 %d{k} to {ty}" if width != 64 else f"%depth{k} = or i64 %d{k}, 0")
     return source
 
 
@@ -93,14 +102,20 @@ def main():
     parser.add_argument("--ablation-plugin", type=Path, help="require feature-off IR equality with this prior plugin")
     parser.add_argument("--bundle-call-inputs", action="store_true")
     parser.add_argument("--bundle-call-outputs", action="store_true")
+    parser.add_argument("--joint-call-arguments", action="store_true")
+    parser.add_argument("--homogeneous-arguments", action="store_true", help="use the word type for bounded recursion depth too")
+    parser.add_argument("--drop-unused-depth", action="store_true", help="two-argument straight-line control without an unused depth formal")
     parser.add_argument("--straight-line", action="store_true", help="nonrecursive all-input-absorption control")
     parser.add_argument("--direct-return", action="store_true", help="straight-line control with a direct bundle result")
     parser.add_argument("--transfer-family", choices=("xor", "additive", "seeded"), default="seeded")
     parser.add_argument("--no-bundle-pins", action="store_true")
     parser.add_argument("--connected-nodes", type=int, default=128)
+    parser.add_argument("--profile", choices=("smoke", "max"), default="smoke")
+    parser.add_argument("--passes", help="explicit native application pass selection")
     args = parser.parse_args()
     if args.direct_return and not args.straight_line: parser.error("--direct-return requires --straight-line")
-    if args.ablation_plugin and (args.straight_line or args.bundle_call_inputs or args.bundle_call_outputs):
+    if args.drop_unused_depth and not args.straight_line: parser.error("--drop-unused-depth requires --straight-line")
+    if args.ablation_plugin and (args.straight_line or args.bundle_call_inputs or args.bundle_call_outputs or args.joint_call_arguments):
         parser.error("recursion prior-plugin ablation is separate from bundle-input controls")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
@@ -108,20 +123,22 @@ def main():
     shutil.copy2(ROOT / "build/Obfuscator.so", plugin)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out,), timeout=240)
     result = {"schema": "sre-recursive-call-conformance-v1", "passed": False,
-              "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False}
-    flags = ["-passes=native-obfuscation", "-native-level=smoke",
-             "-native-passes=constenc,fmerge" if args.merge else "-native-passes=constenc",
+              "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False,
+              "profile": args.profile, "passes": args.passes or ("constenc,fmerge" if args.merge else "constenc")}
+    flags = ["-passes=native-obfuscation", f"-native-level={args.profile}",
+             *([] if result['passes'] == 'all' else [f"-native-passes={result['passes']}"]),
              "-native-strings=0", "-native-data=0", "-native-helper-hardening=0", "-native-late-constants=0",
              f"-native-merge={int(args.merge)}", "-native-values=1", "-native-values-wide=1",
              "-native-region-plan=connected", f"-native-connected-nodes={args.connected_nodes}", "-native-predicate-regions=1",
              "-native-encoded-calls=1", "-native-self-recursion=1", "-native-call-policy=1", "-native-plan=1",
              "-native-regional-families=1", "-obf-deterministic", "-obf-verify"]
-    if args.bundle_call_inputs or args.bundle_call_outputs:
+    if args.bundle_call_inputs or args.bundle_call_outputs or args.joint_call_arguments:
         flags += ["-native-bundles=1",
                   f"-native-transfer-family={args.transfer_family}",
                   f"-native-bundle-pins={int(not args.no_bundle_pins)}"]
     if args.bundle_call_inputs: flags += ["-native-bundle-call-inputs=1"]
     if args.bundle_call_outputs: flags += ["-native-bundle-call-outputs=1"]
+    if args.joint_call_arguments: flags += ["-native-joint-call-arguments=1"]
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "tile_driver.c"), "-o", str(driver)])
@@ -129,7 +146,7 @@ def main():
             case = out / f"i{width}"
             case.mkdir()
             source = case / "clean.ll"
-            source.write_text(fixture(width, args.straight_line, args.direct_return))
+            source.write_text(fixture(width, args.straight_line, args.direct_return, args.homogeneous_arguments, args.drop_unused_depth))
             vectors = inputs(width, args.random_inputs)
             if args.direct_return:
                 # v6 == 0 exactly: 3*(16+y) + (23|y) == 2**width.
@@ -144,12 +161,17 @@ def main():
             for seed in args.seeds:
                 native, report = case / f"seed-{seed}.ll", case / f"seed-{seed}.json"
                 command = opt_command(plugin) + flags + [f"-obf-seed={seed}", f"-native-report-json={report}",
+                                                        f"-native-stage-dir={case / f'seed-{seed}-stages'}",
                                                         "-S", str(source), "-o", str(native)]
                 runner.run(command)
                 data = json.loads(report.read_text())
                 errors = report_violations(data)
                 if errors: raise ToolFailure("; ".join(errors))
                 row = next(r for r in data["encoded_calls"] if r["function"] == "recur")
+                if args.joint_call_arguments:
+                    expected_joint = width == 32 or args.homogeneous_arguments or args.drop_unused_depth
+                    if (row["joint_arguments"]["status"] == "joint") != expected_joint:
+                        raise ToolFailure("joint argument ABI did not match source width contract")
                 policy = next(r for r in data["call_policy"] if r["function"] == "recur")
                 recursive = not args.straight_line
                 if row["status"] != "encoded" or row["recursive_calls_rewritten"] != int(recursive) or row["call_sites_rewritten"] != 2 + int(recursive):
@@ -177,6 +199,22 @@ def main():
                     runner.run(["clang", str(ir), str(driver), "-pthread", "-o", str(binary)])
                     if runner.run([str(binary)], stdin=vectors) != expected: raise ToolFailure(f"recursive mismatch: {arm}")
                     runner.run([str(binary), "--threads"])
+                if args.joint_call_arguments:
+                    off = case / f"seed-{seed}-joint-off.ll"
+                    off_report = off.with_suffix(".json")
+                    runner.run(opt_command(plugin) + [f for f in flags if f != "-native-joint-call-arguments=1"] +
+                        [f"-obf-seed={seed}", f"-native-report-json={off_report}", "-S", str(source), "-o", str(off)])
+                    off_data = json.loads(off_report.read_text())
+                    if report_violations(off_data) or off_data["features"]["joint_call_arguments"]:
+                        raise ToolFailure("invalid joint-off interface report")
+                    off_o2 = case / f"seed-{seed}-joint-off-post-o2.ll"
+                    runner.run(["opt", "-passes=default<O2>,verify", "-S", str(off), "-o", str(off_o2)])
+                    for ir in (off, off_o2):
+                        binary = ir.with_suffix(".bin")
+                        runner.run(["clang", str(ir), str(driver), "-pthread", "-o", str(binary)])
+                        if runner.run([str(binary)], stdin=vectors) != expected:
+                            raise ToolFailure("joint-off full-output mismatch")
+                        runner.run([str(binary), "--threads"])
                 if args.bundle_call_inputs or args.bundle_call_outputs:
                     disabled = case / f"seed-{seed}-disabled.ll"
                     disabled_report = case / f"seed-{seed}-disabled.json"

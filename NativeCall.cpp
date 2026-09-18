@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/NativeCall.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleMath.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -148,6 +149,62 @@ class Interfaces {
   DenseMap<Function *, AllocaInst *> Slots;
   unsigned Allocas = 0, Encoded = 0;
 
+  // A bounded, homogeneous private argument tuple. Return values retain the
+  // existing pair ABI. Descriptor values are build constants, not secrets.
+  struct JointPlan {
+    SmallVector<uint64_t, 4> Salts;
+    SmallVector<unsigned, 4> Rotations;
+    unsigned MaskInstructions = 0;
+    bool enabled() const { return !Salts.empty(); }
+  };
+
+  JointPlan jointPlan(Function &F, json::Object &Row) {
+    JointPlan P;
+    if (!O.JointArguments) return P;
+    StringRef Reason;
+    unsigned N = F.arg_size(), Sites = sites(F).size();
+    if (N < 2 || N > 4) Reason = "argument-count";
+    else if (llvm::any_of(F.args(), [&](const Argument &A) {
+               return A.getType() != F.getArg(0)->getType(); })) Reason = "mixed-argument-widths";
+    else if (Sites > 8) Reason = "call-site-limit";
+    json::Object Contract{{"contract", "triangular-call-arguments-v1"},
+        {"status", Reason.empty() ? "joint" : "paired-fallback"}, {"reason", Reason.str()},
+        {"abi_words", 2 * N}, {"mask_reservation", 0}, {"mask_instructions", 0}};
+    if (Reason.empty()) {
+      unsigned W = F.getArg(0)->getType()->getIntegerBitWidth();
+      Rng R = RNG.fork("joint-arguments").fork(F.getName());
+      json::Array Salts, Rotations;
+      for (unsigned K = 0; K < N; ++K) {
+        APInt Salt(W, R.u64());
+        SmallString<16> Hex;
+        Salt.toStringUnsigned(Hex, 16);
+        P.Salts.push_back(Salt.getZExtValue()); Salts.push_back(Hex.str().str());
+        P.Rotations.push_back(1 + R.u64() % (W - 1)); Rotations.push_back(P.Rotations.back());
+      }
+      Contract["descriptor"] = json::Object{{"width", W}, {"family", "triangular-xor-v1"},
+          {"salts_hex", std::move(Salts)}, {"rotations", std::move(Rotations)}};
+      Contract["abi_words"] = N + 1;
+      // At most seven mask instructions per argument at each rewritten site
+      // and at entry. The reserve allows one extra per lane; no growth caps
+      // are raised. The bounded eight-site contract limits the reserve to 288.
+      Contract["mask_reservation"] = 8 * N * (Sites + 1);
+      Row["representation"] = "triangular-xor-arguments-v1";
+    }
+    Row["joint_arguments"] = std::move(Contract);
+    return P;
+  }
+
+  Value *jointMask(IRBuilder<> &B, ArrayRef<Value *> Z, Value *Carrier,
+                   unsigned K, JointPlan &P) {
+    auto End = B.GetInsertPoint();
+    auto *BB = B.GetInsertBlock();
+    Instruction *Prev = End == BB->begin() ? nullptr : &*std::prev(End);
+    Value *R = bundle::mask(B, Z, Carrier, K, P.Salts[K], P.Rotations[K]);
+    auto Begin = Prev ? std::next(Prev->getIterator()) : BB->begin();
+    for (auto I = Begin; I != End; ++I) { state(&*I); ++P.MaskInstructions; }
+    return R;
+  }
+
   // Per-activation mask material. It is an entry alloca, never a module
   // global, so concurrent activations of one interface never share it. The
   // slot seeds itself from its own address and every read is volatile: a pair
@@ -207,7 +264,7 @@ class Interfaces {
     return Sites;
   }
 
-  // Move F's body into a twin whose interface carries (E, R) pairs, rebuild
+  // Move F's body into a pair/tuple-interface twin, rebuild
   // every parameter and result inside the twin, and rewrite every call site.
   // The original is erased: a wrapper here would be a duplicate plaintext body
   // with the same summary the encoded interface is meant to cost an attacker.
@@ -215,8 +272,13 @@ class Interfaces {
     LLVMContext &Ctx = F.getContext();
     std::string Owner = F.getName().str();
     Type *Ret = F.getReturnType();
+    JointPlan Joint = jointPlan(F, Row);
     SmallVector<Type *, 16> Params;
-    for (Argument &A : F.args()) { Params.push_back(A.getType()); Params.push_back(A.getType()); }
+    for (Argument &A : F.args()) {
+      Params.push_back(A.getType());
+      if (!Joint.enabled()) Params.push_back(A.getType());
+    }
+    if (Joint.enabled()) Params.push_back(F.getArg(0)->getType());
     Type *Out = Ret->isVoidTy() ? Ret : cast<Type>(StructType::get(Ctx, {Ret, Ret}));
     auto *NF = Function::Create(FunctionType::get(Out, Params, false),
         GlobalValue::InternalLinkage, F.getName() + NativeEncodedCallSuffix, &M);
@@ -237,13 +299,19 @@ class Interfaces {
 
     BasicBlock &Entry = NF->getEntryBlock();
     IRBuilder<> B(&Entry, Entry.begin());
+    SmallVector<Value *, 4> InputState;
     for (unsigned N = 0; N < F.arg_size(); ++N) {
-      Argument *E = NF->getArg(2 * N), *R = NF->getArg(2 * N + 1);
-      E->setName("sre.call.e"); R->setName("sre.call.r");
+      Argument *E = NF->getArg(Joint.enabled() ? N : 2 * N);
+      Value *R = Joint.enabled() ? jointMask(B, InputState, NF->getArg(F.arg_size()), N, Joint) :
+                                  NF->getArg(2 * N + 1);
+      E->setName("sre.call.e");
+      if (!Joint.enabled()) R->setName("sre.call.r");
       auto *Plain = cast<Instruction>(B.CreateXor(E, R, "sre.call.arg"));
       Plain->setMetadata("sre.native.call.arg", MDNode::get(Ctx, {}));
       F.getArg(N)->replaceAllUsesWith(Plain);
+      InputState.push_back(E);
     }
+    if (Joint.enabled()) NF->getArg(F.arg_size())->setName("sre.call.carrier");
     unsigned Returns = 0;
     if (!Ret->isVoidTy())
       for (BasicBlock &BB : *NF) {
@@ -266,14 +334,22 @@ class Interfaces {
       SelfSites += &Host == NF;
       IRBuilder<> CB(C);
       SmallVector<Value *, 16> Args;
+      SmallVector<Value *, 4> State;
+      Value *Carrier = Joint.enabled() ? mask(CB, Host, C->getArgOperand(0)->getType(),
+                                              Owner, "joint-carrier", Site, 0) : nullptr;
       for (unsigned N = 0; N < C->arg_size(); ++N) {
         Value *X = C->getArgOperand(N);
-        Value *R = mask(CB, Host, X->getType(), Owner, "split", Site, N);
+        Value *R = Joint.enabled() ? jointMask(CB, State, Carrier, N, Joint) :
+                                    mask(CB, Host, X->getType(), Owner, "split", Site, N);
         auto *E = cast<Instruction>(CB.CreateXor(X, R, "sre.call.split"));
         E->setMetadata("sre.native.call.split", MDNode::get(Ctx, {}));
+        if (Joint.enabled()) E->setMetadata("sre.native.call.joint-split", MDNode::get(Ctx, {}));
         E->setDebugLoc(C->getDebugLoc());
-        Args.push_back(E); Args.push_back(R);
+        Args.push_back(E);
+        if (!Joint.enabled()) Args.push_back(R);
+        State.push_back(E);
       }
+      if (Joint.enabled()) Args.push_back(Carrier);
       auto *NC = CB.CreateCall(NF, Args);
       NC->setCallingConv(NF->getCallingConv());
       if (C->isNoTailCall()) NC->setTailCallKind(CallInst::TCK_NoTail);
@@ -298,6 +374,7 @@ class Interfaces {
     Row["call_sites_rewritten"] = Site;
     if (O.SelfRecursion) Row["recursive_calls_rewritten"] = SelfSites;
     Row["activation_allocas"] = Allocas;
+    if (Joint.enabled()) (*Row.getObject("joint_arguments"))["mask_instructions"] = Joint.MaskInstructions;
     if (!F.use_empty()) report_fatal_error("native encoded call left a plaintext use");
     F.eraseFromParent();
     ++Encoded;
@@ -347,6 +424,11 @@ public:
           {"wrapper_retained", false}, {"representation", "xor-pair-v1"},
           {"encoded_function", ""}, {"activation_allocas", 0},
           {"absorbed_arguments", 0}, {"partially_absorbed_arguments", 0}, {"absorbed_results", 0}};
+      if (O.JointArguments) {
+        json::Array ArgumentWidths;
+        for (Argument &A : F->args()) ArgumentWidths.push_back(supported(A.getType()) ? A.getType()->getIntegerBitWidth() : 0);
+        Row["argument_widths"] = std::move(ArgumentWidths);
+      }
       if (O.SelfRecursion) {
         Row["recursion_contract"] = "direct-self-activation-v1";
         Row["self_recursive"] = SelfRecursive.contains(F);
@@ -632,7 +714,24 @@ json::Array encodeNativeCalls(Module &M, uint64_t Seed, const NativeCallOptions 
 
 namespace {
 const Function *bundleSupplyOwner(const Instruction &I, const Value *V) {
-  if (I.getOpcode() != Instruction::Xor || I.getOperand(0) != V || !I.hasOneUse()) return nullptr;
+  if (I.getOpcode() != Instruction::Xor || I.getOperand(0) != V) return nullptr;
+  if (I.getMetadata("sre.native.call.joint-split")) {
+    // A coordinate also feeds the next argument's mask. Supplying it must
+    // remask under the existing destination relation, never replace that
+    // relation independently as the older two-word interface allowed.
+    const Function *Owner = nullptr;
+    unsigned Sites = 0;
+    for (const Use &U : I.uses()) {
+      if (const auto *C = dyn_cast<CallInst>(U.getUser()); C && C->isArgOperand(&U) && C->getCalledFunction()) {
+        Owner = C->getCalledFunction(); ++Sites;
+      } else {
+        const auto *User = dyn_cast<Instruction>(U.getUser());
+        if (!User || !User->getMetadata("sre.native.call.state")) return nullptr;
+      }
+    }
+    return Sites == 1 ? Owner : nullptr;
+  }
+  if (!I.hasOneUse()) return nullptr;
   if (I.getMetadata("sre.native.call.split")) {
     const auto *C = dyn_cast<CallInst>(*I.user_begin());
     return C && C->isArgOperand(&*I.use_begin()) ? C->getCalledFunction() : nullptr;

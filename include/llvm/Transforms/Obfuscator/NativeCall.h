@@ -8,12 +8,17 @@
 #include <vector>
 
 namespace llvm::obf {
-// P5 private encoded-call interfaces. A private callee stops taking plaintext
-// scalars: each integer argument arrives as a pair (E, R) with x = E xor R,
-// and an integer result leaves the same way. This moves the decode off the
+// P5 private encoded-call interfaces. By default each integer argument arrives
+// as a pair (E, R) with x = E xor R, and an integer result leaves the same way.
+// JointArguments optionally shares a carrier across a bounded homogeneous
+// argument tuple; the callee derives each R from the descriptor/coordinates.
+// Neither mode changes the public ABI. This moves the decode off the
 // call boundary only when a later pass consumes the pair directly; on its own
 // it MOVES the decode across the boundary rather than removing it.
-struct NativeCallOptions { unsigned Functions = 32; bool SelfRecursion = false; };
+struct NativeCallOptions {
+  unsigned Functions = 32;
+  bool SelfRecursion = false, JointArguments = false;
+};
 
 // Pairs a later pass consumed without materializing a scalar, keyed by the
 // encoded callee's symbol name. Zero everywhere until absorption runs.

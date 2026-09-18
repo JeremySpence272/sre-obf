@@ -7,6 +7,7 @@ from conformance.bundle_check import bundle_violations
 from conformance.bundle_control import bundle_control_violations
 from conformance.bundle_predicates import predicate_violations
 from conformance.call_bundle_check import call_bundle_violations, call_supply_violations
+from conformance.joint_call_check import joint_call_violations
 from conformance.tile_check import tile_violations
 from conformance.immutable_check import immutable_violations
 from conformance.continuity_selection import continuity_violations
@@ -42,7 +43,7 @@ def report_violations(report):
     violations = []
     for check in (invariants, call_violations, policy_violations, plan_violations,
                   bundle_violations, tile_violations, immutable_violations, continuity_violations, call_bundle_violations,
-                  call_supply_violations, bundle_control_violations, predicate_violations):
+                  call_supply_violations, joint_call_violations, bundle_control_violations, predicate_violations):
         try:
             violations.extend(check(report))
         except (KeyError, TypeError, ValueError) as exc:
@@ -212,7 +213,8 @@ def call_violations(report):
                 violations.append(f"{where}: encoded interface rewrote no call site")
             if row["wrapper_retained"]:
                 violations.append(f"{where}: a duplicate plaintext wrapper was retained")
-            if row["representation"] != "xor-pair-v1":
+            allowed = ("xor-pair-v1", "triangular-xor-arguments-v1") if report.get("features", {}).get("joint_call_arguments") else ("xor-pair-v1",)
+            if row["representation"] not in allowed:
                 violations.append(f"{where}: unexpected representation {row['representation']!r}")
             if row["absorbed_arguments"] + row.get("partially_absorbed_arguments", 0) > row["encoded_parameters"]:
                 violations.append(f"{where}: more absorbed argument pairs than parameters")

@@ -343,6 +343,13 @@ requires rejection under the default ceiling as well as testing the tiles-off
 control. `test_tile_width` checks explicit model/report policy and all five-to-eight
 cell shapes. See [the scope and budget limits](../docs/NATIVE_WIDE_TILES_V1.md).
 
+`--joint-call-arguments` opts into bounded homogeneous argument tuples and
+requires bundles plus encoded calls. `joint_call_controls` exercises argument
+counts and site ceilings; `recursive_run --joint-call-arguments` adds a matched
+paired-ABI control. `joint_call_proof` validates actual `interfaces.ll` entry
+slices against supplied descriptors; unknown syntax fails rather than passing.
+See [the supported scope and evidence](../docs/NATIVE_JOINT_CALL_ARGUMENTS_V1.md).
+
 Corpus-lock revision `m0-3` freezes bzip2/cJSON IO manifests under ignored
 `out/v04-frozen-holdouts-20260918/`. Existing seeds and resource caps are unchanged.
 Only unobfuscated reference programs were built during preparation; their
