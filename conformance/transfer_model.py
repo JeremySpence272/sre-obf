@@ -19,6 +19,13 @@ things agree, and it is rejected outright when the fourth test fires.
                     between two recognizable inverses" the plan rejects, so a
                     candidate containing one is rejected here.
 
+No number here is a difficulty measurement. `constant_readback_attack` decodes
+every family in this file exactly, because a carrier's rotation amounts,
+multipliers and constants are operands of emitted instructions and an analyst
+reads them rather than searching for them. The algebraic fits below measure
+whether a *generic* attack that ignores the emitted constants succeeds, which is
+a much weaker question and the only one they answer.
+
 Rule 4 is a rejection criterion only. The masks are ordinary program values that
 the analyst can read, so mask dependence is necessary for a candidate to be
 interesting and is nowhere near sufficient for it to be hard. No score is
@@ -1743,6 +1750,36 @@ def carrier_fit_attack(site, lane=0, degree=2, train=None, test=200, seed=0):
 
 
 
+
+def constant_readback_attack(site, lane=0, trials=200, seed=0):
+  """Decode using the constants the lowering would have emitted.
+
+  This is the attack that matters and the one the other numbers must be read
+  against. A carrier's rotation amounts, multipliers and constants are operands
+  of emitted instructions: a static analyst reads them out of the instruction
+  stream rather than searching for them. So the trial counts reported by
+  `kernel_shape_attack` are an upper bound on a search nobody has to perform,
+  and the network kernel resisting every algebraic fit here means only that
+  those particular fits are the wrong tool.
+
+  It succeeds for every family by construction. It is kept as an executable
+  statement of the threat model, so that "no fit recovered it" can never be read
+  as "it was not recovered".
+  """
+  rng = seeded(("readback", seed, site.identifier, lane))
+  exact = 0
+  for _ in range(trials):
+    lanes, masks = site.sample(rng)
+    state = site.reference_encode(lanes, masks)
+    # Exactly what the emitted code computes, from the emitted constants.
+    recovered = site.reference_decode(state)[lane]
+    exact += int(recovered == (lanes[lane] & site.mask))
+  return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
+          "lane": lane, "trials": trials, "exact": exact,
+          "recovered": exact == trials,
+          "cost": "reading the emitted constants; no search"}
+
+
 def seed_collision_probe(width, kernel, lanes=2, sites=64, seed=0):
   """How often do two independently seeded sites share a lane's carrier?
 
@@ -1888,8 +1925,11 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
                             for d in degrees}
       other = NlCarry(width, seed + 88, lanes=site.n, kernel=site.kernel)
       row["projection_transfer"] = projection_transfer_attack(site, other, seed=seed)["results"]
+    row["constant_readback"] = constant_readback_attack(site, seed=seed)
     row["recovered_by"] = [f"gf2-degree-{d}" for d in degrees
                            if row["gf2_fit"][str(d)] == width]
+    if row["constant_readback"]["recovered"]:
+      row["recovered_by"].append("constant-readback")
     if row["ring_affine_fit"]: row["recovered_by"].append("ring-affine")
     if row["shape_search"].get("recovered"): row["recovered_by"].append("kernel-shape-search")
     report["attacks"].append(row)

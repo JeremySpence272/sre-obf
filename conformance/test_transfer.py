@@ -170,6 +170,25 @@ class TransferLawTests(unittest.TestCase):
           with self.subTest(f"{transfer.identifier}-{width}"):
             self.assertTrue(tm.check_laws(transfer, trials=120)["passed"])
 
+  def test_shifts_at_zero_and_at_width_minus_one(self):
+    """Gate 7A asks for both ends explicitly; both are in range, and a shift by
+    the width itself is not and must be refused."""
+    for width in (8, 32, 64):
+      site = nlcarry(width)
+      for amount in (0, 1, width - 1):
+        transfer = site.build("shl", amount=amount)
+        with self.subTest(f"shl-{width}-{amount}"):
+          self.assertTrue(tm.check_laws(transfer, trials=120)["passed"])
+        transfer = site.build("lshr", amount=amount)
+        with self.subTest(f"lshr-{width}-{amount}"):
+          self.assertTrue(tm.check_laws(transfer, trials=120)["passed"])
+      with self.assertRaises(ValueError): site.build("shl", amount=width)
+
+  def test_a_zero_shift_emits_no_instruction(self):
+    site = nlcarry()
+    self.assertLess(len(tm.live_steps(site.build("shl", amount=0))),
+                    len(tm.live_steps(site.build("shl", amount=1))))
+
   def test_constructed_boundary_cases_are_included(self):
     site = nlcarry()
     points = tm.constructed_points(site)
@@ -446,6 +465,17 @@ class AttackTests(unittest.TestCase):
         self.assertTrue(report["results"]["same-site"]["transfers"],
                         "one fit should decode every use of the same site")
         self.assertFalse(report["results"]["other-seed"]["transfers"])
+
+  def test_reading_the_emitted_constants_decodes_every_family(self):
+    """The threat model, as an executable statement. No family here is hard:
+    the constants are instruction operands. A fit failing means the fit was the
+    wrong tool, never that the family was not recovered."""
+    for site in (tm.NlCarry(IR, 5, lanes=2, kernel="arx"), tm.TriCouple(IR, 7),
+                 tm.ArxValue(IR, 3, lanes=2), tm.XorPair(IR, 5)):
+      with self.subTest(site.identifier):
+        report = tm.constant_readback_attack(site)
+        self.assertTrue(report["recovered"])
+        self.assertEqual(report["exact"], report["trials"])
 
   def test_an_unfittable_model_is_never_reported_as_recovered(self):
     site = tm.NlCarry(IR, 5, lanes=2, kernel="arx")
