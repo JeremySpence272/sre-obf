@@ -10,8 +10,10 @@ That omission is the point. Isolating mechanism cost from discovery cost means
 this control must pay no discovery cost at all, so whatever it reports is the
 cost of the protection mechanism alone. The binary-discovery adapter finds the
 same interfaces itself and pays both, and the difference between the two is the
-discovery cost. Every phase after lifting is shared with it, in
-`conformance/extract_phases.py`, so the two remain comparable.
+discovery cost only for matched interfaces and budgets. Both adapters use the
+same fitting grammar and symbolic model builder. Discovery currently assumes
+two 32-bit scalar arguments; this control also supports byte-buffer interfaces.
+Those different interfaces and phase coverage are not interchangeable costs.
 
 What the control does NOT do, and no field here should be read as claiming:
 
@@ -144,6 +146,7 @@ def run_region(runner, target, region, out, analysis_image, toolchain_image):
 
   worker = out / "extract_phases.py"
   shutil.copy2(Path(phases.__file__), worker)
+  shutil.copy2(Path(phases.grammar.__file__), out / "recovery_grammar.py")
   try:
     runner.run(["python3", str(worker), "worker", "--spec", str(out / "worker-spec.json"),
                 "--out", str(out / "worker-result.json")], image=analysis_image)
@@ -194,6 +197,9 @@ def main(argv=None):
       mounts.add(Path(target["binary"]).resolve().parent)
       if target.get("module"):
         mounts.add(Path(target["module"]).resolve().parent)
+      for region in target.get("regions", []):
+        if region.get("module"):
+          mounts.add(Path(region["module"]).resolve().parent)
     runner = Runner(out, out / "logs", None, timeout=900, mounts=tuple(sorted(mounts)))
     for target in spec["targets"]:
       for index, region in enumerate(target.get("regions", [])):
@@ -204,6 +210,7 @@ def main(argv=None):
         "supplied-region", regions,
         spec_sha256=digest(args.spec),
         phases_sha256=digest(Path(phases.__file__)),
+        grammar_sha256=digest(Path(phases.grammar.__file__)),
         adapter_sha256=digest(Path(__file__)),
         discovery_performed=False,
         discovery_note="every entry and interface was supplied from private "

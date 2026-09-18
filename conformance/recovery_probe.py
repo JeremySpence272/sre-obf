@@ -3,12 +3,13 @@
 Never executes the target natively; Unicorn is disabled. The ABI is supplied.
 The entry comes either from private provenance (the supplied-region control) or
 from `conformance/extract_discovery.py`, which found it from the binary alone;
-this file is identical in both cases, which is what makes their costs comparable.
+this scalar probe is identical in both cases. The separate extract_supplied
+buffer adapter has different interface support and is not a matched cost control.
 No initializers are emulated: unsupported runtime initialization is inconclusive.
 
 On a successful lift it also evaluates the recovered expression at constructed
-points, grouped into sites, and emits them for `conformance/recovery.py` to fit
-and validate a model against. Those points are fixed and structural: no random
+points, grouped into sites, then fits the shared grammar and queries symbolic
+equivalence before reporting a validated summary. Those points are fixed and structural: no random
 sampling, no known answers, and the points used as constructed positives are
 disjoint from the points any model is fitted on.
 """
@@ -19,6 +20,12 @@ import hashlib
 import json
 from pathlib import Path
 import time
+
+try:
+    from conformance import extract_phases as phases, recovery_grammar as grammar
+except ModuleNotFoundError:
+    import extract_phases as phases
+    import recovery_grammar as grammar
 
 
 # Constructed evaluation grid. Edges, small values and a few structured words.
@@ -142,6 +149,7 @@ def probe(args):
             break
         sim.step()
         steps += 1
+    sim.move(from_stash="active", to_stash="returned", filter_func=lambda s: s.addr == stop)
     returned = sim.stashes.get("returned", [])
     result = {"mode": "oracle-entry-symbolic-no-native-execution", "steps": steps,
               "returned_paths": len(returned), "active_paths": len(sim.active),
@@ -186,6 +194,20 @@ def probe(args):
                 result.update(status="recovered" if not work else "lifted_large",
                               ast_nodes=len(seen), ast_depth=expression.depth)
                 result.update(evaluate(claripy, expression, x, y, start, args))
+                oracle = phases.SymbolicOracle(claripy, expression, [x, y], 32, 2000)
+
+                def equivalence(model):
+                    remaining = args.seconds - (time.monotonic() - start)
+                    if remaining <= 0:
+                        return {"status": "inconclusive", "reason": "budget-exhausted"}
+                    oracle.timeout_ms = max(1, min(2000, int(remaining * 1000)))
+                    return oracle.equivalence(phases.RecoveryModel(model))
+
+                positives = result.get("positives", [])
+                result["verified_summary"] = grammar.summarize(
+                    result.get("sites", []), 32, positives=positives,
+                    negatives=[(inputs, value ^ 1) for inputs, value in positives],
+                    equivalence=equivalence)
                 if not work:
                     result["serialization"] = serialize(claripy, expression, args.out)
     else:
@@ -213,6 +235,8 @@ def main():
         result = {"status": "inconclusive", "reason": type(exc).__name__}
     result.update(binary_sha256=hashlib.sha256(args.binary.read_bytes()).hexdigest(),
                   probe_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                  grammar_sha256=hashlib.sha256(Path(grammar.__file__).read_bytes()).hexdigest(),
+                  phases_sha256=hashlib.sha256(Path(phases.__file__).read_bytes()).hexdigest(),
                   entry=args.entry, limits={k: getattr(args, k) for k in ("seconds", "steps", "paths", "nodes")})
     (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
 

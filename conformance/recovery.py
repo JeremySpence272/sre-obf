@@ -1,9 +1,10 @@
 """Shared recovery machinery and candidate selection for the static attack adapters.
 
-Two adapters share everything below. `conformance/extract_supplied.py` is handed
+`conformance/extract_supplied.py` is handed
 a region interface from private provenance; `conformance/extract_discovery.py`
 receives only the binary and the public protocol and has to find one. Both then
-run the same phases, so their costs are comparable, and both report cost split
+share a fitting grammar and symbolic model builder, but support different ABIs
+and phase coverage. Compare mechanism costs only on matched interfaces. They report cost split
 into the classes in `COST_CLASSES`: discovery, repair and mechanism. Mixing those
 would make the two adapters indistinguishable, which is the whole reason there
 are two.
@@ -76,306 +77,8 @@ def costs(phases) -> dict:
     return result
 
 
-# ---------------------------------------------------------------------------
-# A small grammar of expressions and relations, and its validation rules.
-# ---------------------------------------------------------------------------
-
-# Free parameters per family. Used for the capacity check: a family with as many
-# parameters as it has observations explains nothing, which is precisely how a
-# memorized lookup table passes a naive fit.
-FAMILIES = {"identity": 0, "xor_const": 1, "add_const": 1, "sub_const": 1,
-            "mask_const": 1, "rotl": 1, "affine": 2, "gf2_linear": None,
-            "table": None, "bounds": 2, "xor_join": 1, "sum_join": 1,
-            "difference": 1, "affine_join": 3, "recurrence": 3}
-
-
-def _mask(width: int) -> int:
-    return (1 << width) - 1
-
-
-def _inverse(a: int, width: int):
-    """Inverse of an odd residue modulo 2**width; None when `a` is even."""
-    if not a & 1:
-        return None
-    x = 1
-    for _ in range(width.bit_length() + 2):
-        x = x * (2 - a * x) & _mask(width)
-    return x
-
-
-def predict(model: dict, inputs):
-    """Evaluate a fitted model. Returns None where the model does not apply."""
-    width, family, p = model["width"], model["family"], model["params"]
-    mask = _mask(width)
-    values = [int(v) & mask for v in inputs]
-    if len(values) < model["arity"]:
-        return None
-    x = values[0]
-    if family == "identity":
-        return x
-    if family == "xor_const":
-        return x ^ p["k"]
-    if family == "add_const":
-        return (x + p["k"]) & mask
-    if family == "sub_const":
-        return (p["k"] - x) & mask
-    if family == "mask_const":
-        return x & p["k"]
-    if family == "rotl":
-        r = p["r"] % width
-        return x if not r else ((x << r) | (x >> (width - r))) & mask
-    if family == "affine":
-        return (p["a"] * x + p["b"]) & mask
-    if family == "gf2_linear":
-        out = 0
-        for i, column in enumerate(p["columns"]):
-            if x >> i & 1:
-                out ^= column
-        return out & mask
-    if family == "table":
-        index = p["domain"].index(x) if x in p["domain"] else None
-        return None if index is None else p["values"][index]
-    if family == "bounds":
-        return int(p["low"] <= x <= p["high"])
-    y = values[1] if len(values) > 1 else 0
-    if family == "xor_join":
-        return x ^ y ^ p["k"]
-    if family == "sum_join":
-        return (x + y + p["k"]) & mask
-    if family == "difference":
-        return (x - y + p["k"]) & mask
-    if family == "affine_join":
-        return (p["a"] * x + p["b"] * y + p["k"]) & mask
-    if family == "recurrence":
-        if x > 1 << 12:
-            return None
-        state = p["seed"]
-        for _ in range(x):
-            state = (p["a"] * state + p["b"]) & mask
-        return state
-    raise ValueError(f"unknown family: {family}")
-
-
-def _observations(site):
-    return [(tuple(int(v) for v in inputs), int(out)) for inputs, out in site["observations"]]
-
-
-def _candidates(pairs, width):
-    """Every family instantiation worth checking against `pairs`."""
-    mask = _mask(width)
-    first_in, first_out = pairs[0]
-    x0 = first_in[0] & mask
-    out = [("identity", {}),
-           ("xor_const", {"k": x0 ^ first_out}),
-           ("add_const", {"k": (first_out - x0) & mask}),
-           ("sub_const", {"k": (first_out + x0) & mask})]
-    keep = 0
-    for _, value in pairs:
-        keep |= value
-    out.append(("mask_const", {"k": keep}))
-    out.extend(("rotl", {"r": r}) for r in range(width))
-    for inputs, value in pairs[1:]:
-        inverse = _inverse((x0 - (inputs[0] & mask)) & mask, width)
-        if inverse is not None:
-            a = ((first_out - value) * inverse) & mask
-            out.append(("affine", {"a": a, "b": (first_out - a * x0) & mask}))
-            break
-    basis = {inputs[0] & mask: value for inputs, value in pairs}
-    if all(1 << i in basis for i in range(width)) and basis.get(0, 0) == 0:
-        out.append(("gf2_linear", {"columns": [basis[1 << i] for i in range(width)]}))
-    domain = sorted({inputs[0] & mask for inputs, _ in pairs})
-    if len(domain) <= 16:
-        table = {}
-        for inputs, value in pairs:
-            table.setdefault(inputs[0] & mask, value)
-        out.append(("table", {"domain": domain, "values": [table[d] for d in domain]}))
-    if {value for _, value in pairs} <= {0, 1}:
-        inside = [inputs[0] & mask for inputs, value in pairs if value]
-        if inside:
-            out.append(("bounds", {"low": min(inside), "high": max(inside)}))
-    if len(first_in) > 1:
-        y0 = first_in[1] & mask
-        out.append(("xor_join", {"k": first_out ^ x0 ^ y0}))
-        out.append(("sum_join", {"k": first_out - x0 - y0 & mask}))
-        out.append(("difference", {"k": first_out - x0 + y0 & mask}))
-        out.extend(_affine_join(pairs, width))
-    out.extend(_recurrence(pairs, width))
-    return out
-
-
-def _affine_join(pairs, width):
-    """Fit a*x + b*y + k by solving two difference equations modulo 2**width.
-
-    Cramer's rule applies whenever the determinant is odd, which covers the
-    common case of two observations sharing one input as well as a general grid.
-    """
-    mask = _mask(width)
-    x0, y0, out0 = pairs[0][0][0] & mask, pairs[0][0][1] & mask, pairs[0][1]
-    for i in range(1, len(pairs)):
-        for j in range(i + 1, len(pairs)):
-            dx1, dy1 = (pairs[i][0][0] - x0) & mask, (pairs[i][0][1] - y0) & mask
-            dx2, dy2 = (pairs[j][0][0] - x0) & mask, (pairs[j][0][1] - y0) & mask
-            do1, do2 = (pairs[i][1] - out0) & mask, (pairs[j][1] - out0) & mask
-            inverse = _inverse((dx1 * dy2 - dy1 * dx2) & mask, width)
-            if inverse is None:
-                continue
-            a = (do1 * dy2 - dy1 * do2) * inverse & mask
-            b = (dx1 * do2 - do1 * dx2) * inverse & mask
-            return [("affine_join", {"a": a, "b": b,
-                                     "k": (out0 - a * x0 - b * y0) & mask})]
-    return []
-
-
-def _recurrence(pairs, width):
-    """Fit s(i+1) = a*s(i) + b from indices 0, 1 and 2 when they are present."""
-    mask = _mask(width)
-    known = {inputs[0] & mask: value for inputs, value in pairs}
-    if not {0, 1, 2} <= set(known):
-        return []
-    inverse = _inverse(known[1] - known[0] & mask, width)
-    if inverse is None:
-        return []
-    a = (known[2] - known[1]) * inverse & mask
-    return [("recurrence", {"a": a, "b": known[1] - a * known[0] & mask, "seed": known[0]})]
-
-
-def fit(site, width):
-    """Every model in the grammar that reproduces *all* of one site's observations."""
-    pairs = _observations(site)
-    if len(pairs) < 2:
-        raise ValueError("a site needs at least two observations")
-    arity = min(len(inputs) for inputs, _ in pairs)
-    models = []
-    for family, params in _candidates(pairs, width):
-        needs = 2 if family in ("xor_join", "sum_join", "difference", "affine_join") else 1
-        if needs > arity:
-            continue
-        model = {"family": family, "params": params, "width": width, "arity": needs}
-        if all(predict(model, inputs) == value for inputs, value in pairs):
-            models.append(model)
-    return models
-
-
-def parameters(model) -> int:
-    declared = FAMILIES[model["family"]]
-    if declared is not None:
-        return declared
-    if model["family"] == "gf2_linear":
-        return model["width"]
-    return len(model["params"]["domain"])
-
-
-def validate(model, sites, *, negatives=(), positives=(), oracle=None, domain=None,
-             sampled=False) -> dict:
-    """Decide whether one fitted model is a summary or just a memory of one example.
-
-    A model is accepted only when it predicts at least two sites, survives
-    constructed positives and negatives, is falsifiable on the evidence at hand,
-    and has fewer free parameters than the observations it explains. Sampled
-    agreement alone is never enough: almost every random pair is a false one, so
-    a family that happens to match a handful of samples has been tested by
-    nothing. `oracle` plus a small `domain` upgrades the check to exhaustive.
-    """
-    per_site, predicted, observations = [], 0, 0
-    for site in sites:
-        pairs = _observations(site)
-        misses = [inputs for inputs, value in pairs if predict(model, inputs) != value]
-        per_site.append({"site": site.get("name", "?"), "observations": len(pairs),
-                         "predicted": not misses,
-                         "first_miss": list(misses[0]) if misses else None})
-        if not misses:
-            predicted += 1
-            observations += len(pairs)
-    positive_fail = [list(inputs) for inputs, out in positives if predict(model, inputs) != out]
-    negative_hit = [list(inputs) for inputs, out in negatives if predict(model, inputs) == out]
-    observations += len(positives)
-    free = parameters(model)
-    counterexample, checked = None, 0
-    if oracle is not None and domain is not None:
-        for inputs in domain:
-            checked += 1
-            if predict(model, tuple(inputs)) != oracle(tuple(inputs)):
-                counterexample = list(inputs)
-                break
-    # Falsifiability: perturb one output and require the family to stop fitting.
-    # A family that still fits corrupted data has not been tested by the good data.
-    falsified = _falsifiable(model, sites)
-    if checked:
-        level = "exhaustive"
-    elif positives and negatives:
-        level = "constructed"
-    else:
-        level = "sampled_only"
-    if sampled and level != "exhaustive":
-        level = "sampled_only"
-    reasons = []
-    if predicted < 2:
-        reasons.append("predicts-fewer-than-two-sites")
-    if positive_fail:
-        reasons.append("constructed-positive-mispredicted")
-    if negative_hit:
-        reasons.append("negative-case-accepted")
-    if counterexample is not None:
-        reasons.append("counterexample-found")
-    if not falsified:
-        reasons.append("family-not-falsifiable-on-this-evidence")
-    if free >= observations:
-        reasons.append("free-parameters-exceed-observations")
-    if level == "sampled_only":
-        reasons.append("sampled-equality-only")
-    return {"model": model, "sites_predicted": predicted, "sites_total": len(sites),
-            "observations_explained": observations, "free_parameters": free,
-            "constructed_positives": len(positives), "constructed_negatives": len(negatives),
-            "positive_failures": positive_fail, "negatives_accepted": negative_hit,
-            "counterexample": counterexample, "domain_checked": checked,
-            "falsifiable": falsified, "verification": level,
-            "validated": not reasons, "reasons": reasons, "per_site": per_site}
-
-
-def _falsifiable(model, sites) -> bool:
-    """Can the evidence at hand reject this family at all?
-
-    Perturb one output in the *pooled* multi-site observations and refit. A
-    family that still fits the corrupted pool was never tested by the clean pool:
-    a lookup table refits any single site, which is the exact shape of a model
-    that has only memorized its one example. The same table checked against
-    several sites is falsifiable, because a perturbation then contradicts the
-    other sites, and that distinction is the point of the check.
-    """
-    pool = [pair for site in sites for pair in _observations(site)]
-    if len(pool) < 2:
-        return False
-    for index in range(min(len(pool), 4)):
-        corrupted = list(pool)
-        inputs, value = corrupted[index]
-        corrupted[index] = (inputs, value ^ 1)
-        refit = fit({"observations": [[list(i), o] for i, o in corrupted]}, model["width"])
-        if not any(other["family"] == model["family"] for other in refit):
-            return True
-    return False
-
-
-def summarize(sites, width, *, negatives=(), positives=(), oracle=None, domain=None,
-              sampled=False) -> dict:
-    """Fit at the first site, then test every candidate against the others."""
-    if len(sites) < 2:
-        return {"status": "not_summarized", "reason": "fewer-than-two-sites",
-                "outcomes": [], "validated": False}
-    outcomes = [validate(model, sites, negatives=negatives, positives=positives,
-                         oracle=oracle, domain=domain, sampled=sampled)
-                for model in fit(sites[0], width)]
-    accepted = [o for o in outcomes if o["validated"]]
-    accepted.sort(key=lambda o: (o["free_parameters"], o["model"]["family"]))
-    if accepted:
-        return {"status": "summarized", "validated": True, "best": accepted[0],
-                "candidates": len(outcomes), "accepted": len(accepted)}
-    # Report why the *closest* candidate failed. Merging every family's
-    # complaints would hide which obstacle actually stopped the attack.
-    ranked = sorted(outcomes, key=lambda o: (len(o["reasons"]), -o["sites_predicted"],
-                                             o["model"]["family"]))
-    return {"status": "not_summarized", "validated": False,
-            "reason": ranked[0]["reasons"][0] if ranked else "no-family-fits",
-            "candidates": len(outcomes), "accepted": 0, "outcomes": ranked[:8]}
+from conformance.recovery_grammar import (FAMILIES, fit, parameters, predict,
+                                          summarize, validate)
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +137,18 @@ def attack_level(arm: dict) -> tuple[str, str | None]:
         return "blocked", arm.get("reason") or status or "missing-result"
     outcome = arm.get("summary") or {}
     if outcome.get("validated"):
+        if outcome.get("best", {}).get("verification") not in ("proved", "exhaustive"):
+            return "blocked", "legacy-or-unverified-summary"
         return "summarized", None
+    if not outcome or arm.get("evaluation", {}).get("truncated"):
+        return "blocked", "model-verification-incomplete"
+    if outcome.get("verification_incomplete"):
+        return "blocked", "model-verification-inconclusive"
+    if any(o.get("proof", {}).get("status") == "inconclusive"
+           for o in outcome.get("outcomes", []) if o.get("proof")):
+        return "blocked", "model-verification-inconclusive"
+    if outcome.get("reason") in ("complete-domain-verification-required", "sampled-equality-only"):
+        return "blocked", "model-verification-incomplete"
     return "lifted", outcome.get("reason", "no-validated-model")
 
 
@@ -442,6 +156,8 @@ def _eligible(row, max_growth, max_runtime):
     if row["control"]["status"] != "recovered":
         # A broken clean control invalidates this adapter/fixture pairing.
         return "clean-control-not-recovered"
+    if attack_level(row["control"])[0] != "summarized":
+        return "clean-control-not-summarized"
     if row.get("runtime_ratio") is None:
         return "runtime-ratio-unavailable"
     if row["runtime_ratio"] > max_runtime:
@@ -560,13 +276,15 @@ def constructed_negatives(positives):
 
     Rejecting these shows the model is a function of its inputs rather than
     something that accepts anything. It is the weakest of the checks here; the
-    load-bearing evidence is prediction at unseen points and across sites.
+    load-bearing evidence is complete-domain equivalence, not these samples.
     """
     return [(tuple(inputs), int(out) ^ 1) for inputs, out in positives]
 
 
 def probe_summary(result, width=32):
-    """Fit and validate a model from the sites the probe measured, if it emitted any."""
+    """Use the worker's proof, or report unverified candidates from legacy samples."""
+    if "verified_summary" in result:
+        return result["verified_summary"]
     sites = result.get("sites") or []
     if len(sites) < 2:
         return {"status": "not_summarized", "validated": False,

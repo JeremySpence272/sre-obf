@@ -200,13 +200,13 @@ encoded, rolled back, planner-skipped, not planned, not selected, absorbed
 before selection, or unaccounted — weighted both by count and by input
 instructions, crediting a merged origin at the function that owns its body. A
 function no pass touched is a bucket, not an absence. `coverage_views` reports
-raw operation coverage beside cost- and source-weighted coverage; on SQLite
+stage-mixed operation ratios beside cost- and source-weighted coverage; on SQLite
 those differ by two orders of magnitude, which is the point. `loss_ledger`
 keeps selection loss and growth rollback apart and closes the identity
 `eligible = selected + skipped + shard-lost + rolled-back`. `cap_ledger` keeps
 the module, per-function, per-region, per-shard and per-object caps distinct;
-the per-object cap is null because the pass does not publish it, and null is
-unknown, not absent. `support_charge` charges each generated helper once at its
+published object leaf/depth caps are read from current reports and stay null
+for older reports without those fields. `support_charge` charges each generated helper once at its
 owning symbol, so a helper called from forty functions is one charge.
 
 `--require-accounting` fails a run whose cost identity does not close or whose
@@ -216,3 +216,56 @@ source denominator is unknown, with status `accounting-failure` or
 No paid-agent solve or general obfuscation-hardness claim is established by
 these tests. The wider evaluation and remaining acceptance criteria are in
 [the plan](../docs/STATIC_NATIVE_PLAN.md).
+
+## v04 checkpoint validation
+
+The v04 work is infrastructure and offline family research, not a completed new
+representation lowering or a promoted protection preset. The active delivery
+criteria are in [the v04 plan](../docs/NATIVE_V04_PLAN.md).
+
+```sh
+python3 -m unittest discover -s conformance -p 'test_*.py'
+python3 -m conformance.review_v04 --out out/FRESH-v04-review \
+  --toolchain-image sre-obf-dev:llvm22
+```
+
+The latter archives its plugin and inputs, checks that observing the typed plan
+does not change emitted IR, exercises merge/call arbitration and an explicit
+non-interface owner, and compares full outputs before/after an O2 attack. Its
+aggregate case deliberately uses O0 to retain stack objects; that is not an O2
+memory-coverage result. `conformance.test_review_v04` also contains four real
+solver checks: run it inside the pinned analysis image. Hosts without Claripy
+skip those four explicitly; they do not count as passed proofs.
+
+Typed-plan format 2 preserves operand and bundle-member identities. Its graph is
+**pre-connected-lowering**, not frontend-source IR: earlier transforms may have
+inserted instructions. Useful-work depth is a deterministic cycle-cut DFS
+estimate, not an exact longest path. Rolled-back plans retain attempted graph
+and boundary records and label them as attempted. Input source counts are a
+separate inventory; stage-mixed ratios are diagnostics, not instruction-level
+source coverage. Encoded-call renames preserve function ownership, while fusion
+removals retain explicit provenance and unknown body coverage.
+
+Both recovery adapters use `recovery_grammar.py` and the symbolic models in
+`extract_phases.py`. Constructed samples propose a model; only a complete
+declared-domain enumeration or an equivalence proof validates it. Partial
+lookup domains, unresolved guard variables, incomplete returns, solver unknowns
+and missing clean summaries cannot be promoted to protection. The discovery
+probe currently assumes two 32-bit System V scalar arguments; it does not infer
+callee signatures. Supplied byte-buffer controls have different phase/ABI
+coverage, so their times are not a matched comparison with that scalar probe.
+Cross-region sample agreement remains unverified transfer evidence.
+
+The offline family catalogue cannot mark anything `ready_to_lower`: its sampled
+screens can nominate `screened_for_proof` candidates only. Mask-independence SMT
+checks do not prove the sampled bijection or a cheap inverse. The known-parameter
+reference decoder is a threat-model control, not an implemented binary constant
+extractor. No compiler, decompiler, scale or agent hardness follows from those
+reference-model checks.
+
+Fixture and whole-program runners expose `--plan`, `--call-policy` (requires
+`--encoded-calls`) and `--semantic-budget 0..50`; scale exposes them on its
+connected `v02` base variant as explicit v04 experiments. Locked scale runs also
+check upstream revision/archive identity; a held-out workload needs a frozen
+manifest hash before it can run. Scale-regression manifests retain their own
+recorded hashes rather than claiming the lock pins their entire source tree.

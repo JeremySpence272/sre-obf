@@ -53,8 +53,11 @@ class V01Tests(unittest.TestCase):
     def test_timeouts_errors_and_failed_controls_are_never_selected(self):
         # Both the live metric and the retained ablation must refuse these rows.
         def row(native, control="recovered", growth=2):
-            return {"candidate": "a", "native": {"status": native, "ast_nodes": 12, "steps": 7},
-                    "control": {"status": control}, "growth": growth, "runtime_ratio": 1}
+            return {"candidate": "a", "native": {"status": native, "ast_nodes": 12, "steps": 7,
+                    "summary": {"validated": False, "reason": "no-family-fits"}},
+                    "control": {"status": control, "summary": {"validated": True,
+                                "best": {"verification": "proved"}}},
+                    "growth": growth, "runtime_ratio": 1}
         for case in ([row(s) for s in ("budget", "inconclusive", "tool_error")] +
                      [row("recovered", control="budget"), row("recovered", growth=9),
                       {**row("recovered"), "runtime_ratio": None},

@@ -478,7 +478,8 @@ class ImmutableDataTest(unittest.TestCase):
 
 class ReportTest(unittest.TestCase):
   def test_region_status_follows_the_worst_phase(self):
-    ok = [ph.phase("lift", "ok"), ph.phase("fit", "ok")]
+    ok = [ph.phase("lift", "ok"), ph.phase("fit", "ok"),
+          ph.phase("test", "ok"), ph.phase("compose", "ok")]
     self.assertEqual(ph.region_report("r", "supplied-region", ok)["status"], "recovered")
 
     weak = ok + [ph.phase("test", "inconclusive", "solver-unknown")]
@@ -489,15 +490,15 @@ class ReportTest(unittest.TestCase):
 
   def test_a_skipped_phase_does_not_demote_a_region(self):
     rows = [ph.phase("lift", "ok"), ph.phase("normalize", "skipped", "not-attempted")]
-    self.assertEqual(ph.region_report("r", "supplied-region", rows)["status"], "recovered")
+    self.assertEqual(ph.region_report("r", "supplied-region", rows)["status"], "lifted")
 
   def test_adapter_report_counts_and_disclaims(self):
     regions = [ph.region_report("a", "supplied-region", [ph.phase("lift", "ok")]),
                ph.region_report("b", "supplied-region",
                                 [ph.phase("lift", "inconclusive", "budget-exhausted")])]
     report = ph.adapter_report("supplied-region", regions)
-    self.assertEqual(report["schema"], "sre-extract-v1")
-    self.assertEqual((report["regions_total"], report["regions_recovered"]), (2, 1))
+    self.assertEqual(report["schema"], "sre-extract-v2")
+    self.assertEqual((report["regions_total"], report["regions_recovered"], report["regions_lifted"]), (2, 0, 1))
     self.assertIn("not a hardness claim", report["interpretation"])
 
 

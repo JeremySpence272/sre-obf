@@ -67,6 +67,8 @@ class Image:
         offset, size, count = (struct.unpack_from("<Q", data, 32)[0],
                                struct.unpack_from("<H", data, 54)[0],
                                struct.unpack_from("<H", data, 56)[0])
+        if size < 56 or offset + size * count > len(data):
+            raise Boundary("invalid-program-header-table")
         self.segments = []
         for i in range(count):
             base = offset + i * size
@@ -75,6 +77,8 @@ class Image:
             kind, flags = struct.unpack_from("<II", data, base)
             file_offset, vaddr = struct.unpack_from("<QQ", data, base + 8)
             file_size, mem_size = struct.unpack_from("<QQ", data, base + 32)
+            if file_offset + file_size > len(data) or (kind == PT_LOAD and file_size > mem_size):
+                raise Boundary("invalid-file-backed-segment")
             self.segments.append({"type": kind, "flags": flags, "offset": file_offset,
                                   "vaddr": vaddr, "file_size": file_size, "mem_size": mem_size})
         self.load = [s for s in self.segments if s["type"] == PT_LOAD and s["file_size"]]
@@ -82,6 +86,8 @@ class Image:
             raise Boundary("no-loadable-segments")
 
     def owner(self, addr: int, length: int = 1):
+        if addr < 0 or length < 0:
+            return None
         for s in self.load:
             if s["vaddr"] <= addr and addr + length <= s["vaddr"] + s["file_size"]:
                 return s
@@ -195,7 +201,7 @@ def _chain_length(image: Image, addr: int) -> int:
             length = struct.unpack("<I", image.read(cursor, 4))[0]
         except Boundary:
             return count
-        if length in (0, 0xFFFFFFFF):
+        if length < 4 or length == 0xFFFFFFFF:
             return count
         cursor += 4 + length
         count += 1
@@ -212,7 +218,7 @@ def unwind_functions(image: Image):
             length = struct.unpack("<I", image.read(cursor, 4))[0]
         except Boundary:
             break
-        if length in (0, 0xFFFFFFFF):
+        if length < 4 or length == 0xFFFFFFFF:
             break
         body_at, body = cursor + 8, None
         try:
@@ -221,7 +227,10 @@ def unwind_functions(image: Image):
         except Boundary:
             break
         if identifier == 0:
-            cies[cursor] = _cie(body, body_at, hdr_base)
+            try:
+                cies[cursor] = _cie(body, body_at, hdr_base)
+            except (IndexError, ValueError, Boundary):
+                raise Boundary("malformed-cie") from None
         else:
             cie = cies.get(cursor + 4 - identifier)
             if cie and cie.get("encoding") is not None:
@@ -344,7 +353,7 @@ def references(image: Image, targets):
     wanted, hits = set(targets), []
     for s in image.code():
         blob = image.data[s["offset"]:s["offset"] + s["file_size"]]
-        for i in range(len(blob) - 7):
+        for i in range(len(blob) - 6):
             if blob[i] & 0xF8 != 0x48:
                 continue
             for skip in (3, 4):
@@ -545,6 +554,13 @@ def run(args):
                               "probes_to_reach_expected": rank,
                               "note": "private provenance, scores discovery only"}
     if args.analysis_image:
+        result["probe_interface"] = {"arity": 2, "width": 32,
+            "abi": "sysv-amd64-int-words", "basis": "public-protocol-assumption",
+            "callee_signature_inferred": False}
+        if spec.get("arity", 2) != 2 or spec.get("width", 32) != 32:
+            result["mechanism_status"] = "inconclusive"
+            result["mechanism_reason"] = "unsupported-probe-interface"
+            return result
         result["probes"] = [_probe(args, region["address"], index)
                             for index, region in enumerate(ranked[:args.probe_candidates])]
         for record in result["probes"]:
@@ -599,7 +615,8 @@ def _transfer(probes):
     predicted = [p["entry"] for p in others
                  if all(recovery.predict(model, tuple(inputs)) == out
                         for site in p["result"]["sites"] for inputs, out in site["observations"])]
-    return {"status": "transferred" if predicted else "not_transferred",
+    return {"status": "sampled_agreement" if predicted else "not_transferred",
+            "validated": False, "reason": "cross-region-equivalence-not-checked",
             "model": model["family"], "fitted_at": fitted["entry"],
             "regions_predicted": len(predicted), "regions_tested": len(others),
             "predicted": predicted}
@@ -623,6 +640,7 @@ def main(argv=None):
         if min(args.seconds, args.depth, args.candidates, args.probe_candidates) <= 0:
             raise ValueError("budgets must be positive")
         args.out = args.out.resolve()
+        args.binary = args.binary.resolve()
         args.out.mkdir(parents=True, exist_ok=False)
         result = run(args)
         dump(args.out / "discovery.json", result)

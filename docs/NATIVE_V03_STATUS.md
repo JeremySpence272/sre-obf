@@ -947,15 +947,17 @@ Both are single-instruction regroupings, not design errors: adding the mask to
 the first partial product instead of last computes the same value from the same
 operands with no such intermediate. The regrouped forms are proved equal to the
 originals and are in `conformance/connected_model.py` as
-`xor_to_additive_grouped` and `affine_mul_grouped`. **The emitter itself is not
-yet fixed**, and the originals are retained as negative controls that SMT
+`xor_to_additive_grouped` and `affine_mul_grouped`. **Commit `584eff7` applied
+both regroupings to the emitter** (XOR-to-additive conversion and additive
+multiplication, not both conversion directions). The originals remain negative controls that SMT
 proves contain a decode at 8, 16, 32 and 64 bits.
 
 This is the concrete v03 claim the v04 plan's principle 1 anticipated: a wrapper
 around an ordinary operation is only a candidate until normalization tests it.
 The claim in commit `b685259` that mixed families connect "without scalar
-decodes" is false as implemented for these two paths, and the ledger text above
-describing that feature should be read with this correction.
+decodes" was false for these two paths before `584eff7`. Regrouping removes those
+explicit SSA intermediates; it does not establish resistance to reassociation
+or semantic extraction after compilation/decompilation.
 
 ### A labelling artifact, and the supervisor's own misreading
 

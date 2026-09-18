@@ -207,11 +207,11 @@ class TransferLawTests(unittest.TestCase):
         self.assertEqual(report["escaped"], [], report)
         self.assertTrue(report["caught"])
 
-  def test_an_equivalent_mutant_is_excluded_rather_than_counted_as_an_escape(self):
+  def test_an_undistinguished_mutant_is_unknown_not_proved_equivalent(self):
     """Writing a result back onto one of its own operands cancels that carrier,
     so corrupting it really does leave the transfer unchanged."""
     report = tm.mutate_counterexample(nlcarry().build("xor"), attempts=8)
-    self.assertGreater(report["equivalent"], 0)
+    self.assertGreater(report["not_distinguished"], 0)
     self.assertEqual(report["escaped"], [])
 
   def test_predicates_stay_in_their_own_representation(self):

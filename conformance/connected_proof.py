@@ -279,11 +279,13 @@ def settle_exposure(z3, width, milliseconds, site, transfer, label, results):
     # the candidate; a lossy function of the logical values is a partial
     # plaintext, which is recorded rather than used to reject.
     classified = verdict["verdicts"][name]
-    severity = ("recognizable-decode" if classified == "decode" else "partial-plaintext")
+    severity = ("suspected-recognizable-decode" if classified == "decode" else "partial-plaintext")
     record = run_claim(z3, milliseconds, a[name] != b[name], expect="decided",
                        law=f"{label}:{transfer.name}:exposure:{name}", width=width,
                        group="v04", kind="exposure", classified=classified,
-                       severity=severity, declared=transfer.expect)
+                       severity=severity, declared=transfer.expect,
+                       bijection_verification="sampled-only",
+                       query_scope="universal-mask-independence-only")
     # An exposure query has no single wanted answer, so `expect` is "decided".
     #   proved         unsat: the intermediate never moves when the masks move, so
     #                  it is a function of the logical values alone. Bad.
@@ -295,9 +297,9 @@ def settle_exposure(z3, width, milliseconds, site, transfer, label, results):
     # library declares acceptable: that is a recognizable decode, and it fails
     # the candidate, not the prover.
     record["ok"] = record["status"] != "inconclusive"
-    if record["status"] == "proved" and severity == "recognizable-decode" \
+    if record["status"] == "proved" and severity == "suspected-recognizable-decode" \
         and transfer.expect != "reject":
-      record["finding"] = "recognizable decode inside a transfer declared acceptable"
+      record["finding"] = "mask-independent intermediate with a sampled decode relation; conservatively rejected"
       record["ok"] = False
     results.append(record)
 
@@ -315,7 +317,12 @@ def main():
   args = p.parse_args()
   if args.out.exists() or not 1 <= args.milliseconds <= 60000:
     p.error("use a fresh output file and a 1..60000 millisecond per-law cap")
-  widths = tuple(int(w) for w in args.widths.split(","))
+  try:
+    widths = tuple(int(w) for w in args.widths.split(","))
+  except ValueError:
+    p.error("widths must be comma-separated supported integers")
+  if not widths or len(set(widths)) != len(widths) or any(w not in tm.WIDTHS for w in widths):
+    p.error("widths must be distinct members of " + str(tm.WIDTHS))
   results = []
   if args.group in ("all", "v03"):
     for width in widths:
@@ -324,10 +331,10 @@ def main():
         results.append(run_claim(z3, args.milliseconds, decoded != expected,
                                  law=name, width=width, group="v03", kind="law"))
   if args.group in ("all", "v04"):
-    for width in widths:
+    for index, width in enumerate(widths):
       primitive_laws(z3, width, args.milliseconds, results)
       family_laws(z3, width, args.milliseconds, results, args.quick)
-      reached = [w for w in widths if w <= width]
+      reached = list(widths[:index + 1])
       partial = args.out.with_suffix(".partial.json")
       partial.parent.mkdir(parents=True, exist_ok=True)
       partial.write_text(json.dumps(
@@ -355,15 +362,15 @@ def assemble(results, args, widths, z3, complete, reached=None):
     slot = per_width.setdefault(record["width"], {"seconds": 0.0})
     slot["seconds"] = round(slot["seconds"] + record.get("seconds", 0.0), 2)
     slot[record["status"]] = slot.get(record["status"], 0) + 1
-  return {"schema": "sre-connected-reference-proofs-v2", "z3": z3.get_version_string(),
+  return {"schema": "sre-connected-reference-proofs-v3", "z3": z3.get_version_string(),
           "scope": "reference laws only; not LLVM lowering, memory safety, ABI, or hardness",
           "per_law_timeout_ms": args.milliseconds, "groups_run": args.group,
           "widths": list(widths), "quick": bool(args.quick),
           "summary": groups, "per_width": per_width,
           "solver_seconds": round(sum(r.get("seconds", 0.0) for r in results), 1),
           "results": results,
-          "recognizable_decodes": [r["law"] for r in results
-                                   if r.get("severity") == "recognizable-decode" and
+          "suspected_recognizable_decodes": [r["law"] for r in results
+                                   if r.get("severity") == "suspected-recognizable-decode" and
                                    r["status"] == "proved"],
           "partial_plaintext_intermediates": [r["law"] for r in results
                                              if r.get("severity") == "partial-plaintext" and

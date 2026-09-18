@@ -101,17 +101,25 @@ def elf(*, startup=True, unwind=True, eh_frame_hdr=False):
         segments.append((0x6474E550, 4, hdr_off, hdr_va))
         table = b"\x01\x1b\x03\x3b" + struct.pack("<i", frame_at - (hdr_va + 4))
         rodata[0x80:0x80 + len(table)] = table
-    phdrs = b"".join(struct.pack("<IIQQQQQQ", kind, flags, off, va, va, 0x800, 0x800, 0x1000)
-                     for kind, flags, off, va in segments)
+    payload = code(startup)
+    phdrs = b"".join(struct.pack("<IIQQQQQQ", kind, flags, off, va, va, size, size, 0x1000)
+                     for kind, flags, off, va in segments
+                     for size in [8 if kind == 0x6474E550 else
+                                  len(payload) if off == CODE_OFF else len(rodata)])
     data = bytearray(header + phdrs)
     data += b"\x00" * (CODE_OFF - len(data))
-    data += code(startup)
+    data += payload
     data += b"\x00" * (RO_OFF - len(data))
     data += rodata
     return bytes(data)
 
 
 class ImageTests(unittest.TestCase):
+    def test_truncated_file_backed_segment_is_a_boundary(self):
+        with self.assertRaises(Boundary) as caught:
+            Image(elf()[:-1])
+        self.assertEqual(caught.exception.reason, "invalid-file-backed-segment")
+
     def test_a_non_elf_input_is_a_reported_boundary(self):
         with self.assertRaises(Boundary) as caught:
             Image(b"MZ" + b"\x00" * 200)
@@ -221,10 +229,11 @@ class ModelTests(unittest.TestCase):
         positives = self.constructed(f, 0x0BADC0DE)
         result = recovery.summarize(self.sites(f, (0, 1, 0xDEADBEEF)), self.WIDTH,
                                     positives=positives,
-                                    negatives=recovery.constructed_negatives(positives))
+                                    negatives=recovery.constructed_negatives(positives),
+                                    equivalence=lambda model: {"status": "proved", "method": "test-stub"})
         self.assertEqual(result["status"], "summarized")
         self.assertEqual(result["best"]["model"]["family"], "xor_join")
-        self.assertEqual(result["best"]["verification"], "constructed")
+        self.assertEqual(result["best"]["verification"], "proved")
         self.assertEqual(result["best"]["sites_predicted"], 3)
 
     def test_a_model_that_predicts_only_its_own_site_is_not_a_summary(self):
@@ -235,7 +244,7 @@ class ModelTests(unittest.TestCase):
                                     positives=positives,
                                     negatives=recovery.constructed_negatives(positives))
         self.assertFalse(result["validated"])
-        self.assertEqual(result["reason"], "predicts-fewer-than-two-sites")
+        self.assertEqual(result["reason"], "no-family-fits")
 
     def test_a_table_memorized_at_one_site_is_rejected_but_a_shared_one_is_not(self):
         table = {3: 0x11, 4: 0x99, 5: 0x07, 6: 0x08, 9: 0x21, 11: 0x42}
@@ -248,8 +257,8 @@ class ModelTests(unittest.TestCase):
         shared = recovery.summarize([{"name": n, "observations": [[[k], v] for k, v in table.items()]}
                                      for n in ("a", "b", "c")], self.WIDTH,
                                     positives=positives, negatives=[((3,), 0x12)])
-        self.assertTrue(shared["validated"])
-        self.assertTrue(shared["best"]["falsifiable"])
+        self.assertFalse(shared["validated"])
+        self.assertEqual(shared["reason"], "complete-domain-verification-required")
 
     def test_sampled_agreement_alone_never_validates(self):
         f = lambda x, y: (x ^ y ^ 5) & 0xFFFFFFFF
@@ -264,7 +273,7 @@ class ModelTests(unittest.TestCase):
         positives = [((x,), truth(x)) for x in (121, 122, 123)]
         negatives = recovery.constructed_negatives(positives)
         without = recovery.summarize(sites, 8, positives=positives, negatives=negatives)
-        self.assertTrue(without["validated"])
+        self.assertFalse(without["validated"])
         with_oracle = recovery.summarize(sites, 8, positives=positives, negatives=negatives,
                                          oracle=lambda i: truth(i[0]),
                                          domain=[(i,) for i in range(256)])
@@ -336,8 +345,11 @@ def _row(candidate="a", *, status="recovered", control="recovered", growth=2, ru
                        "discovery_steps": discovery}}
     if status in ("recovered", "lifted_large"):
         native["summary"] = {"validated": summarized,
+                             "best": {"verification": "proved"} if summarized else None,
                              "reason": None if summarized else "no-family-fits"}
-    return {"candidate": candidate, "native": native, "control": {"status": control},
+    return {"candidate": candidate, "native": native,
+            "control": {"status": control, "summary": {"validated": True,
+                        "best": {"verification": "proved"}}},
             "growth": growth, "runtime_ratio": runtime}
 
 

@@ -1303,7 +1303,7 @@ def check_laws(transfer, trials=512, seed=0, complete=False, extra_points=True):
 
 
 def check_inverse(site, complete=False, trials=512, seed=0):
-  """Positive control for the inverse: decode(encode(X, M)) == X everywhere."""
+  """Inverse control over the reported sample or complete small domain."""
   rng = seeded(("inverse", seed, site.identifier))
   points = list(site.enumerate_domain()) if complete else \
       [site.sample(rng) for _ in range(trials)] + constructed_points(site)
@@ -1322,8 +1322,8 @@ def mutate_counterexample(transfer, attempts=8, points=64, seed=0):
 
   A law test that cannot fail proves nothing, so every accepted law is paired
   with mutants that must be caught. A mutant whose output never differs from the
-  original on any sampled input is an *equivalent* mutant and is excluded rather
-  than counted as an escape: the destination carrier of a transfer that writes
+  original on the sampled inputs is *not distinguished*, not proved equivalent.
+  It is recorded as unknown rather than an escape: the destination carrier of a transfer that writes
   back to one of its own operands cancels algebraically, so corrupting that
   carrier really does leave the transfer unchanged. Anything that does change an
   output word must be caught.
@@ -1340,7 +1340,7 @@ def mutate_counterexample(transfer, attempts=8, points=64, seed=0):
   sample = [site.sample(rng) for _ in range(points)]
   states = [site.reference_encode(lanes, masks) for lanes, masks in sample]
   baseline = [transfer.run(state, backend)[1] for state in states]
-  report = {"transfer": transfer.identifier, "attempted": 0, "equivalent": 0,
+  report = {"transfer": transfer.identifier, "attempted": 0, "not_distinguished": 0,
             "effective": 0, "escaped": [], "missed_by_sampling": []}
   for index in candidates[:attempts]:
     name, op, args = steps[index]
@@ -1355,7 +1355,7 @@ def mutate_counterexample(transfer, attempts=8, points=64, seed=0):
       moved = any(transfer.run(state, backend)[1] != want
                   for state, want in zip(states, baseline))
       if not moved:
-        report["equivalent"] += 1
+        report["not_distinguished"] += 1
         continue
       report["effective"] += 1
       # The law must fail at the points that distinguish the mutant. If it does
@@ -1519,7 +1519,8 @@ def classify(transfer, repeats=6, extra=8, mask_points=24, seed=0, exhaustive_ma
           "verdicts": verdicts,
           "detail": {n: detail[n] for n in names if verdicts[n] in
                      ("decode", "partial-plain", "partial-collapse")},
-          "accepted": not exposed}
+          "accepted": not exposed, "verification": "sampled-screen",
+          "universal_no_decode_proof": False}
 
 
 def review(transfer, **kw):
@@ -1565,7 +1566,9 @@ def features(bits, monos):
 class Gf2System:
   """Row-echelon GF(2) system over feature bitmasks with several right sides."""
 
-  def __init__(self): self.basis = {}
+  def __init__(self):
+    self.basis = {}
+    self.consistent = True
 
   def add(self, row, rhs):
     while row:
@@ -1576,6 +1579,7 @@ class Gf2System:
       other, orhs = self.basis[pivot]
       row ^= other
       rhs ^= orhs
+    self.consistent &= rhs == 0
     return rhs == 0  # a zero row with a nonzero side is inconsistent
 
   def predict(self, row):
@@ -1638,7 +1642,8 @@ def gf2_attack(site, lane=0, degree=1, train=None, test=200, seed=0,
           "scored": scored, "undetermined": undetermined,
           "bits_recovered": len(recovered), "bits": site.width,
           "recovered_bits": recovered,
-          "broken": scored > 0 and len(recovered) == site.width}
+          "broken": consistent and scored > 0 and len(recovered) == site.width,
+          "verification": "sampled-reference-model", "equivalence_proved": False}
 
 
 def solve_mod(rows, rhs, width):
@@ -1766,8 +1771,9 @@ def projection_transfer_attack(site, other, lane=0, degree=2, train=None,
       scored += 1
       hits += int(prediction == (lanes[which] & target.mask))
     results[label] = {"scored": scored, "exact": hits, "lane": which,
-                      "transfers": scored > 0 and hits == scored}
-  return {"fitted_on": site.identifier, "degree": degree, "results": results}
+                      "transfers": system.consistent and scored > 0 and hits == scored}
+  return {"fitted_on": site.identifier, "degree": degree, "results": results,
+          "consistent": system.consistent, "verification": "sampled-reference-model"}
 
 
 
@@ -1814,8 +1820,9 @@ def carrier_fit_attack(site, lane=0, degree=2, train=None, test=200, seed=0):
   return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
           "width": site.width, "degree": degree, "lane": lane, "train": train,
           "attempted": True, "monomials": len(monos), "scored": scored,
+          "consistent": system.consistent, "verification": "sampled-reference-model",
           "bits_recovered": len(recovered), "recovered_bits": recovered,
-          "broken": scored > 0 and len(recovered) == site.width}
+          "broken": system.consistent and scored > 0 and len(recovered) == site.width}
 
 
 
@@ -1846,7 +1853,8 @@ def constant_readback_attack(site, lane=0, trials=200, seed=0):
   return {"site": site.identifier, "kernel": getattr(site, "kernel", None),
           "lane": lane, "trials": trials, "exact": exact,
           "recovered": exact == trials,
-          "cost": "reading the emitted constants; no search"}
+          "cost": "reference decoder with known family parameters; extraction cost not measured",
+          "evidence": "mechanism-aware-reference-control", "binary_extraction_performed": False}
 
 
 def seed_collision_probe(width, kernel, lanes=2, sites=64, seed=0):
@@ -1915,16 +1923,18 @@ def describe(site):
 # Offline driver: the record a planner reads before lowering anything.
 # --------------------------------------------------------------------------
 
-def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
+def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=1):
   """Build the family library record: laws, rejection verdicts and attacks.
 
-  This is a research artifact, not a gate on the compiler. `ready_to_lower` means
-  only that a family has at least one transfer whose law holds against an
-  independent reference and which contains no recognizable decode. It says
-  nothing about how hard the family is, and a family that one of the fitting
-  attacks below recovers is reported as recovered even when it is ready.
+  This is a sampled research screen, not a gate on the compiler. No proof
+  certificate or emitted-code conformance result is attached here, so it cannot
+  mark a family ready to lower. `screened_for_proof` names candidates worth
+  checking next, and is not evidence of hardness or universal equivalence.
   """
-  report = {"schema": "sre-transfer-families-v1", "width": width, "seed": seed,
+  if attack_lanes != 1:
+    raise ValueError("the catalogue currently measures lane 0 only; use the per-lane attack APIs")
+  report = {"schema": "sre-transfer-families-v2", "width": width, "seed": seed,
+            "attack_lanes": [0],
             "scope": "offline reference models; no compiler lowering, no hardness claim",
             "families": [], "attacks": [], "failures": [], "ablation_findings": []}
   sites = [XorPair(width, seed, lanes=2), AdditivePair(width, seed, lanes=2),
@@ -1933,11 +1943,12 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
   sites += [NlCarry(width, seed, lanes=3, kernel=k) for k in NlCarry.KERNELS]
   sites.append(NlCarryAbstract(width, seed, lanes=3, kernel="and"))
   for site in sites:
+    failures_before = len(report["failures"])
     record = describe(site)
     inverse = check_inverse(site, trials=400)
     record["inverse_control"] = {"passed": inverse["passed"], "points": inverse["points"]}
     if not inverse["passed"]: report["failures"].append(f"{site.identifier}:inverse")
-    if isinstance(site, NlCarry):
+    if hasattr(site, "distinct_carriers"):
       record["distinct_carriers"] = site.distinct_carriers(trials=256)
       if not record["distinct_carriers"]["passed"]:
         report["failures"].append(f"{site.identifier}:carriers")
@@ -1953,7 +1964,7 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
       entry["rejection"] = {"outcome": verdict["outcome"], "counts": verdict["counts"],
                             "exposes": verdict["exposes"]}
       entry["counterexample_control"] = {k: mutant[k] for k in
-                                        ("attempted", "equivalent", "effective", "caught")}
+                                        ("attempted", "not_distinguished", "effective", "caught")}
       entry["counterexample_control"]["missed_by_sampling"] = \
           len(mutant["missed_by_sampling"])
       if not laws["passed"]: report["failures"].append(f"{transfer.identifier}:law")
@@ -1973,7 +1984,8 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
              "mutants_missed_by_a_random_sample": len(mutant["missed_by_sampling"]),
              "note": "the law holds at the distinguishing inputs; a sample of "
                      "this size did not reach them"})
-      if verdict["accepted"] and transfer.expect == "accept": accepted.append(name)
+      if laws["passed"] and verdict["accepted"] and not mutant["escaped"] and transfer.expect == "accept":
+        accepted.append(name)
     record["useful_transfers_between_conversions"] = accepted
     proof_only = isinstance(site, NlCarryAbstract)
     record["role"] = ("ablation" if site.ablation else
@@ -1984,7 +1996,10 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
     # Its decode is linear in its own free carriers by construction, so the
     # fitting attacks recover it trivially and that number means nothing about
     # any concrete kernel. It is never a lowering candidate.
-    record["ready_to_lower"] = bool(accepted) and not site.ablation and not proof_only
+    record["screened_for_proof"] = (bool(accepted) and not site.ablation and not proof_only
+                                    and len(report["failures"]) == failures_before)
+    record["ready_to_lower"] = False
+    record["lowering_blockers"] = ["universal-proofs-not-attached", "compiler-conformance-not-run"]
     report["families"].append(record)
   for site in sites:
     row = {"site": site.identifier, "ablation": site.ablation,
@@ -2013,6 +2028,8 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
   report["seed_collisions"] = [seed_collision_probe(width, k, sites=64)
                               for k in NlCarry.KERNELS]
   report["ready"] = sorted(r["family"] for r in report["families"] if r["ready_to_lower"])
+  report["screened_for_proof"] = sorted(r["family"] for r in report["families"]
+                                        if r["screened_for_proof"])
   report["ready_and_not_yet_recovered"] = sorted(
       r["family"] for r in report["families"]
       if r["ready_to_lower"] and not r.get("recovered_by"))

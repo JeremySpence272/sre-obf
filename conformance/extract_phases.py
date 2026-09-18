@@ -4,8 +4,8 @@ Two adapters use this module: the supplied-region control
 (`conformance/extract_supplied.py`, which is handed a region interface from
 private provenance) and the binary-discovery adapter, which must find the same
 interface itself. Everything here is deliberately discovery-free so the two
-adapters differ only in where the interface comes from, and the mechanism cost
-they measure is therefore comparable.
+adapters share model semantics and proof rules. Their current ABI support and
+phase coverage differ, so cost comparisons require matched interfaces/budgets.
 
 Phases, in the order plan W0 names them:
 
@@ -43,7 +43,12 @@ import struct
 import sys
 import time
 
-SCHEMA = "sre-extract-v1"
+try:
+  from conformance import recovery_grammar as grammar
+except ModuleNotFoundError:  # copied worker and sibling module inside analysis image
+  import recovery_grammar as grammar
+
+SCHEMA = "sre-extract-v2"
 WIDTHS = (8, 16, 32, 64)
 
 # Fixed reason vocabulary. A phase that is not `ok` always carries one of these;
@@ -354,6 +359,11 @@ class LookupTable(Model):
 
   kind = "lookup-table"
 
+  def apply(self, args):
+    if not args or not 0 <= args[0] < len(self.params["table"]):
+      return None
+    return super().apply(args)
+
   def build(self, b, args):
     table = self.params["table"]
     if not table:
@@ -385,6 +395,10 @@ class Bound(Model):
   kind = "bound"
 
   def build(self, b, args):
+    if self.params["n"] == 1 << self.width:
+      return b.const(1)
+    if not 0 <= self.params["n"] <= 1 << self.width:
+      raise ValueError("bound outside word range")
     return b.ite(b.ult(args[0], b.const(self.params["n"])), b.const(1), b.const(0))
 
   def perturbations(self):
@@ -430,23 +444,15 @@ class Recurrence(Model):
 # --------------------------------------------------------------------------
 # Bridge to the discovery adapter's grammar.
 #
-# `conformance/recovery.py` (agent E2) fits the same kind of grammar, but its
-# models are plain dicts fitted from a concrete observation grid, so they carry
-# no symbolic form and can only be validated by enumerating a domain. The
-# wrapper below gives any of its families a `build`, which is what turns a
+# `conformance/recovery_grammar.py` fits plain dictionary models. The wrapper
+# below gives those families a symbolic `build`, which is what turns a
 # counterexample check into a *proof* over the whole input space rather than an
 # enumeration over sampled points.
 #
-# The intent is that only one fitter survives integration. This is what makes
-# that choice free: either fitter may produce the model, and it can still be
-# proved against a lifted expression.
+# Both adapters now use that fitter and this symbolic builder.
 # --------------------------------------------------------------------------
 
-RECOVERY_FAMILIES = (
-    "identity", "xor_const", "add_const", "sub_const", "mask_const", "rotl",
-    "affine", "gf2_linear", "table", "bounds", "xor_join", "sum_join",
-    "difference", "affine_join", "recurrence",
-)
+RECOVERY_FAMILIES = tuple(grammar.FAMILIES)
 
 
 class RecoveryModel(Model):
@@ -469,6 +475,11 @@ class RecoveryModel(Model):
   def as_recovery_model(self):
     return {"family": self.family, "params": dict(self.params),
             "width": self.width, "arity": self.arity}
+
+  def apply(self, args):
+    if self.family == "table" and (not args or args[0] not in self.params["domain"]):
+      return None
+    return super().apply(args)
 
   def build(self, b, args):
     p, family = self.params, self.family
@@ -507,7 +518,11 @@ class RecoveryModel(Model):
       return out
     if family == "bounds":
       # low <= x <= high, as the unsigned range test (x - low) <u (high-low+1).
-      span = (p["high"] - p["low"]) & self.mask
+      if not 0 <= p["low"] <= p["high"] <= self.mask:
+        raise ValueError("invalid unsigned bounds")
+      span = p["high"] - p["low"]
+      if span == self.mask:
+        return b.const(1)
       inside = b.ult(b.sub(x, b.const(p["low"])), b.const((span + 1) & self.mask))
       return b.ite(inside, b.const(1), b.const(0))
     if family == "xor_join":
@@ -537,6 +552,8 @@ class RecoveryModel(Model):
           continue
         params = dict(self.params)
         params[key] = nudged
+        if self.family == "bounds" and params["low"] > params["high"]:
+          continue
         out.append(self._sibling(params))
     if self.family == "table" and self.params.get("values"):
       values = list(self.params["values"])
@@ -658,16 +675,22 @@ class SymbolicOracle:
 
   def evaluate(self, args):
     self.calls += 1
+    if len(args) != self.arity:
+      raise ValueError("oracle interface mismatch")
     solver = self._solver()
     for variable, value in zip(self.variables, args):
       solver.add(variable == (value & self.mask))
-    values = solver.eval(self.expression, 1)
+    values = solver.eval(self.expression, 2)
+    if len(values) != 1:
+      raise ValueError("expression is not a function of the declared inputs")
     return values[0] & self.mask
 
   def equivalence_sliced(self, model, fixed, position):
     """Prove or refute equality with one operand pinned to a constant."""
     if len(self.variables) != 2:
       return {"method": "solver", "status": "inconclusive", "reason": "interface-mismatch"}
+    if not total_model(model):
+      return {"method": "solver", "status": "inconclusive", "reason": "domain-too-large"}
     free = self.variables[0] if position == 1 else self.variables[1]
     pinned = self.variables[1] if position == 1 else self.variables[0]
     backend = ClaripyBackend(self.width, self.cl)
@@ -687,6 +710,8 @@ class SymbolicOracle:
 
   def equivalence(self, model):
     """Prove or refute equality against the lifted expression."""
+    if not total_model(model):
+      return {"method": "solver", "status": "inconclusive", "reason": "domain-too-large"}
     backend = ClaripyBackend(self.width, self.cl)
     try:
       candidate = model.build(backend, list(self.variables))
@@ -707,8 +732,21 @@ class SymbolicOracle:
 # --------------------------------------------------------------------------
 
 
+def total_model(model):
+  """A partial lookup must never become a total function by its fallthrough."""
+  if isinstance(model, LookupTable):
+    return len(model.params["table"]) == 1 << model.width
+  if isinstance(model, RecoveryModel) and model.family == "table":
+    domain = model.params["domain"]
+    return (len(domain) == 1 << model.width and len(set(domain)) == len(domain)
+            and min(domain) == 0 and max(domain) == model.mask)
+  return True
+
+
 def constructed_points(width, arity=1):
   """A deterministic probe set that exercises every bit position."""
+  if arity not in (1, 2):
+    raise ValueError("unsupported probe arity")
   m = mask_of(width)
   base = [0, 1, 2, 3, m, m - 1, m >> 1, (m >> 1) + 1]
   base += [(1 << i) & m for i in range(width)]
@@ -728,6 +766,8 @@ def constructed_points(width, arity=1):
 
 def domain_points(domain, arity=1):
   """Every point of a declared finite domain, or None when it is too large."""
+  if arity not in (1, 2):
+    raise ValueError("unsupported domain arity")
   if domain is None:
     return None
   size = int(domain)
@@ -768,40 +808,50 @@ def _agrees(model, oracle, points):
   return True
 
 
+def symbolic_model(spec):
+  """Keep the public model names while using one shared dictionary grammar."""
+  w, p, family = spec["width"], spec["params"], spec["family"]
+  if family == "identity":
+    return Identity(w)
+  if family == "xor_const":
+    return XorConst(w, k=p["k"])
+  if family == "mask_const":
+    return Mask(w, m=p["k"])
+  if family == "rotl":
+    return Rotate(w, r=p["r"])
+  if family in ("affine", "add_const", "sub_const"):
+    return Affine(w, a=p.get("a", -1 if family == "sub_const" else 1) & mask_of(w),
+                  b=p.get("b", p.get("k")))
+  if family == "gf2_linear":
+    columns = p["columns"]
+    if (len(columns) == w and all(c and c & (c - 1) == 0 for c in columns)
+        and len(set(columns)) == w):
+      return BitPermutation(w, perm=[c.bit_length() - 1 for c in columns])
+  if family == "bounds" and p["low"] == 0:
+    return Bound(w, n=p["high"] + 1)
+  if family == "table" and p["domain"] == list(range(len(p["domain"]))):
+    return LookupTable(w, table=p["values"])
+  if family in ("xor_join", "sum_join", "difference") and p["k"] == 0:
+    return {"xor_join": Xor2, "sum_join": Sum, "difference": Difference}[family](w)
+  return RecoveryModel(spec)
+
+
 def fit_models(oracle, width, domain=None):
-  """Every grammar member that matches the oracle on the constructed points."""
+  """Fit the shared grammar, adding explicitly bounded table/bound probes."""
   arity = getattr(oracle, "arity", 1)
+  if domain is not None and (type(domain) is not int or not 0 < domain <= 1 << width):
+    raise ValueError("domain must fit the declared word width")
   points = probe_set(width, arity, domain)
-  m = mask_of(width)
-  candidates = []
+  observations = [[list(args), oracle.evaluate(list(args))] for args in points]
+  specs = grammar.fit({"observations": observations}, width)
+  candidates = [symbolic_model(s) for s in specs
+                if s["family"] != "recurrence"
+                and (s["family"] != "table" or domain is not None)]
 
-  if arity == 2:
-    for model in (Xor2(width), Difference(width), Sum(width)):
-      if _agrees(model, oracle, points):
-        candidates.append(model)
-    return sorted(candidates, key=lambda mo: (mo.cost(), mo.kind))
-
-  f0 = oracle.evaluate([0])
-  f1 = oracle.evaluate([1])
-  fall = oracle.evaluate([m])
-
-  candidates.append(Identity(width))
-  candidates.append(XorConst(width, k=f0))
-  candidates.append(Mask(width, m=fall))
-  candidates.append(Affine(width, a=(f1 - f0) & m, b=f0))
-  for r in range(width):
-    candidates.append(Rotate(width, r=r))
-
-  # A bit permutation only exists if every single-bit input maps to a single bit.
-  images = [oracle.evaluate([(1 << i) & m]) for i in range(width)]
-  if all(image and (image & (image - 1)) == 0 for image in images):
-    perm = [image.bit_length() - 1 for image in images]
-    if sorted(perm) == list(range(width)):
-      candidates.append(BitPermutation(width, perm=perm))
-
-  # A bound predicate, located by binary search on a monotone predicate.
-  if {f0, fall} <= {0, 1}:
-    low, high = 0, m + 1
+  # Locate a monotone prefix's boundary rather than guessing it from sparse
+  # positives. The shared fitter still judges every observation afterwards.
+  if arity == 1 and observations and {value for _, value in observations} <= {0, 1}:
+    low, high = 0, domain if domain is not None else 1 << width
     while low < high:
       middle = (low + high) // 2
       if oracle.evaluate([middle]) == 1:
@@ -810,19 +860,14 @@ def fit_models(oracle, width, domain=None):
         high = middle
     candidates.append(Bound(width, n=low))
 
-  # Each candidate is judged on its own probe set, so a bound is separated at
-  # its own boundary rather than only where the generic points happen to fall.
   kept = [model for model in candidates
           if _agrees(model, oracle, probe_set(width, arity, domain, model))]
-
-  # A table is exact over an enumerated finite domain, and is offered last so
-  # it never displaces a closed-form relation that also fits.
-  enumerated = domain_points(domain, 1)
-  if enumerated is not None:
-    table = [oracle.evaluate(list(args)) for args in enumerated]
-    kept.append(LookupTable(width, table=table))
-
-  return sorted(kept, key=lambda mo: (mo.cost(), mo.kind, json.dumps(mo.params, sort_keys=True)))
+  enumerated = domain_points(domain, arity)
+  if arity == 1 and enumerated is not None:
+    kept.append(LookupTable(width, table=[value for _, value in observations]))
+  unique = {json.dumps(m.describe(), sort_keys=True): m for m in kept}
+  return sorted(unique.values(), key=lambda m: (m.cost(), m.kind,
+                                                 json.dumps(m.params, sort_keys=True)))
 
 
 def fit_recurrence(states, width):
@@ -836,7 +881,7 @@ def fit_recurrence(states, width):
   if all(((t ^ s) & m) == constant for s, t in steps):
     return Recurrence(width, XorConst(width, k=constant))
   delta0, delta1 = (s1 - s0) & m, (s2 - s1) & m
-  if delta0 == delta1:
+  if delta0 == delta1 and all((t - s) & m == delta0 for s, t in steps):
     return Recurrence(width, Affine(width, a=1, b=delta0))
   # a*(s1-s0) == (s2-s1) determines a when the first difference is invertible.
   if delta0 % 2 == 1:
@@ -1191,7 +1236,10 @@ def region_report(name, adapter, phases, interface=None, **extra):
   elif inconclusive:
     status = "inconclusive"
   else:
-    status = "recovered"
+    complete = {p["phase"] for p in phases if p["status"] == "ok"}
+    status = "recovered" if {"lift", "test", "compose"} <= complete else "lifted"
+    if "lift" not in complete:
+      status = "inconclusive"
   return {"region": name, "adapter": adapter, "status": status,
           "phase_order": order, "failed_phases": failed,
           "inconclusive_phases": inconclusive,
@@ -1202,6 +1250,7 @@ def adapter_report(adapter, regions, **extra):
   recovered = [r for r in regions if r["status"] == "recovered"]
   return {"schema": SCHEMA, "adapter": adapter,
           "regions_total": len(regions), "regions_recovered": len(recovered),
+          "regions_lifted": sum(r["status"] == "lifted" for r in regions),
           "regions_inconclusive": sum(1 for r in regions if r["status"] == "inconclusive"),
           "regions_failed": sum(1 for r in regions if r["status"] == "failed"),
           "interpretation": "relative semantic-recovery cost under a fixed adapter; "
@@ -1271,6 +1320,7 @@ def _run(project, state, limits, started):
       break
     sim.step()
     steps += 1
+  sim.move(from_stash="active", to_stash="returned", filter_func=lambda s: s.addr == STOP)
   return sim, steps
 
 
@@ -1278,10 +1328,11 @@ def _lift_status(sim, steps, started):
   out = {"steps": steps, "returned_paths": len(sim.stashes.get("returned", [])),
          "active_paths": len(sim.active), "errors": len(sim.errored),
          "unconstrained": len(sim.unconstrained),
+         "deadended": len(sim.stashes.get("deadended", [])),
          "seconds": round(time.monotonic() - started, 4),
          "mode": "oracle-entry-symbolic-no-native-execution",
          "variables": [], "unresolved_reads": [], "domain_complete": False}
-  if sim.errored or sim.unconstrained:
+  if sim.errored or sim.unconstrained or sim.stashes.get("deadended"):
     out.update(status="inconclusive", reason="unsupported-operation")
   elif sim.active:
     out.update(status="inconclusive", reason="budget-exhausted")
@@ -1290,6 +1341,20 @@ def _lift_status(sim, steps, started):
   else:
     out.update(status="ok", reason=None)
   return out
+
+
+def return_domain(claripy, returned, declared, timeout_ms):
+  """Check path guards as well as values; a discarded guard is a lost input."""
+  covered = claripy.Or(*(claripy.And(*s.solver.constraints) for s in returned))
+  unknown = set(covered.variables) - set(declared)
+  if unknown:
+    return False, unknown, "unresolved-memory"
+  try:
+    solver = claripy.Solver(timeout=timeout_ms)
+    complete = not solver.satisfiable(extra_constraints=[claripy.Not(covered)])
+    return complete, set(), None if complete else "interface-mismatch"
+  except Exception:
+    return False, set(), "solver-unknown"
 
 
 def lift_region(spec, limits):
@@ -1306,7 +1371,7 @@ def lift_region(spec, limits):
   """
   import angr
   from angr.calling_conventions import SimCCSystemVAMD64
-  from angr.sim_type import (SimTypeFunction, SimTypeInt, SimTypeLongLong,
+  from angr.sim_type import (SimTypeFunction, SimTypeInt, SimTypeLongLong, SimTypeShort,
                              SimTypePointer, SimTypeChar)
 
   claripy = _load_claripy()
@@ -1326,7 +1391,7 @@ def lift_region(spec, limits):
     args = [claripy.BVS(n, width, explicit_name=True) for n in names]
     # The declared width drives the prototype, so a narrow interface is passed
     # and read at its own width instead of being widened into register noise.
-    scalar = {8: SimTypeChar, 32: SimTypeInt, 64: SimTypeLongLong}.get(width)
+    scalar = {8: SimTypeChar, 16: SimTypeShort, 32: SimTypeInt, 64: SimTypeLongLong}.get(width)
     if scalar is None:
       raise ValueError(f"unsupported int-words width {width}")
     proto = SimTypeFunction([scalar()] * len(args), scalar())
@@ -1335,6 +1400,8 @@ def lift_region(spec, limits):
                                        prototype=proto, **options)
   elif abi == "buffer-in-out":
     width = int(interface.get("width", 8))
+    if width != 8:
+      raise ValueError("buffer-in-out exposes byte lanes only")
     count = int(interface["input_bytes"])
     proto = SimTypeFunction([SimTypePointer(SimTypeChar()),
                              SimTypePointer(SimTypeChar())], SimTypeInt(False))
@@ -1357,6 +1424,11 @@ def lift_region(spec, limits):
   declared = declared_inputs(interface)
   returned = sim.stashes["returned"]
   oracles, free = {}, set()
+  complete, unresolved, reason = return_domain(claripy, returned, declared, limits["solver_ms"])
+  lift["domain_complete"] = complete
+  if not complete:
+    lift.update(status="inconclusive", reason=reason, unresolved_reads=sorted(unresolved))
+    return lift, {}
 
   if abi == "int-words":
     expression, covered = claripy.BVV(0, width), claripy.false()
@@ -1367,8 +1439,6 @@ def lift_region(spec, limits):
       expression = claripy.If(condition, finished.regs.rax[width - 1:0], expression)
     expression = claripy.simplify(expression)
     free |= expression.variables | covered.variables
-    solver = claripy.Solver()
-    lift["domain_complete"] = not solver.satisfiable(extra_constraints=[claripy.Not(covered)])
     lift["ast_nodes"] = _ast_size(expression)
     lift["ast_depth"] = expression.depth
     oracles["result"] = SymbolicOracle(claripy, expression, args, width, limits["solver_ms"])
@@ -1380,7 +1450,6 @@ def lift_region(spec, limits):
                   note="more than one returned path; lane expressions would hide a branch")
       return lift, {}
     finished = returned[0]
-    lift["domain_complete"] = True
     lanes, nodes = [], 0
     for index in range(int(interface["output_bytes"])):
       expression = claripy.simplify(finished.memory.load(OUT_BASE + index, 1))
@@ -1427,17 +1496,22 @@ def analyze(spec, lift, oracles):
   slice_result = validate_slice(lift, interface)
   phases.append(slice_result)
   phases.append(forward_local_memory(lift, slice_result))
+  if slice_result["status"] != "ok":
+    return phases, {}
 
   fitted, fits, tests = {}, [], []
   for site, oracle in sorted(oracles.items()):
     models = fit_models(oracle, width, domain)
-    fitted[site] = models[0] if models else None
+    fitted[site] = None
     fits.append({"site": site, "candidates": [m.describe() for m in models]})
-    if models:
-      result = test_model(models[0], oracle, width, domain)
+    for model in models:
+      result = test_model(model, oracle, width, domain)
       result["site"] = site
       tests.append(result)
-  if not any(fitted.values()):
+      if result["accepted"]:
+        fitted[site] = model
+        break
+  if not any(row["candidates"] for row in fits):
     phases.append(phase("fit", "inconclusive", "no-candidate-model", sites=fits))
     sliced = slice_family(oracles, width, domain,
                           seconds=spec.get("limits", {}).get("slice_seconds", 300))
@@ -1445,16 +1519,17 @@ def analyze(spec, lift, oracles):
       phases.append(sliced)
     return phases, fitted
   phases.append(phase("fit", "ok", sites=fits,
-                      sites_fitted=sum(1 for m in fitted.values() if m is not None),
+                      sites_fitted=sum(bool(row["candidates"]) for row in fits),
                       sites_total=len(oracles)))
   accepted = [t for t in tests if t["accepted"]]
   if not accepted:
     phases.append(phase("test", "inconclusive",
                         tests[0]["reason"] if tests else "no-candidate-model",
-                        sites=tests, sites_accepted=0, sites_total=len(tests)))
+                        sites=tests, sites_accepted=0, sites_total=len(oracles)))
   else:
-    phases.append(phase("test", "ok", sites=tests, sites_accepted=len(accepted),
-                        sites_total=len(tests)))
+    phases.append(phase("test", "ok" if len(accepted) == len(oracles) else "inconclusive",
+                        None if len(accepted) == len(oracles) else "no-candidate-model",
+                        sites=tests, sites_accepted=len(accepted), sites_total=len(oracles)))
   phases.append(probe_model_reuse(fitted, oracles, width, domain))
   if lift.get("abi") == "buffer-in-out":
     sources = [lane["source"] for lane in lift["lanes"]]
@@ -1502,16 +1577,18 @@ def slice_family(oracles, width, domain=None, seconds=None):
         slices_accepted=0, slices_probed=0, seconds=round(time.monotonic() - started, 4))
   accepted = [r for r in rows if r["accepted"]]
   kinds = sorted({r["model"]["kind"] for r in accepted})
+  repeated = [kind for kind in kinds if sum(r["model"]["kind"] == kind for r in accepted) >= 2]
   common = {"slices": rows, "slices_accepted": len(accepted),
             "slices_probed": len(rows), "slices_available": len(SLICE_POINTS),
             "budget_exhausted": exhausted,
             "seconds": round(time.monotonic() - started, 4)}
   if exhausted and len(accepted) < 2:
     return phase("slice-family", "inconclusive", "budget-exhausted", **common)
-  if len(accepted) < 2:
+  if not repeated:
     return phase("slice-family", "inconclusive", "single-site", **common,
                  note="fewer than two pinned slices are explained; this is not a summary")
-  return phase("slice-family", "ok", **common, kinds=kinds)
+  return phase("slice-family", "ok", **common, kinds=repeated,
+               scope="independently proved pinned slices; no general parameter-transfer law")
 
 
 def worker(argv):
