@@ -30,11 +30,93 @@ def cost_accounting(report):
 def report_violations(report):
     """Validate before computing coverage; malformed reports fail explicitly."""
     violations = []
-    for check in (invariants, call_violations, policy_violations):
+    for check in (invariants, call_violations, policy_violations, plan_violations):
         try:
             violations.extend(check(report))
         except (KeyError, TypeError, ValueError) as exc:
             violations.append(f"{check.__name__}: malformed report: {exc}")
+    return violations
+
+
+BOUNDARY_REASONS = ("external-abi", "address-exposure", "unsupported-operation",
+                    "object-escape", "component-limit", "interface-mismatch", "budget-loss")
+PLAN_FAMILIES = ("none", "xor-prefix-pair", "additive-pair")
+PLAN_VERIFICATION = ("unverified", "algebraic", "enumerated", "smt")
+PLAN_CONSUMERS = ("branch-choice", "address", "return", "call", "store", "phi",
+                  "unsupported-consumer")
+
+
+def plan_violations(report):
+    """The private typed plan checked against itself and against its own row.
+
+    A row without a plan is unknown, not a violation: the planner publishes one
+    only when it was asked to. A plan that is present must agree with the
+    accounting beside it, must carry the compiler's own validation result, and
+    must not report an unmeasured inventory as a set of zeroes.
+    """
+    violations = []
+    for row in report.get("connected_regions", []):
+        plan = row.get("plan")
+        if plan is None:
+            continue
+        where = f"{row['function']} plan"
+        if plan.get("plan_version") != 1:
+            violations.append(f"{where}: unsupported plan version {plan.get('plan_version')!r}")
+            continue
+        if not plan.get("sealed"):
+            violations.append(f"{where}: published without sealing the original graph")
+        # The compiler validates its own plan; a nonempty list is a planner bug
+        # and is never allowed to pass silently.
+        for detail in plan.get("violations", []):
+            violations.append(f"{where}: {detail}")
+        if plan.get("eligible_nodes") != row.get("eligible_nodes"):
+            violations.append(f"{where}: eligible nodes disagree with the row")
+        costs = plan.get("costs", {})
+        for field, key in (("eligible_estimated", "eligible_estimated_cost"),
+                           ("selected_estimated", "selected_estimated_cost"),
+                           ("skipped_estimated", "skipped_estimated_cost"),
+                           ("lost_estimated", "shard_lost_estimated_cost")):
+            if key in row and costs.get(field) != row[key]:
+                violations.append(f"{where}: {field} disagrees with {key}")
+        # Generated instructions must never enter a denominator.
+        if len(plan.get("operations", [])) > (plan.get("eligible_nodes") or 0):
+            violations.append(f"{where}: more planned operations than eligible nodes")
+        for op in plan.get("operations", []):
+            if op["selected"] and op["reason"] is not None:
+                violations.append(f"{where}: {op['origin']} is selected and carries a skip reason")
+            if not op["selected"] and op["reason"] not in BOUNDARY_REASONS:
+                violations.append(f"{where}: {op['origin']} was dropped without a known reason")
+        for rep in plan.get("representations", []):
+            if rep["family"] not in PLAN_FAMILIES:
+                violations.append(f"{where}: unknown representation family {rep['family']!r}")
+            if rep["verification"] not in PLAN_VERIFICATION:
+                violations.append(f"{where}: unknown verification {rep['verification']!r}")
+            if not rep["lanes"] or not rep["invariant"] or not rep["seed_namespace"]:
+                violations.append(f"{where}: representation without lanes, invariant or namespace")
+        for site in plan.get("decodes", []):
+            if site["consumer"] not in PLAN_CONSUMERS:
+                violations.append(f"{where}: unknown decode consumer {site['consumer']!r}")
+            if site["reason"] not in BOUNDARY_REASONS:
+                violations.append(f"{where}: decode at {site['origin']} without a known reason")
+            if site["uses"] < 1:
+                violations.append(f"{where}: decode at {site['origin']} serves no use")
+        inventory = plan.get("boundary_inventory", {})
+        counted = ("total_scalar_use_edges", "absorbed_edges", "constant_entries",
+                   "protected_operations", "exposures", "useful_work_total", "useful_work_max")
+        if inventory.get("measured"):
+            if set(inventory.get("scalar_use_edges", {})) != set(BOUNDARY_REASONS):
+                violations.append(f"{where}: inventory vocabulary is not the fixed one")
+            if inventory.get("exposures") != len(plan.get("decodes", [])):
+                violations.append(f"{where}: exposures disagree with the decode sites")
+            if sum(inventory.get("scalar_use_edges", {}).values()) != inventory.get("total_scalar_use_edges"):
+                violations.append(f"{where}: scalar-use edges do not sum to the total")
+            if inventory.get("useful_work_max", 0) > inventory.get("protected_operations", 0):
+                violations.append(f"{where}: useful work exceeds the protected operations")
+        else:
+            # An unmeasured inventory is unknown. Publishing it as zero would
+            # read as "no boundaries", which is the opposite of the truth.
+            if any(inventory.get(key) is not None for key in counted):
+                violations.append(f"{where}: unmeasured inventory published counts instead of null")
     return violations
 
 

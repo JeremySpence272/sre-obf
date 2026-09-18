@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/NativeBudget.h"
+#include "llvm/Transforms/Obfuscator/NativePlan.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InstIterator.h"
 
@@ -50,6 +51,7 @@ json::Array budgetNativeStructure(Module &M, ModuleAnalysisManager &AM,
     if (Charge > Grant) report_fatal_error("native structural allocation exceeded its transaction");
     Pool -= Charge;
     Report.push_back(json::Object{{"function", F->getName().str()}, {"status", Status},
+        {"origin", plan::originId(F->getName(), "function", 0)},
         {"source_weight", Weight}, {"instructions_before", Before}, {"instructions_after", After},
         {"growth_grant", Grant}, {"growth_charge", Charge}, {"remaining_pool", Pool}});
   }
