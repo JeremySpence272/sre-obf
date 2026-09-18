@@ -29,7 +29,7 @@ def boundary(**overrides):
 def report(*rows, feature=True):
     # connected_regions is what the shared gate's other checks read; an empty
     # planner report keeps this file about the arbitration alone.
-    return {"schema": "sre-native-v5", "features": {"call_policy": feature},
+    return {"schema": "sre-native-v6", "features": {"call_policy": feature},
             "connected_regions": [], "call_policy": list(rows)}
 
 
@@ -96,7 +96,7 @@ class OutcomeTests(unittest.TestCase):
 
 class DenominatorTests(unittest.TestCase):
     def test_a_missing_array_is_unknown_not_zero(self):
-        coverage = policy_coverage({"schema": "sre-native-v5"})
+        coverage = policy_coverage({"schema": "sre-native-v6"})
         self.assertIsNone(coverage["source_functions"])
         self.assertIsNone(coverage["policies"])
 

@@ -628,7 +628,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     std::error_code EC;
     raw_fd_ostream OS(NativeReport, EC, sys::fs::OF_Text);
     if (EC) report_fatal_error(Twine("native report: ") + EC.message());
-    json::Object Result{{"schema", "sre-native-v5"},
+    json::Object Result{{"schema", "sre-native-v6"},
                         {"profile", "native-" + NativeLevel.getValue() + "-ir"},
                         {"seed", std::to_string(static_cast<uint64_t>(ObfSeed))},
                         {"vm", false}, {"injected_assembly", false},

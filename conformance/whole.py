@@ -18,7 +18,8 @@ IR_BUDGET_MULTIPLIER, IR_BUDGET_MAX = 50, 30000
 
 EXPERIMENTS = ("fusion", "memory", "values", "values-wide", "coupled-state", "invariant", "outline",
                "memory-ssa", "predicate-regions", "regional-families", "support-regions", "scale-budget", "scale-structure",
-               "connected-shards", "connected-aggregates", "joint-outputs", "encoded-calls")
+               "connected-shards", "connected-aggregates", "joint-outputs", "encoded-calls",
+               "call-policy", "plan")
 
 # P6 useful data/control relation experiment. "stale-relation" is the
 # canonical-repair arm: transitions are keyed on the live encoded-data word
@@ -51,6 +52,8 @@ def parser():
     p.add_argument("--value-nodes", type=int, default=24)
     p.add_argument("--region-plan", choices=("legacy", "connected"), default="legacy")
     p.add_argument("--connected-nodes", type=int, default=128)
+    p.add_argument("--semantic-budget", type=int, default=0,
+                   help="percent of the component limit reserved for components owning encoded storage (0..50); 0 is the previous selection exactly")
     p.add_argument("--post-o2-attack", action="store_true")
     p.add_argument("--control-only", action="store_true", help="Build only the matched clean arm, including when a protected build cannot compile")
     p.add_argument("--no-disassembly", action="store_true", help="Skip full ELF disassembly for large scale-only runs; not a survival test")
@@ -79,8 +82,15 @@ def build(args):
         raise ValueError("connected regions require --values --values-wide")
     if any((args.memory_ssa, args.predicate_regions, args.regional_families, args.support_regions,
             args.scale_budget, args.connected_shards, args.connected_aggregates,
-            args.joint_outputs, args.encoded_calls)) and args.region_plan != "connected":
+            args.joint_outputs, args.encoded_calls, args.call_policy, args.plan)
+           ) and args.region_plan != "connected":
         raise ValueError("connected subfeatures require --region-plan connected")
+    if not 0 <= args.semantic_budget <= 50:
+        raise ValueError("--semantic-budget must be 0..50")
+    if args.semantic_budget and args.region_plan != "connected":
+        raise ValueError("--semantic-budget requires --region-plan connected")
+    if args.call_policy and not args.encoded_calls:
+        raise ValueError("--call-policy requires --encoded-calls")
     if args.memory_ssa and not args.memory:
         raise ValueError("--memory-ssa requires --memory")
     if args.connected_aggregates and not args.memory_ssa:
@@ -134,7 +144,8 @@ def build(args):
     feature_flags = [f"-native-{name}={int(getattr(args, name.replace('-', '_')))}" for name in EXPERIMENTS]
     feature_flags += [f"-native-region-plan={args.region_plan}", f"-native-connected-nodes={args.connected_nodes}",
                       f"-native-lane-transitions={LANE_TRANSITIONS[args.lane_transitions]}",
-                      f"-native-merge={int(not args.no_merge)}"]
+                      f"-native-merge={int(not args.no_merge)}",
+                      f"-native-semantic-budget={args.semantic_budget}"]
     if not args.control_only:
         runner.run(opt_command(plugin) + ["-passes=native-obfuscation", f"-native-level={args.profile}",
                 *feature_flags, f"-native-value-nodes={args.value_nodes}",

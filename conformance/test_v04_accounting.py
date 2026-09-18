@@ -42,7 +42,7 @@ def source_row(function="a", instructions=100, **overrides):
 
 
 def report(sources=("a",), planner=None, selection=None, merged=(), helpers=None,
-           final_functions=None, schema="sre-native-v5"):
+           final_functions=None, schema="sre-native-v6"):
     rows = [source_row(name) for name in sources]
     value = {"schema": schema,
              "features": {"module_instruction_limit": 250000, "helper_limit": 4096},

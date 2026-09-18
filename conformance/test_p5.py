@@ -161,7 +161,7 @@ class ReviewInterfaceTests(unittest.TestCase):
     def current(self, **overrides):
         row = call_row(encoded_function="helper.sre.encoded.1", partially_absorbed_arguments=0)
         row.update(overrides)
-        return {"schema": "sre-native-v5", "connected_regions": [], "encoded_calls": [row]}
+        return {"schema": "sre-native-v6", "connected_regions": [], "encoded_calls": [row]}
 
     def test_partial_and_complete_absorption_have_separate_counts(self):
         report = self.current(absorbed_arguments=1, partially_absorbed_arguments=1)
@@ -185,7 +185,7 @@ class ReviewInterfaceTests(unittest.TestCase):
         self.assertTrue(report_violations(self.current(status="unknown")))
 
     def test_feature_on_without_report_is_a_failure(self):
-        self.assertTrue(report_violations({"schema": "sre-native-v5", "connected_regions": [],
+        self.assertTrue(report_violations({"schema": "sre-native-v6", "connected_regions": [],
                                           "features": {"encoded_calls": True}}))
 
     def test_old_reports_leave_partial_absorption_unknown(self):

@@ -183,7 +183,7 @@ class PlanningInvariantTests(unittest.TestCase):
                                                        selected_estimated_cost=100000)))
 
     def test_atomic_shard_ceiling_and_region_totals_are_checked(self):
-        report = native_report(schema="sre-native-v5")
+        report = native_report(schema="sre-native-v6")
         row = report["connected_regions"][0]
         for region in row["regions"]:
             region["estimated_cost"] = 350

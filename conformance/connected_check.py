@@ -6,7 +6,10 @@ from conformance.call_policy import policy_violations
 from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, test_inputs
 
-SHARD_ACCOUNTING = ("sre-native-v3", "sre-native-v4", "sre-native-v5")
+SHARD_ACCOUNTING = ("sre-native-v3", "sre-native-v4", "sre-native-v5", "sre-native-v6")
+# Schemas carrying the v5 interface repairs: the partial-absorption counter,
+# the recorded encoded symbol and exact region cost sums.
+INTERFACE_ACCOUNTING = ("sre-native-v5", "sre-native-v6")
 # The fixed skip vocabulary of the encoded-call interface pass. A row with any
 # other reason is a reporting bug, not coverage.
 CALL_SKIPS = ("not-original", "exported-or-address-taken", "varargs", "eh-or-personality",
@@ -140,7 +143,7 @@ def call_violations(report):
             continue
         counters = ("parameters", "encoded_parameters", "callers", "call_sites_rewritten",
                     "result_rebuilds", "activation_allocas", "absorbed_arguments", "absorbed_results")
-        if report["schema"] == "sre-native-v5":
+        if report["schema"] in INTERFACE_ACCOUNTING:
             counters += ("partially_absorbed_arguments",)
             if (row["status"] == "encoded") != bool(row["encoded_function"]):
                 violations.append(f"{where}: encoded symbol does not match interface status")
@@ -215,7 +218,7 @@ def call_coverage(report):
                                  + row["result_rebuilds"] for row in encoded),
             "absorbed_arguments": sum(row["absorbed_arguments"] for row in encoded),
             "partially_absorbed_arguments": (sum(row["partially_absorbed_arguments"] for row in encoded)
-                                             if report["schema"] == "sre-native-v5" else None),
+                                             if report["schema"] in INTERFACE_ACCOUNTING else None),
             "absorbed_results": sum(row["absorbed_results"] for row in encoded),
             "activation_allocas": sum(row["activation_allocas"] for row in encoded),
             "wrappers_retained": sum(int(row["wrapper_retained"]) for row in rows),
@@ -281,7 +284,7 @@ def invariants(report):
             if missing:
                 violations.append(f"{where}: encoded accounting missing {', '.join(missing)}")
                 continue
-        if report["schema"] == "sre-native-v5":
+        if report["schema"] in INTERFACE_ACCOUNTING:
             # Region estimates now sum actual node costs, including both
             # representation parts of a shard; no proportional rounding loss.
             costs = {}
