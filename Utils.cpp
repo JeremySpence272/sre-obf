@@ -1,4 +1,5 @@
 #include "llvm/Transforms/Obfuscator/Utils.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleControl.h"
 #include "llvm/Transforms/Obfuscator/Rng.h"
 
 #include "llvm/ADT/Twine.h"
@@ -431,7 +432,9 @@ namespace llvm::obf {
 				if (!PN || PN->getParent() == nullptr)
 					continue;
 				// Your tree already uses the std::optional overload.
-				llvm::DemotePHIToStack(PN, std::nullopt);
+				llvm::MDNode* BundleState = PN->getMetadata(llvm::obf::NativeBundleControlState);
+				if (auto* Slot = llvm::DemotePHIToStack(PN, std::nullopt); Slot && BundleState)
+					Slot->setMetadata(llvm::obf::NativeBundleControlState, BundleState);
 				Changed = true;
 			}
 

@@ -157,8 +157,14 @@ def main():
     parser.add_argument("--pins", type=int, nargs="+", choices=(0, 1), default=[0, 1])
     parser.add_argument("--shapes", nargs="+", choices=SHAPES, default=list(SHAPES))
     parser.add_argument("--bundle-loop-boundaries", action="store_true")
+    parser.add_argument("--bundle-control", action="store_true")
+    parser.add_argument("--control-ablation", action="store_true", help="matched control-off arm, retaining flattening")
+    parser.add_argument("--control-profile", choices=("smoke", "max"), default="smoke")
+    parser.add_argument("--control-passes", default="flattening", help="application pass filter; all uses the full profile")
     parser.add_argument("--exhaustive-byte-pairs", action="store_true")
     args = parser.parse_args()
+    if not args.bundle_control and (args.control_ablation or args.control_profile != "smoke" or args.control_passes != "flattening"):
+        parser.error("control experiment options require --bundle-control")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     plugin = out / "Obfuscator.so"
@@ -167,6 +173,9 @@ def main():
     summary = {"schema": "sre-bundle-loop-conformance-v1", "passed": False, "complete": False,
                "plugin_sha256": digest(plugin), "cases": [], "hardness_evaluated": False,
                "scalar_input_boundaries": args.bundle_loop_boundaries,
+               "control_ablation": args.control_ablation,
+               "control_profile": args.control_profile if args.bundle_control else None,
+               "control_passes": args.control_passes if args.bundle_control else None,
                "exhaustive_byte_pairs_requested_trip_count": 2 if args.exhaustive_byte_pairs else None}
     flags = ["-passes=native-obfuscation", "-native-level=smoke", "-native-passes=constenc",
              "-native-strings=0", "-native-data=0", "-native-helper-hardening=0",
@@ -175,6 +184,10 @@ def main():
              "-native-plan=1", "-native-scale-budget=1", "-native-bundles=1", "-native-transfer-nodes=12",
              "-native-bundle-loops=1", f"-native-bundle-loop-boundaries={int(args.bundle_loop_boundaries)}",
              "-obf-deterministic", "-obf-verify"]
+    if args.bundle_control:
+        flags = [f for f in flags if f not in ("-native-passes=constenc", "-native-level=smoke")]
+        flags += [f"-native-level={args.control_profile}", "-native-bundle-control=1"]
+        if args.control_passes != "all": flags.append(f"-native-passes={args.control_passes}")
     try:
         driver = out / "driver.o"
         runner.run(["clang", "-O2", "-pthread", "-c", str(FIXTURES / "bundle_loop_driver.c"), "-o", str(driver)])
@@ -212,6 +225,9 @@ def main():
                                 loop = region["loop"]
                                 encoded = shape not in FALLBACKS or (shape in EXPOSED and args.bundle_loop_boundaries)
                                 if encoded:
+                                    if args.bundle_control:
+                                        control = next(r for r in data["bundle_control"] if r["function"] == "kernel")
+                                        if control["status"] != "coupled": raise ToolFailure("persistent data/control relation was not emitted")
                                     if loop["status"] != "encoded": raise ToolFailure("recurrence fell back: " + loop["reason"])
                                     if len(loop["backedges"]) != (2 if shape == "multi-latch" else 1):
                                         raise ToolFailure("missing edge-specific tuple join")
@@ -226,19 +242,37 @@ def main():
                                 before = digest(protected)
                                 runner.run(command)
                                 if digest(protected) != before: raise ToolFailure("nondeterministic emission")
-                                for normalized in (False, True):
-                                    selected = protected
-                                    if normalized:
-                                        selected = case / (name + "-post-o2.ll")
-                                        runner.run(["opt", "-passes=default<O2>,verify", "-S", str(protected), "-o", str(selected)])
-                                    binary = selected.with_suffix(".bin")
-                                    runner.run(["clang", "-pthread", str(selected), str(driver), "-o", str(binary)])
-                                    if runner.run([str(binary)], stdin=stdin) != expected:
-                                        raise ToolFailure(f"{name}: full-output mismatch, post-O2={normalized}")
+                                arms = {name: protected}
+                                if args.control_ablation:
+                                    disabled = case / (name + "-disabled.ll")
+                                    off_report = case / (name + "-disabled.json")
+                                    off_command = [f for f in command if not f.startswith(("-native-report-json=", "-native-stage-dir="))]
+                                    off_command = ["-native-bundle-control=0" if f == "-native-bundle-control=1" else
+                                                   str(disabled) if f == str(protected) else f for f in off_command]
+                                    off_command += [f"-native-report-json={off_report}"]
+                                    runner.run(off_command)
+                                    off = json.loads(off_report.read_text())
+                                    errors = report_violations(off)
+                                    if errors: raise ToolFailure("control-off: " + "; ".join(errors))
+                                    if not any(r["function"] == "kernel" and r["words"] == 3 for r in off["flattening_state"]):
+                                        raise ToolFailure("matched control-off arm lost multi-state flattening")
+                                    arms[name + "-disabled"] = disabled
+                                for arm, source in arms.items():
+                                    for normalized in (False, True):
+                                        selected = source
+                                        if normalized:
+                                            selected = case / (arm + "-post-o2.ll")
+                                            runner.run(["opt", "-passes=default<O2>,verify", "-S", str(source), "-o", str(selected)])
+                                        binary = selected.with_suffix(".bin")
+                                        runner.run(["clang", "-pthread", str(selected), str(driver), "-o", str(binary)])
+                                        if runner.run([str(binary)], stdin=stdin) != expected:
+                                            raise ToolFailure(f"{arm}: full-output mismatch, post-O2={normalized}")
                                 summary["cases"].append({"width": width, "shape": shape, "seed": seed,
                                     "family": family, "pins": bool(pins), "phases": phases, "vectors": len(values),
                                     "loop": loop, "passed": True, "post_o2_correct": True,
-                                    "deterministic": True, "reentry_and_threads": True})
+                                    "deterministic": True, "reentry_and_threads": True,
+                                    "control_disabled_correct": True if args.control_ablation else None})
+                                if args.bundle_control: summary["cases"][-1]["control"] = data["bundle_control"]
                                 dump(out / "summary.json", summary)
                                 print(f"i{width} {shape} {name}: passed", flush=True)
         summary.update(passed=True, complete=True)

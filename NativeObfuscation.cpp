@@ -6,6 +6,7 @@
 #include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/NativeBudget.h"
 #include "llvm/Transforms/Obfuscator/NativeBundle.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleControl.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InlineAsm.h"
@@ -252,6 +253,8 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     report_fatal_error("native bundle limits require 2..4 values and 8..32 transfer nodes");
   if (NativeBundles && NativeRegionPlan != "connected")
     report_fatal_error("native-bundles requires native-region-plan=connected");
+  if (obf::nativeBundleControl() && (!NativeBundles || !NativeBundleLoops || !NativeMultiState))
+    report_fatal_error("native-bundle-control requires bundles, bundle loops and multi-state flattening");
   if (NativeBundleCallInputs && (!NativeBundles || !NativeEncodedCalls))
     report_fatal_error("native-bundle-call-inputs requires native-bundles and native-encoded-calls");
   if (NativeBundleCallOutputs && (!NativeBundles || !NativeEncodedCalls))
@@ -764,6 +767,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"immutable_bundles", NativeImmutableBundles.getValue()},
                             {"bundle_call_inputs", NativeBundleCallInputs.getValue()},
                             {"bundle_call_outputs", NativeBundleCallOutputs.getValue()},
+                            {"bundle_control", obf::nativeBundleControl()},
                             {"continuity_priority", NativeContinuityPriority.getValue()},
                             {"immutable_continuity_contract", 2},
                             {"object_bundle_contract", 3},
@@ -799,6 +803,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"functions", std::move(Coverage)}};
     Result["encoded_calls"] = std::move(CallCoverage);
     if (NativeBundles) {
+      if (obf::nativeBundleControl()) Result["bundle_control"] = obf::nativeBundleControlInventory(M, BundleCoverage);
       Result["bundle_input_inventory"] = std::move(BundleOrigins);
       Result["bundles"] = std::move(BundleCoverage);
       if (NativeBundleCallInputs) Result["bundle_call_inputs"] = std::move(BundleCallInputs);

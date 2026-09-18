@@ -11,6 +11,7 @@
 #include "llvm/Transforms/Obfuscator/PassCtx.h"
 #include "llvm/Transforms/Obfuscator/FunctionObfContextAnalysis.h"
 #include "llvm/Transforms/Obfuscator/NativeInvariant.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleControl.h"
 #include "llvm/Transforms/Obfuscator/Flattening.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationAnnotationAnalysis.h"
 #include "llvm/Transforms/Obfuscator/ObfuscationOptions.h"
@@ -164,6 +165,7 @@ namespace {
 		AllocaInst* MultiSalt = nullptr;
 		AllocaInst* ValueContext = nullptr;
 		AllocaInst* ValueWitness = nullptr;
+		SmallVector<AllocaInst*, 4> BundleWords;
 		unsigned MultiFamily = 0;
 
 		llvm::obf::OpaqueUtils Opaque;
@@ -422,6 +424,7 @@ namespace {
 					ES = NS;
 				}
 			}
+			if (!PCtx.BundleWords.empty()) obf::nativeBundleControlKeys(B, EK, ES, PCtx.BundleWords, false);
 			V = multiStateEncode(B, PCtx, V, EK, ES);
 			if (PCtx.ValueContext && !obf::nativeLaneTransitions())
 				NextContext = B.CreateXor(V, NS);
@@ -1514,6 +1517,7 @@ namespace {
 				Lane->setVolatile(true);
 				obf::nativeLaneKeys(B, EK, ES, Lane);
 			}
+			if (!PCtx.BundleWords.empty()) obf::nativeBundleControlKeys(B, EK, ES, PCtx.BundleWords, true);
 			if (PCtx.Cfg.PerDispatcherDomain)
 				Token = dispatcherDomainIR(B, Token, I, Ctx);
 			for (unsigned J = 0; J < Cases.size(); ++J) {
@@ -1697,6 +1701,8 @@ namespace {
 		// Strategy: local reg2mem for CFG safety, then mem2reg after flattening.
 		llvm::SmallVector<llvm::AllocaInst*, 64> DemotedAllocas;
 		llvm::obf::demoteForCFGChange(F, DemotedAllocas);
+		if (obf::nativeBundleControl() && PCtx.Cfg.MultiState)
+			PCtx.BundleWords = obf::bindNativeBundleControl(F);
 
 		if (!prepareFlattening(PCtx)) {
 			// Restore SSA — we demoted above but built nothing.

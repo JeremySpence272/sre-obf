@@ -1,5 +1,6 @@
 #include "llvm/Transforms/Obfuscator/NativeBundle.h"
 #include "llvm/Transforms/Obfuscator/NativeBundleMath.h"
+#include "llvm/Transforms/Obfuscator/NativeBundleControl.h"
 #include "llvm/Transforms/Obfuscator/NativeCall.h"
 #include "llvm/Transforms/Obfuscator/NativeTransfer.h"
 #include "llvm/Transforms/Obfuscator/FunctionSnapshot.h"
@@ -353,6 +354,16 @@ class Lowering {
     }
     CarrierPhi = phi(M, "sre.bundle.loop.carrier"); M = CarrierPhi;
     if (P.Phases) PhasePhi = phi(c(0), "sre.bundle.loop.phase");
+    if (nativeBundleControl()) {
+      auto mark = [&](PHINode *Phi, StringRef Role) {
+        Phi->setMetadata(NativeBundleControlState, MDNode::get(F.getContext(), {
+            Tag->getOperand(0).get(), MDString::get(F.getContext(), Role),
+            ConstantAsMetadata::get(ConstantInt::get(B.getInt1Ty(), P.Phases))}));
+      };
+      mark(StatePhis[0], "state0"); mark(StatePhis[1], "state1");
+      mark(CarrierPhi, "carrier");
+      if (PhasePhi) mark(PhasePhi, "phase");
+    }
     if (!P.ScalarInputs.empty()) {
       // Header placement dominates ordinary users and the incoming edge of
       // outside PHI users. These plaintext projections are deliberately exposed

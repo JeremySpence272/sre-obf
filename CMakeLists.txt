@@ -85,6 +85,7 @@ set(OBF_SOURCES
   NativePlan.cpp
   NativeTransfer.cpp
   NativeBundle.cpp
+  NativeBundleControl.cpp
   NativeTile.cpp
   Utils.cpp
   OpaqueUtils.cpp

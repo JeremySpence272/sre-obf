@@ -33,6 +33,7 @@ def main():
     workload.add_argument("--immutable", action="store_true", help="four-output immutable_run case with matched off arms")
     workload.add_argument("--private-calls", action="store_true", help="recursive_run bundle-input case and matched off arms")
     parser.add_argument("--call-output-ablation", action="store_true", help="private-calls disabled arms turn off outputs, leaving inputs on")
+    parser.add_argument("--control-ablation", action="store_true", help="loop disabled arms retain flattening without bundle control")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--toolchain-image", required=True)
     parser.add_argument("--ghidra-image", required=True)
@@ -41,6 +42,8 @@ def main():
     args = parser.parse_args()
     if args.call_output_ablation and not args.private_calls:
         parser.error("--call-output-ablation requires --private-calls")
+    if args.control_ablation and not args.loop:
+        parser.error("--control-ablation requires --loop")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
     runner = Runner(ROOT, out / "logs", args.toolchain_image, mounts=(out, args.case), timeout=180)
@@ -56,8 +59,10 @@ def main():
                     str(FIXTURES / driver_source), "-o", str(driver)])
         selected = {"clean": args.case / "clean.ll", "native": args.case / (args.stem + ".ll"),
                     "post-o2": args.case / (args.stem + "-post-o2.ll")}
-        if args.tile or args.immutable or args.private_calls:
-            name = ("call-outputs" if args.call_output_ablation else "call-inputs") if args.private_calls else "immutable" if args.immutable else "tiles"
+        if args.tile or args.immutable or args.private_calls or args.control_ablation:
+            if args.control_ablation: name = "control"
+            elif args.private_calls: name = "call-outputs" if args.call_output_ablation else "call-inputs"
+            else: name = "immutable" if args.immutable else "tiles"
             selected[name + "-off"] = args.case / (args.stem + "-disabled.ll")
             selected[name + "-off-post-o2"] = args.case / (args.stem + "-disabled-post-o2.ll")
         expected = None

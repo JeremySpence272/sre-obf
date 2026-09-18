@@ -36,7 +36,11 @@ public:
 				auto* SI = llvm::dyn_cast<llvm::StoreInst>(&I);
 				if (!SI || SI->isVolatile() || SI->isAtomic())
 					continue;
-				if (!llvm::isa<llvm::AllocaInst>(SI->getPointerOperand()))
+				auto* AI = llvm::dyn_cast<llvm::AllocaInst>(SI->getPointerOperand());
+				// Persistent data/control binding proves a closed direct-access
+				// contract. Do not introduce unclassified integer pointer aliases
+				// after that proof; ordinary application stores remain eligible.
+				if (!AI || AI->getMetadata("sre.native.bundle.control-bound"))
 					continue;
 				llvm::Type* ValTy = SI->getValueOperand()->getType();
 				if (!ValTy->isIntegerTy() && !ValTy->isFloatingPointTy())

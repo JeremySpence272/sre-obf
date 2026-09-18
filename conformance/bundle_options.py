@@ -9,6 +9,7 @@ def add_options(parser):
     parser.add_argument("--continuity-priority", action="store_true")
     parser.add_argument("--bundle-call-inputs", action="store_true")
     parser.add_argument("--bundle-call-outputs", action="store_true")
+    parser.add_argument("--bundle-control", action="store_true")
     parser.add_argument("--transfer-family", choices=("xor", "additive", "seeded"))
     parser.add_argument("--bundle-values", type=int, choices=(2, 3, 4))
     parser.add_argument("--transfer-nodes", type=int, choices=range(8, 33))
@@ -24,7 +25,7 @@ def validate(args, connected):
                   for key in ("transfer_family", "bundle_values", "transfer_nodes"))
     switches = any(getattr(args, key, False) for key in
                    ("no_bundle_pins", "bundle_loops", "bundle_phases", "bundle_loop_boundaries",
-                    "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs"))
+                    "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "bundle_control"))
     if not enabled and (choices or switches):
         raise ValueError("bundle options require --bundles")
     if getattr(args, "object_phases", False) and not getattr(args, "object_bundles", False):
@@ -33,6 +34,10 @@ def validate(args, connected):
         raise ValueError("--bundle-call-inputs requires --encoded-calls")
     if getattr(args, "bundle_call_outputs", False) and not getattr(args, "encoded_calls", False):
         raise ValueError("--bundle-call-outputs requires --encoded-calls")
+    if getattr(args, "bundle_control", False) and not getattr(args, "bundle_loops", False):
+        raise ValueError("--bundle-control requires --bundle-loops")
+    if getattr(args, "bundle_control", False) and getattr(args, "no_multistate", False):
+        raise ValueError("--bundle-control requires multi-state flattening")
     if getattr(args, "bundle_phases", False) and not getattr(args, "bundle_loops", False):
         raise ValueError("--bundle-phases requires --bundle-loops")
     if getattr(args, "bundle_loop_boundaries", False) and not getattr(args, "bundle_loops", False):
@@ -50,7 +55,7 @@ def flags(args):
             f"-native-bundle-pins={int(not getattr(args, 'no_bundle_pins', False))}"] + [
             "-native-" + key.replace("_", "-") + "=1"
             for key in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries",
-                        "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs")
+                        "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "bundle_control")
             if getattr(args, key, False)]
 
 
@@ -62,6 +67,6 @@ def argv(args):
             out += ["--" + name.replace("_", "-"), str(getattr(args, name))]
     if getattr(args, "no_bundle_pins", False): out.append("--no-bundle-pins")
     for name in ("bundle_loops", "bundle_phases", "bundle_loop_boundaries",
-                 "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs"):
+                 "object_bundles", "object_phases", "immutable_bundles", "continuity_priority", "bundle_call_inputs", "bundle_call_outputs", "bundle_control"):
         if getattr(args, name, False): out.append("--" + name.replace("_", "-"))
     return out

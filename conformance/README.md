@@ -5,6 +5,35 @@ contains source, IR, maps, seeds, and decompiler entry addresses. Never expose i
 to a binary-only agent. Ghidra is deliberately given the target entry address:
 this diagnostic measures normalization separately from discovery.
 
+## What the test groups prove
+
+Conformance separates correctness, retained coverage, normalization survival,
+recovery cost and generalization. Passing one does not establish the others.
+
+| Group | Main entry points | Question answered |
+|---|---|---|
+| Representation mathematics | `*_model.py`, `connected_proof.py` | Do the bounded integer transfer, conversion and state laws preserve values? |
+| Actual emitted expressions | `bundle_lift.py`, `bundle_control_proof.py` | Does a supported emitted IR slice agree with its independent specification? |
+| Basic compiler integration | `run.py`, `whole.py` | Do matched clean and protected builds produce the same complete outputs? |
+| Persistent values and loops | `bundle_run.py`, `bundle_loop_run.py`, `value_edges.py` | Are values preserved across updates, PHIs, zero-trip loops, joins and exits? |
+| Mutable and immutable storage | `tile_run.py`, `immutable_run.py` | Are initialization, indexed accesses, updates, tails and phase changes correct? |
+| Private interfaces | `recursive_run.py`, call-bundle report gates | Do arguments/results remain correct across callers, recursion and per-activation state? |
+| Safe fallback | `*_controls.py`, `rollback.py` | Are unsupported shapes refused, and do failed transactions restore valid code? |
+| Compiler normalization | `--post-o2-attack`, saved assembly | What remains after a second, explicitly experimental stock-O2 simplification pass? |
+| Decompiler normalization | Ghidra integration, `bundle_decompile.py` | What C/p-code does the matched stripped binary produce at the supplied entry? |
+| Semantic recovery | `extract_supplied.py`, `extract_discovery.py`, `relation_recovery.py` | Can a particular recovery method find and validate a simpler semantic description? |
+| Honest accounting | `*_check.py`, `test_*.py`, `compare.py` | Are coverage, losses, boundaries, resource caps and reproducibility reported consistently? |
+| Scale and holdouts | `scale.py`, `scale_stage.py`, `prepare_holdouts.py` | Does the compiler preserve unchanged real workloads at fixed costs, and are holdout contracts frozen? |
+
+Threaded/reentrant checks live in the relevant differential runners, not a
+separate claim that all possible interleavings were proved. Finite runtime
+corpora do not prove whole-program equivalence. Solver unknown, unsupported
+lifting, missing requested tools and tool crashes are not protection wins.
+Decompiler size and assembly differences are diagnostics, not hardness scores.
+Known-descriptor inverses are expected to succeed; supplied and discovered
+interfaces must not be conflated. Live-agent evaluation is a separate acceptance
+layer with its own binary-only artifacts, policy and matched resource budget.
+
 ## Build this fork
 
 ```sh
@@ -189,8 +218,8 @@ refused rather than silently switched on: a defaults-off flag stays off.
 The lock enforces the split rather than describing it. zlib, Lua and SQLite are
 `scale-regression`: they already influenced this work and cannot be relabelled
 held out. bzip2 and cJSON are `holdout`: they refuse every purpose but
-`holdout`, and because their input/output contracts are not frozen yet they
-currently refuse that too. Seeds 1/3/4 are regression, 11/13/17 promotion,
+`holdout`, require their frozen IO-manifest hashes, and have only clean-contract
+preparation evidence so far (see the chronology below). Seeds 1/3/4 are regression, 11/13/17 promotion,
 23/29/31 holdout, and the three sets are disjoint. Another seed of the same
 program is not a held-out program.
 
@@ -219,8 +248,8 @@ these tests. The wider evaluation and remaining acceptance criteria are in
 
 ## v04 checkpoint validation
 
-The v04 work is infrastructure and offline family research, not a completed new
-representation lowering or a promoted protection preset. The active delivery
+The v04 work includes infrastructure, offline family research and experimental
+bounded representation lowerings, not a completed or promoted protection preset. The active delivery
 criteria are in [the v04 plan](../docs/NATIVE_V04_PLAN.md).
 
 ```sh
@@ -292,6 +321,12 @@ accounts for scalar header projections; it is off by default and requires loops.
 The loop compiler runner includes earlier-region binding replacement, outside
 PHI uses, actual early exits and negative CFG shapes; these are still correctness
 and coverage controls, not demonstrated resistance to semantic recovery.
+
+`--bundle-control` additionally binds the actual recurrence storage to native
+dispatch. `bundle_loop_run --control-ablation` keeps flattening in the off arm;
+`bundle_control_proof` validates supported emitted key/salt slices. See
+[`NATIVE_BUNDLE_CONTROL_V1.md`](../docs/NATIVE_BUNDLE_CONTROL_V1.md) for ownership,
+coverage, normalization controls and the successful supplied-relation inverse.
 
 Corpus-lock revision `m0-3` freezes bzip2/cJSON IO manifests under ignored
 `out/v04-frozen-holdouts-20260918/`. Existing seeds and resource caps are unchanged.

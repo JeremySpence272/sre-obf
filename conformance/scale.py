@@ -16,6 +16,7 @@ from conformance.whole import build, parser as build_parser
 from conformance.run import ROOT
 from conformance.connected_check import SHARD_ACCOUNTING, cost_accounting, report_violations
 from conformance.bundle_check import bundle_summary
+from conformance.bundle_control import bundle_control_summary
 from conformance.call_bundle_check import call_bundle_summary, call_supply_summary
 from conformance.tile_check import tile_summary
 from conformance.immutable_check import immutable_summary
@@ -448,6 +449,7 @@ def coverage(report):
     ledger, objects = source_ledger(report), object_ledger(report)
     measured = {"source_ledger": ledger, "object_ledger": objects,
             "bundles": bundle_summary(report),
+            "bundle_control": bundle_control_summary(report),
             "bundle_call_inputs": call_bundle_summary(report),
             "bundle_call_outputs": call_supply_summary(report),
             "object_bundles": tile_summary(report),
