@@ -490,10 +490,15 @@ class Transfer:
   """
 
   def __init__(self, name, site, program, outputs=None, spec=None,
-               predicate=None, note="", expect="accept"):
+               predicate=None, note="", expect="accept", source_ops=1):
     self.name, self.site, self.program = name, site, program
     self.outputs, self.spec, self.predicate = outputs or {}, spec, predicate
     self.note, self.expect = note, expect
+    # How many operations of the original program this transfer stands for.
+    # A candidate that stands for one operation is the shape the plan warns
+    # about; the ratio of emitted instructions to this number is the cost a
+    # planner is paying for that coverage.
+    self.source_ops = source_ops
     self.kind = "predicate" if predicate else "state"
 
   @property
@@ -892,10 +897,10 @@ class NlCarry(Site):
     aux0, aux1 = carriers[self.n], carriers[self.n + 1]
     word = f"e{k}"
 
-    def finish(pair, spec, note="", expect="accept", grouping=store):
+    def finish(pair, spec, note="", expect="accept", grouping=store, source_ops=1):
       out = grouping(pair, carriers[k])
       return Transfer(kind, self, prog, outputs={word: out.name}, spec=spec,
-                      note=note, expect=expect)
+                      note=note, expect=expect, source_ops=source_ops)
 
     if kind in ("xor", "and", "or", "add", "sub"):
       table = {"xor": (pxor, lambda a, b: a ^ b),
@@ -959,6 +964,7 @@ class NlCarry(Site):
       pair = pxor(land(widened, pairs[i]), land(inv(widened), pairs[j]))
       return finish(pair, lambda v, ops=None:
                     {k: (ops or Comparisons(self.width)).umin(v[i], v[j])},
+                    source_ops=2,
                     note="predicate widened to a full-width mask inside the shares")
 
     if kind == "combined":
@@ -971,7 +977,7 @@ class NlCarry(Site):
         u_value = ((values[0] + values[1]) & self.mask) ^ values[2]
         return {0: u_value, 1: ((values[0] & values[1]) + u_value) & self.mask}
       return Transfer(kind, self, prog, outputs={"e0": out0.name, "e1": out1.name},
-                      spec=spec,
+                      spec=spec, source_ops=4,
                       note="four source operations, three inputs, two real outputs")
 
     if kind == "xor_sandwich":
@@ -1158,7 +1164,7 @@ class TriCouple(Site):
       new0, new1 = rewrite(total, mixed)
       def spec(v, ops=None): return {0: (v[0] + v[1]) & self.mask, 1: v[0] ^ v[1]}
       return Transfer(kind, self, prog, outputs={"z0": new0.name, "z1": new1.name},
-                      spec=spec,
+                      spec=spec, source_ops=2,
                       note="two real outputs; lane 1's carrier reads lane 0's new word")
 
     if kind == "repair_sandwich":
@@ -1833,6 +1839,9 @@ def describe(site):
       histogram[op] = histogram.get(op, 0) + 1
     record["transfers"][name] = {"instructions": len(live),
                                  "traced": transfer.program.size,
+                                 "source_operations": transfer.source_ops,
+                                 "instructions_per_source_operation":
+                                     round(len(live) / transfer.source_ops, 1),
                                  "operations": histogram, "expect": transfer.expect,
                                  "kind": transfer.kind, "note": transfer.note}
   return record

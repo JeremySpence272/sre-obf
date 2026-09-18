@@ -377,6 +377,27 @@ class CombinedTransferTests(unittest.TestCase):
     transfer = nlcarry(lanes=3).build("combined")
     self.assertLess(len(tm.live_steps(transfer)), 600)
 
+  def test_bundling_amortizes_the_carrier_cost(self):
+    """The quantitative case for a combined transfer: the carriers are
+    recomputed once for four source operations instead of once each."""
+    for width in (8, 32):
+      record = tm.describe(nlcarry(width, lanes=3))
+      combined = record["transfers"]["combined"]
+      single = record["transfers"]["add"]
+      with self.subTest(width):
+        self.assertEqual(combined["source_operations"], 4)
+        self.assertEqual(single["source_operations"], 1)
+        self.assertLess(combined["instructions_per_source_operation"],
+                        single["instructions_per_source_operation"])
+
+  def test_a_transfer_standing_for_one_operation_says_so(self):
+    """The plan warns about a candidate that hides a single instruction, so the
+    count is recorded rather than left for a reader to infer."""
+    site = nlcarry(lanes=3)
+    self.assertEqual(site.build("xor").source_ops, 1)
+    self.assertEqual(site.build("combined").source_ops, 4)
+    self.assertEqual(tm.TriCouple(IR, 7).build("combined").source_ops, 2)
+
   def test_tricouple_couples_the_lanes_with_a_genuinely_nonlinear_term(self):
     """W1 item 3 asks for cross-value nonlinear terms. In `tricouple` lane one
     decodes through a kernel of lane zero's state word, so with the mask held
