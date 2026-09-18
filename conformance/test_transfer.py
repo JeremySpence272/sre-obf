@@ -416,6 +416,27 @@ class AttackTests(unittest.TestCase):
     self.assertTrue(tm.carrier_fit_attack(site, degree=1)["bits_recovered"] <
                     report["bits_recovered"], "more degree must buy more bits")
 
+  def test_a_projection_does_not_transfer_to_another_lane_of_the_same_site(self):
+    site = tm.NlCarry(IR, 11, lanes=3, kernel="and")
+    other = tm.NlCarry(IR, 99, lanes=3, kernel="and")
+    report = tm.projection_transfer_attack(site, other, degree=2)
+    self.assertTrue(report["results"]["same-site"]["transfers"])
+    self.assertFalse(report["results"]["other-lane"]["transfers"])
+
+  def test_closed_form_kernels_collide_across_independently_seeded_sites(self):
+    """Recorded because it is a hazard for the planner, not a property to keep.
+    Seeding a carrier only through its rotation amounts gives a space of
+    (w-1)^2, so at eight-bit lanes many sites share a carrier and one recovered
+    projection decodes all of them."""
+    for kernel in ("linear", "and", "mul"):
+      report = tm.seed_collision_probe(IR, kernel, sites=64)
+      with self.subTest(kernel):
+        self.assertEqual(report["parameter_space"], (IR - 1) ** 2)
+        self.assertGreater(report["collisions"], 0)
+    network = tm.seed_collision_probe(IR, "arx", sites=64)
+    self.assertEqual(network["collisions"], 0)
+    self.assertIsNone(network["parameter_space"])
+
   def test_a_fitted_projection_does_not_transfer_to_another_seed(self):
     for kernel in ("linear", "and"):
       a = tm.NlCarry(IR, 11, lanes=2, kernel=kernel)

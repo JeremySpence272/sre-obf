@@ -1666,10 +1666,13 @@ def kernel_shape_attack(site, lane=0, samples=16, seed=0):
 
 def projection_transfer_attack(site, other, lane=0, degree=2, train=None,
                                test=100, seed=0):
-  """Does a projection fitted at one site still decode a differently seeded one?
+  """Does a projection fitted for one lane still decode elsewhere?
 
-  W1 asks whether an inferred model transfers across sites and seeds. A model
-  that transfers means one recovery pays for every site using that seed stream.
+  W1 asks whether an inferred model transfers across lanes, sites and seeds. A
+  model that transfers means one recovery pays for many uses; a model that does
+  not means the analyst repeats the work. Three arms: the same lane of the same
+  site on fresh inputs, another lane of the same site, and the same lane of a
+  differently seeded site.
   """
   rng = seeded(("transfer", seed, site.identifier))
   count = site.width * len(site.state_words())
@@ -1681,7 +1684,9 @@ def projection_transfer_attack(site, other, lane=0, degree=2, train=None,
     bits, _ = state_bits(site, site.reference_encode(lanes, masks))
     system.add(features(bits, monos), lanes[lane] & site.mask)
   results = {}
-  for label, target in (("same-site", site), ("other-seed", other)):
+  arms = [("same-site", site, lane), ("other-seed", other, lane)]
+  if site.n > 1: arms.append(("other-lane", site, (lane + 1) % site.n))
+  for label, target, which in arms:
     hits = scored = 0
     for _ in range(test):
       lanes, masks = target.sample(rng)
@@ -1689,8 +1694,8 @@ def projection_transfer_attack(site, other, lane=0, degree=2, train=None,
       prediction = system.predict(features(bits, monos))
       if prediction is None: continue
       scored += 1
-      hits += int(prediction == (lanes[lane] & target.mask))
-    results[label] = {"scored": scored, "exact": hits,
+      hits += int(prediction == (lanes[which] & target.mask))
+    results[label] = {"scored": scored, "exact": hits, "lane": which,
                       "transfers": scored > 0 and hits == scored}
   return {"fitted_on": site.identifier, "degree": degree, "results": results}
 
@@ -1735,6 +1740,42 @@ def carrier_fit_attack(site, lane=0, degree=2, train=None, test=200, seed=0):
           "monomials": len(monos), "scored": scored,
           "bits_recovered": len(recovered), "recovered_bits": recovered,
           "broken": scored > 0 and len(recovered) == site.width}
+
+
+
+def seed_collision_probe(width, kernel, lanes=2, sites=64, seed=0):
+  """How often do two independently seeded sites share a lane's carrier?
+
+  Distinct carriers within a site are a precondition (`distinct_carriers`).
+  Across sites nothing enforces it, and a collision is worth a number rather
+  than an anecdote: a projection recovered at one site decodes a colliding site
+  for free, so one recovery pays twice. For the closed-form kernels the
+  parameter space is just the (w-1)^2 rotation pairs, so collisions are common
+  at small widths. The network kernel draws multipliers and constants as well,
+  so its space is far larger; it is reported as not enumerated rather than as
+  safe.
+  """
+  built = [NlCarry(width, seed * 1000 + index, lanes=lanes, kernel=kernel)
+           for index in range(sites)]
+  # The mask sample must cover the whole width. Drawing only small values makes
+  # a rotated AND kernel read zero for most parameters, which looks like a
+  # collision and is not one.
+  rng = seeded(("collision", width, kernel, lanes, seed))
+  masks = ([(a, b) for a in range(1 << width) for b in range(1 << width)]
+           if width <= 4 else
+           [(rng.getrandbits(width), rng.getrandbits(width)) for _ in range(96)])
+  signatures = {}
+  collisions = 0
+  for site in built:
+    key = tuple(site.carrier(a, b, 0, reference=True) for a, b in masks)
+    if key in signatures: collisions += 1
+    signatures.setdefault(key, site.seed)
+  space = None if kernel == "arx" else max(1, width - 1) ** 2
+  return {"width": width, "kernel": kernel, "sites": sites,
+          "distinct_lane0_carriers": len(signatures), "collisions": collisions,
+          "parameter_space": space,
+          "note": ("rotation pairs only" if space else
+                   "network parameters not enumerated here")}
 
 
 def describe(site):
@@ -1855,6 +1896,8 @@ def catalogue(width=8, seed=11, degrees=(1, 2), attack_lanes=2):
   for row in report["attacks"]:
     for record in report["families"]:
       if record["family"] == row["site"]: record["recovered_by"] = row["recovered_by"]
+  report["seed_collisions"] = [seed_collision_probe(width, k, sites=64)
+                              for k in NlCarry.KERNELS]
   report["ready"] = sorted(r["family"] for r in report["families"] if r["ready_to_lower"])
   report["ready_and_not_yet_recovered"] = sorted(
       r["family"] for r in report["families"]
