@@ -1,8 +1,8 @@
 # sre-obf
 
-sre-obf is a fork of [xollvm](https://github.com/und3ath/xollvm) focused on native, whole-program, representation-aware LLVM obfuscation.
+sre-obf is a fork of xollvm focused on native, whole-program, representation-aware LLVM obfuscation.
 
-## Current native-obfuscation status
+In crackme testing, the unobfuscated baseline was solved in 8 steps and 34 seconds, while the current v4 build exhausted 400 steps and 53,270 seconds (14h 47m 50s) without an accepted solution.
 
 - **Strong native profile:** constant encoding, MBA, substitution, block splitting, semantic diffusion, bogus control flow, flattening, indirect calls, string encryption, function merging, anti-optimization, and anti-decompiler passes.
 - **Seeded encoding families:** XOR/additive shares, rotations, odd multiplication, and mixed-family conversions for constants and values.
