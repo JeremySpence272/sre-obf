@@ -6,7 +6,7 @@ ARG LLVM_PACKAGE_VERSION=1:22.1.8~++20260714014902+ca7933e47d3a-1~exp1~202607141
 # Record the resulting image ID and package versions with every run.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl gnupg cmake ninja-build g++ python3 binutils file \
-    libzstd-dev zlib1g-dev libffi-dev libedit-dev libxml2-dev \
+    libzstd-dev zlib1g-dev libffi-dev libedit-dev libxml2-dev libncurses-dev \
     && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
     | gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
