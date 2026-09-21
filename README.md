@@ -14,5 +14,5 @@ sre-obf is a fork of xollvm focused on native, whole-program, representation-awa
 - **Attack-guided selection:** deterministic seeds, typed planning, explicit boundaries, growth budgets, rollback, coverage accounting, and measured encoding-family selection.
 
 Crackme test results:
-unobfuscated baseline was solved in 8 steps and 34 seconds
-current v4 build was solved in ~400 steps and 14h 47m 50s
+- unobfuscated baseline was solved in 8 steps and 34 seconds
+- current v4 build was solved in ~400 steps and 14h 47m 50s
