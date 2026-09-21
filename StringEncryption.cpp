@@ -11,9 +11,11 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Analysis/CaptureTracking.h"
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
@@ -24,6 +26,8 @@
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Transforms/IPO/InferFunctionAttrs.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
@@ -438,13 +442,11 @@ namespace {
 
         // ── Per-string helpers ────────────────────────────────────────────────────
 
-        /// True if GV (or a constexpr derived from it, e.g. a GEP) is ever
-        /// converted to an integer (ptrtoint). Such globals must not be
-        /// encrypted: encryptStrings() rewrites every use of GV inside a
-        /// function to the address of a fresh per-call stack buffer, so a
-        /// captured integer address would silently diverge from the address
-        /// other call sites / the original merged-constant address observe.
-        static bool isAddressTakenAsInteger(Constant* C);
+        /// Stack-backed decryption is legal only when every derived pointer
+        /// stays within the using activation and its original address is not
+        /// observed. Unknown consumers and analysis limits are safe boundaries.
+        static bool isSafeForStackDecryption(GlobalVariable& GV);
+        static void dropTailCallHints(Function& F);
 
         /// True if GV should be encrypted (is a non-empty, eligible string).
         static bool shouldEncrypt(GlobalVariable& GV, int minLength);
@@ -677,17 +679,54 @@ namespace {
 
     // ── StrEncImpl helpers ────────────────────────────────────────────────────────
 
-    bool StrEncImpl::isAddressTakenAsInteger(Constant* C) {
-        for (User* U : C->users()) {
-            if (isa<PtrToIntInst>(U)) return true;
-            if (auto* CE = dyn_cast<ConstantExpr>(U)) {
-                if (CE->getOpcode() == Instruction::PtrToInt) return true;
-                // Derived constexprs (e.g. GEP-of-GV) can themselves be
-                // ptrtoint'd further downstream — follow them.
-                if (isAddressTakenAsInteger(CE)) return true;
+    bool StrEncImpl::isSafeForStackDecryption(GlobalVariable& GV) {
+        SmallVector<Value*, 32> Work{&GV};
+        SmallPtrSet<Value*, 32> Seen;
+        unsigned Uses = 0;
+        while (!Work.empty()) {
+            Value* V = Work.pop_back_val();
+            if (!Seen.insert(V).second) continue;
+            for (Use& U : V->uses()) {
+                if (++Uses > 4096) return false;
+                User* Consumer = U.getUser();
+                if (auto* CE = dyn_cast<ConstantExpr>(Consumer)) {
+                    if (CE->getOpcode() != Instruction::GetElementPtr &&
+                        CE->getOpcode() != Instruction::BitCast &&
+                        CE->getOpcode() != Instruction::AddrSpaceCast)
+                        return false;
+                    Work.push_back(CE);
+                    continue;
+                }
+                // Global initializers/aliases retain the original address.
+                auto* I = dyn_cast<Instruction>(Consumer);
+                if (!I || isa<PtrToIntInst>(I) || isa<ICmpInst>(I))
+                    return false;
+                if (auto* Call = dyn_cast<CallInst>(I))
+                    if (Call->isMustTailCall()) return false;
+                // Includes returned pointers, stores (even into O0 local
+                // pointer slots), escaping call arguments and operand bundles.
+                // Follow returned captures too, e.g. strchr/memchr results.
+                UseCaptureInfo Capture = DetermineUseCaptureKind(U, &GV);
+                if (capturesAnything(Capture.UseCC)) return false;
+                if (capturesAnything(Capture.ResultCC)) {
+                    if (!I->getType()->isPointerTy()) return false;
+                    Work.push_back(I);
+                }
             }
         }
-        return false;
+        return true;
+    }
+
+    void StrEncImpl::dropTailCallHints(Function& F) {
+        // A former global operand may now point into this activation. A tail
+        // hint promises that the callee will not access caller allocas, even
+        // for a nocapture consumer. Remove optional hints on indirect derived
+        // uses too; musttail consumers are excluded by the safety analysis.
+        for (BasicBlock& BB : F)
+            for (Instruction& I : BB)
+                if (auto* Call = dyn_cast<CallInst>(&I))
+                    if (Call->isTailCall() && !Call->isMustTailCall())
+                        Call->setTailCallKind(CallInst::TCK_None);
     }
 
     bool StrEncImpl::shouldEncrypt(GlobalVariable& GV, int minLength) {
@@ -710,12 +749,15 @@ namespace {
         // Skip printf-style format strings
         if (S.contains('%')) return false;
 
-        // Skip strings whose address is ever captured as an integer: the
-        // encrypted form replaces every use inside a function with a
-        // per-call stack buffer, which has a different (and non-stable)
-        // address than the original global — breaking pointer-identity
-        // code (e.g. rustc string-literal merging + ptrtoint match tables).
-        if (isAddressTakenAsInteger(&GV)) return false;
+        // A literal has static lifetime; a decrypt buffer does not. In
+        // particular, fmerge represents pointer returns as stores through an
+        // output argument. Checking only ReturnInst misses that case.
+        if (!isSafeForStackDecryption(GV)) {
+            if (ObfVerbose)
+                errs() << "[strenc] preserve " << GV.getName()
+                       << ": pointer lifetime or identity boundary\n";
+            return false;
+        }
 
         return true;
     }
@@ -833,6 +875,68 @@ namespace {
         }
     }
 
+    // Initialize only on paths that reach a use, not at a merged function's
+    // entry. PHI operands are uses on incoming edges, so isolate those edges
+    // before placing initialization. Keep EH and unusual terminators on the
+    // conservative entry path rather than changing their control flow.
+    static SmallVector<Instruction*, 8>
+    aesDecryptionPoints(GlobalVariable& GV, Function& F) {
+        Instruction* Entry = &*F.getEntryBlock().getFirstInsertionPt();
+        if (F.hasPersonalityFn()) return {Entry};
+
+        SmallVector<std::pair<BasicBlock*, BasicBlock*>, 8> PhiEdges;
+        for (Use& U : GV.uses()) {
+            auto* I = dyn_cast<Instruction>(U.getUser());
+            if (!I || I->getFunction() != &F) continue;
+            if (auto* PN = dyn_cast<PHINode>(I)) {
+                BasicBlock* Pred = PN->getIncomingBlock(
+                    PN->getIncomingValueNumForOperand(U.getOperandNo()));
+                Instruction* T = Pred->getTerminator();
+                if (!isa<BranchInst>(T) && !isa<SwitchInst>(T)) return {Entry};
+                auto Edge = std::make_pair(Pred, PN->getParent());
+                if (!llvm::is_contained(PhiEdges, Edge)) PhiEdges.push_back(Edge);
+            }
+        }
+        for (auto [Pred, Succ] : PhiEdges) {
+            if (Pred->getTerminator()->getNumSuccessors() > 1) {
+                // Redirect ALL edges from this predecessor, including switch
+                // cases sharing a destination. SplitEdge alone splits only
+                // one of those cases. Don't retain Use pointers across PHI
+                // rewrites or reuse cached dominator/loop analyses here.
+                if (!SplitBlockPredecessors(Succ, {Pred}, ".strenc.edge"))
+                    return {Entry};
+            }
+        }
+
+        MapVector<BasicBlock*, Instruction*> FirstUses;
+        for (Use& U : GV.uses()) {
+            auto* I = dyn_cast<Instruction>(U.getUser());
+            if (!I || I->getFunction() != &F) continue;
+            if (auto* PN = dyn_cast<PHINode>(I))
+                I = PN->getIncomingBlock(
+                    PN->getIncomingValueNumForOperand(U.getOperandNo()))
+                        ->getTerminator();
+            Instruction*& First = FirstUses[I->getParent()];
+            if (!First || I->comesBefore(First)) First = I;
+        }
+
+        DominatorTree DT(F);
+        SmallVector<Instruction*, 8> Points;
+        // Function order makes emission deterministic. A dominating use has
+        // already initialized the buffer; don't add a check at later uses.
+        for (BasicBlock& BB : F) {
+            auto It = FirstUses.find(&BB);
+            if (It == FirstUses.end()) continue;
+            if (!DT.isReachableFromEntry(&BB)) return {Entry};
+            Instruction* I = It->second;
+            bool Dominated = llvm::any_of(FirstUses, [&](const auto& Other) {
+                return Other.second != I && DT.dominates(Other.second, I);
+            });
+            if (!Dominated) Points.push_back(I);
+        }
+        return Points;
+    }
+
     // StrEncImpl::encryptStrings
 
     bool StrEncImpl::encryptStrings(Module& M, StrEncCtx& Ctx) {
@@ -921,35 +1025,62 @@ namespace {
                 if (auto* I = dyn_cast<Instruction>(U))
                     Users.insert(I->getFunction());
 
-            // inject decryption at each using function's entry ──────
+            // Keep storage local to the activation, but defer initialization
+            // until a path actually reaches a string use.
             for (Function* F : Users) {
                 if (!F || F->isDeclaration()) continue;
                 // Skip the stub functions themselves (avoids self-re-encryption)
                 if (F->getName().starts_with("__strenc_")) continue;
+                dropTailCallHints(*F);
 
-                Instruction* IP = &*F->getEntryBlock().getFirstInsertionPt();
-                IRBuilder<> B(IP);
+                auto Points = aesDecryptionPoints(*GV, *F);
+                IRBuilder<> Entry(&*F->getEntryBlock().getFirstInsertionPt());
 
                 // alloca [N x i8]  (stack buffer for in-place decryption)
-                AllocaInst* Buf = B.CreateAlloca(CtTy, nullptr, "strenc.buf");
+                AllocaInst* Buf = Entry.CreateAlloca(CtTy, nullptr, "strenc.buf");
                 Buf->setAlignment(Align(16));
 
-                // memcpy(Buf, CtGV, CtBytes)
-                Value* Dst = gepI8(B, CtTy, Buf);
-                Value* Src = gepI8(B, CtTy, CtGV);
-                B.CreateMemCpy(Dst, Align(1), Src, Align(1),
-                    ConstantInt::get(I64Ty, CtBytes));
+                AllocaInst* Ready = nullptr;
+                if (Points.size() != 1 ||
+                    Points.front()->getParent() != &F->getEntryBlock()) {
+                    Ready = Entry.CreateAlloca(Entry.getInt1Ty(), nullptr,
+                                               "strenc.ready");
+                    Entry.CreateStore(Entry.getFalse(), Ready);
+                }
+                for (Instruction* IP : Points) {
+                    if (Ready) {
+                        IRBuilder<> Check(IP);
+                        Value* IsReady = Check.CreateLoad(Check.getInt1Ty(), Ready,
+                                                          "strenc.is_ready");
+                        IP = SplitBlockAndInsertIfThen(Check.CreateNot(IsReady),
+                                                       IP, false);
+                        IP->getParent()->setName("strenc.init");
+                    }
+                    IRBuilder<> B(IP);
 
-                // ptr to nonce
-                Value* NcPtr = gepI8(B, NonceTy, NonceGV);
+                    // memcpy(Buf, CtGV, CtBytes)
+                    Value* Dst = gepI8(B, CtTy, Buf);
+                    Value* Src = gepI8(B, CtTy, CtGV);
+                    B.CreateMemCpy(Dst, Align(1), Src, Align(1),
+                        ConstantInt::get(I64Ty, CtBytes));
 
-                // call __strenc_decrypt(buf_ptr, plaintext_len, nonce_ptr)
-                // Note: len = CtBytes - 1 (exclude null terminator)
-                B.CreateCall(DecryptFn, {
-                    Dst,
-                    ConstantInt::get(I32Ty, (uint32_t)(CtBytes - 1)),
-                    NcPtr
-                    });
+                    // ptr to nonce
+                    Value* NcPtr = gepI8(B, NonceTy, NonceGV);
+
+                    // call __strenc_decrypt(buf_ptr, plaintext_len, nonce_ptr)
+                    // Note: len = CtBytes - 1 (exclude null terminator)
+                    B.CreateCall(DecryptFn, {
+                        Dst,
+                        ConstantInt::get(I32Ty, (uint32_t)(CtBytes - 1)),
+                        NcPtr
+                        });
+
+                    // Guard every non-entry site: this handles natural and
+                    // irreducible loops as well as multiple disjoint uses.
+                    // No process-global plaintext cache is introduced.
+                    if (Ready) B.CreateStore(B.getTrue(), Ready);
+                    ++DecryptCallsInserted;
+                }
 
                 // Replace all uses of the original GV in this function with Buf.
                 // Buf and GV both have type 'ptr' in opaque-pointer mode.
@@ -959,7 +1090,6 @@ namespace {
                     I->replaceUsesOfWith(GV, Buf);
                 }
 
-                ++DecryptCallsInserted;
                 Changed = true;
             }
 
@@ -1173,6 +1303,7 @@ namespace {
                 if (!F || F->isDeclaration()) continue;
                 // Skip the stub functions themselves (avoids self-re-encryption)
                 if (F->getName().starts_with("__strenc_")) continue;
+                dropTailCallHints(*F);
 
                 ByFn[F].push_back(CandInj{ GV, CtGV, NonceGV, CtTy, NonceTy, CtBytes });
             }
@@ -1539,6 +1670,7 @@ namespace {
 
             for (Function* F : Users) {
                 if (!F || F->isDeclaration()) continue;
+                dropTailCallHints(*F);
                 Instruction* IP = &*F->getEntryBlock().getFirstInsertionPt();
                 IRBuilder<> B(IP);
 
@@ -1589,6 +1721,10 @@ PreservedAnalyses StringEncryptionPass::run(Module& M,
             << "\n";
     }
 
+    // Infer target-aware library capture attributes even at O0, so known
+    // consumers such as strcmp/puts do not require a hand-written allowlist.
+    bool AttributesChanged =
+        !InferFunctionAttrsPass().run(M, MAM).areAllPreserved();
     bool Changed = Ctx.Cfg.useChaCha
         ? StrEncImpl::encryptStringsChaCha(M, Ctx)
         : Ctx.Cfg.useAES
@@ -1600,5 +1736,5 @@ PreservedAnalyses StringEncryptionPass::run(Module& M,
         << " strings, " << (uint64_t)DecryptCallsInserted
         << " call sites\n";
 
-    return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+    return Changed || AttributesChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
