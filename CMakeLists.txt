@@ -84,6 +84,9 @@ set(OBF_SOURCES
   NativeBudget.cpp
   NativePlan.cpp
   NativeTransfer.cpp
+  NativeRuntime.cpp
+  NativeConsumer.cpp
+  NativeInterpreter.cpp
   NativeBundle.cpp
   NativeBundlePolicy.cpp
   NativeBundleControl.cpp

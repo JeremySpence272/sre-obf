@@ -7,7 +7,7 @@ import shutil
 import sys
 
 from conformance.cc import backend_flags
-from conformance import bundle_options
+from conformance import bundle_options, runtime_options
 from conformance.process import Runner, ToolFailure, digest, dump
 from conformance.run import ROOT, image_identity, opt_command
 
@@ -32,6 +32,7 @@ LANE_TRANSITIONS = {"off": 0, "on": 1, "stale-relation": 2}
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
     bundle_options.add_options(p)
+    runtime_options.add_options(p)
     p.add_argument("sources", type=Path, nargs="+")
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--toolchain-image")
@@ -66,6 +67,7 @@ def parser():
 
 def build(args):
     bundle_options.validate(args, args.region_plan == "connected")
+    runtime_options.validate(args)
     out, plugin = args.out.resolve(), args.plugin.resolve()
     if out.exists():
         raise ValueError("output directory already exists; use a fresh path to preserve provenance")
@@ -147,6 +149,7 @@ def build(args):
                     "-S", str(linked), "-o", str(prepared)])
     protected = out / "protected.ll"
     feature_flags = bundle_options.flags(args) + [f"-native-{name}={int(getattr(args, name.replace('-', '_')))}" for name in EXPERIMENTS]
+    feature_flags += runtime_options.flags(args)
     feature_flags += [f"-native-region-plan={args.region_plan}", f"-native-connected-nodes={args.connected_nodes}",
                       f"-native-lane-transitions={LANE_TRANSITIONS[args.lane_transitions]}",
                       f"-native-merge={int(not args.no_merge)}",

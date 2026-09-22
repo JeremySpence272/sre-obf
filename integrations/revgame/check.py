@@ -14,6 +14,7 @@ import time
 from conformance.connected_check import report_violations
 from conformance.process import digest, dump
 from conformance.scale import coverage
+from conformance.runtime_check import runtime_summary, runtime_violations, v05_violations
 
 
 def elf_properties(binary):
@@ -137,6 +138,10 @@ def main(argv=None):
             dump(out / "summary.json", result)
         report = json.loads((build / "build/native.json").read_text())
         violations = report_violations(report)
+        violations += runtime_violations(report)
+        violations += v05_violations(report)
+        if report.get("features", {}).get("runtime_state"):
+            result["runtime_state"] = runtime_summary(report)
         result["coverage"] = coverage(report)
         result["coverage_violations"] = violations
         result["structural_statuses"] = dict(Counter(

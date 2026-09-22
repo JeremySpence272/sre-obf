@@ -1,4 +1,4 @@
-"""Build matched O0, stripped, static-PIE RevGame C binaries with native v4."""
+"""Build matched O0, stripped, static-PIE RevGame C binaries with v04 or experimental v05."""
 from __future__ import annotations
 
 import argparse
@@ -25,6 +25,8 @@ V4_OPTIONS = [
     "--self-recursion", "--plan", "--scale-budget", "--scale-structure",
     "--semantic-budget", "25",
 ]
+V5_OPTIONS = ["--runtime-state", "--runtime-single-thread", "--runtime-phases", "--runtime-getters",
+              "--exact-consumers", "--runtime-buffers", "--selective-interpreter"]
 
 
 def prepare(source: Path, out: Path) -> tuple[Path, list[Path]]:
@@ -71,10 +73,19 @@ def main(argv=None):
     p.add_argument("--module-insts", type=int, default=250000)
     p.add_argument("--compile-timeout", type=float, default=600)
     p.add_argument("--control-only", action="store_true")
+    p.add_argument("--revision", choices=("v04", "v05"), default="v04")
+    p.add_argument("--v05-features-off", action="store_true",
+                   help="v05 ablation using the unchanged v04 compiler feature set")
+    p.add_argument("--runtime-growth", type=int, default=20000)
     args = p.parse_args(argv)
+    if args.v05_features_off and args.revision != "v05":
+        p.error("--v05-features-off requires --revision v05")
+    if not 1 <= args.runtime_growth <= 65536:
+        p.error("--runtime-growth must be 1..65536")
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    status = {"status": "preparing"}
+    status = {"status": "preparing", "revision": args.revision,
+              "v05_features_off": args.v05_features_off, "candidate_ready": False}
     dump(out / "status.json", status)
     try:
         croot, sources = prepare(args.source.resolve(strict=True), out)
@@ -84,6 +95,8 @@ def main(argv=None):
                    "--profile", "max", "--seed", str(args.seed), "--closed-world",
                    "--no-disassembly", "--module-insts", str(args.module_insts),
                    "--compile-timeout", str(args.compile_timeout), *V4_OPTIONS]
+        if args.revision == "v05" and not args.v05_features_off:
+            options += [*V5_OPTIONS, "--runtime-growth", str(args.runtime_growth)]
         # Match the shipped C Makefile's production semantics, including its
         # existing HARDENED catalogs and noncontracted floating-point math.
         options += ["--cflag=" + flag for flag in (
@@ -93,7 +106,7 @@ def main(argv=None):
             "-static-pie", "-s", "-Wl,--build-id=none", "-lncursesw", "-ltinfo", "-lm")]
         if args.control_only:
             options.append("--control-only")
-        status = {"status": "building", "source_files": len(sources), "options": options}
+        status.update(status="building", source_files=len(sources), options=options)
         dump(out / "status.json", status)
         manifest = whole_build(whole_parser().parse_args(options))
         status.update(status="built", artifacts=manifest["artifacts"])

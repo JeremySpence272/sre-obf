@@ -251,7 +251,7 @@ bool VMImpl::run() {
 		return false;
 	}
 
-	if (ObfVerify) {
+	if (ObfVerify || F.hasFnAttribute("sre.native.interpreter")) {
 		std::string VErr;
 		uint32_t BadIP = 0;
 		if (!verifyBytecode(E, CTSalt, OpMap, VErr, BadIP, SaltConst, BlindTargets, KeyedDispatch)) {

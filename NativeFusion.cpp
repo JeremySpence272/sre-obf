@@ -12,6 +12,7 @@ using namespace llvm;
 namespace llvm::obf {
 namespace {
 bool unsafe(const Function &F) {
+  if (F.hasFnAttribute("sre.runtime.support")) return true;
   if (F.isDeclaration() || F.isVarArg() || F.hasPersonalityFn() ||
       F.hasFnAttribute(Attribute::Naked) || F.hasFnAttribute(Attribute::ReturnsTwice)) return true;
   for (const Instruction &I : instructions(F)) {

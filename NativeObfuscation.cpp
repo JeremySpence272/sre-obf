@@ -7,6 +7,11 @@
 #include "llvm/Transforms/Obfuscator/NativeBudget.h"
 #include "llvm/Transforms/Obfuscator/NativeBundle.h"
 #include "llvm/Transforms/Obfuscator/NativeBundleControl.h"
+#include "llvm/Transforms/Obfuscator/NativeRuntime.h"
+#include "llvm/Transforms/Obfuscator/NativeConsumer.h"
+#include "llvm/Transforms/Obfuscator/NativeInterpreter.h"
+#include "llvm/Transforms/Utils/Mem2Reg.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/Obfuscator/ConstantEncryption.h"
 #include "llvm/Transforms/Obfuscator.h"
 #include "llvm/IR/InlineAsm.h"
@@ -22,6 +27,26 @@
 using namespace llvm;
 
 namespace {
+cl::opt<bool> NativeInterpreter("native-interpreter", cl::desc("Bounded private integer interpretation"), cl::init(false));
+cl::opt<bool> NativeInterpreterRollback("native-interpreter-test-rollback", cl::desc("Force interpreter transaction rollback"), cl::init(false));
+cl::opt<bool> NativeExactConsumers("native-exact-consumers",
+    cl::desc("Integrate bounded private byte-array equality consumers"), cl::init(false));
+cl::opt<bool> NativeRuntimeBuffers("native-runtime-buffers",
+    cl::desc("Own closed bounded private integer arrays"), cl::init(false));
+cl::opt<bool> NativeRuntimeState("native-runtime-state",
+    cl::desc("Experimental persistent private integer state with independent runtime contexts"), cl::init(false));
+cl::opt<bool> NativeRuntimeSingleThread("native-runtime-single-thread",
+    cl::desc("Explicit contract: no concurrent or signal-reentrant access to runtime-owned state"), cl::init(false));
+cl::opt<bool> NativeRuntimePhases("native-runtime-phases",
+    cl::desc("Refresh persistent representation on each supported store"), cl::init(false));
+cl::opt<bool> NativeRuntimeGetters("native-runtime-getters",
+    cl::desc("Import bounded private scalar getters before runtime ownership selection"), cl::init(false));
+cl::opt<unsigned> NativeRuntimeGrowth("native-runtime-growth",
+    cl::desc("Atomic runtime-state growth allowance"), cl::init(20000));
+cl::opt<uint64_t> NativeRuntimeTestSeed("native-runtime-test-seed",
+    cl::desc("Diagnostic-only fixed context; never a release seed override"), cl::init(0));
+cl::opt<bool> NativeRuntimeTestRollback("native-runtime-test-rollback",
+    cl::desc("Diagnostic-only forced rollback after runtime-state lowering"), cl::init(false));
 cl::opt<std::string> NativeLevel(
     "native-level", cl::desc("Native profile: max or smoke (explicit test profile)"),
     cl::init("max"));
@@ -231,12 +256,23 @@ std::string structuralBlocker(const Function &F) {
 }
 
 bool selected(const Function &F) {
+  if (F.hasFnAttribute("sre.runtime.support")) return false;
   return NativeFunctions.empty() ||
       llvm::is_contained(NativeFunctions, F.getName().str());
 }
 } // namespace
 
 PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &AM) {
+  if (NativeRuntimeState && !NativeRuntimeSingleThread)
+    report_fatal_error("native-runtime-state requires explicit native-runtime-single-thread contract");
+  if (NativeRuntimeState && (!NativeFunctions.empty() || !Triple(M.getTargetTriple()).isOSLinux()))
+    report_fatal_error("native-runtime-state currently requires whole-module selection on Linux");
+  if (!NativeRuntimeState && (NativeRuntimePhases || NativeRuntimeSingleThread ||
+      NativeRuntimeTestSeed.getNumOccurrences() || NativeRuntimeGrowth.getNumOccurrences() ||
+      NativeRuntimeTestRollback || NativeRuntimeGetters || NativeRuntimeBuffers))
+    report_fatal_error("runtime controls require native-runtime-state");
+  if (NativeRuntimeGrowth < 1 || NativeRuntimeGrowth > 65536)
+    report_fatal_error("native-runtime-growth must be 1..65536");
   std::optional<obf::NativeBundlePolicy> BundlePolicy;
   if (!NativeBundlePolicyFile.empty()) {
     if (!NativeBundles || NativeTransferFamily != "seeded")
@@ -346,6 +382,59 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   auto InputInventory = obf::nativeBoundaryInventory(M, "input-before-fusion");
   json::Array BundleOrigins;
   if (NativeBundles) BundleOrigins = obf::stampNativeBundleOrigins(M);
+  json::Array ExactConsumers;
+  if (NativeExactConsumers) {
+    checkModuleBudget(M, "before-exact-consumers");
+    unsigned Available = (NativeModuleInsts - moduleInstructions(M)) / 3;
+    ExactConsumers = obf::integrateNativeExactConsumers(M, AM, std::min(Available, 16384u));
+    AM.invalidate(M, PreservedAnalyses::none());
+    if (verifyModule(M, &errs())) report_fatal_error("native exact consumers produced invalid IR");
+    checkModuleBudget(M, "after-exact-consumers");
+    saveNativeStage(M, "exact-consumers.ll");
+  }
+  json::Object RuntimeCoverage;
+  json::Array RuntimeGetters;
+  if (NativeRuntimeState) {
+    FunctionPassManager Promote;
+    Promote.addPass(PromotePass());
+    ModulePassManager PrepareRuntime;
+    PrepareRuntime.addPass(createModuleToFunctionPassAdaptor(std::move(Promote)));
+    if (NativeRuntimeBuffers) PrepareRuntime.addPass(GlobalDCEPass());
+    PrepareRuntime.run(M, AM);
+    if (NativeRuntimeGetters) {
+      RuntimeGetters = obf::importNativeRuntimeGetters(M, 64);
+      AM.invalidate(M, PreservedAnalyses::none());
+    }
+    checkModuleBudget(M, "before-runtime-state");
+    obf::NativeRuntimeOptions Options;
+    Options.Phases = NativeRuntimePhases;
+    Options.Buffers = NativeRuntimeBuffers;
+    Options.TestRollback = NativeRuntimeTestRollback;
+    Options.GrowthBudget = std::min<uint64_t>(NativeRuntimeGrowth,
+        (NativeModuleInsts - moduleInstructions(M)) / 3);
+    if (NativeRuntimeTestSeed.getNumOccurrences()) Options.TestSeed = NativeRuntimeTestSeed;
+    RuntimeCoverage = obf::encodeNativeRuntimeState(M, static_cast<uint64_t>(ObfSeed), Options);
+    AM.invalidate(M, PreservedAnalyses::none());
+    if (verifyModule(M, &errs())) report_fatal_error("native runtime state produced invalid IR");
+    checkModuleBudget(M, "after-runtime-state");
+    saveNativeStage(M, "runtime-state.ll");
+  }
+  json::Object InterpreterCoverage;
+  if (NativeInterpreter) {
+    FunctionPassManager Promote;
+    Promote.addPass(PromotePass());
+    ModulePassManager Prepare;
+    Prepare.addPass(createModuleToFunctionPassAdaptor(std::move(Promote)));
+    Prepare.run(M, AM);
+    checkModuleBudget(M, "before-interpreter");
+    InterpreterCoverage = obf::interpretNativeRegions(M, AM,
+        std::min<unsigned>(24000, (NativeModuleInsts - moduleInstructions(M)) / 3),
+        NativeInterpreterRollback);
+    AM.invalidate(M, PreservedAnalyses::none());
+    if (verifyModule(M, &errs())) report_fatal_error("native interpreter produced invalid IR");
+    checkModuleBudget(M, "after-interpreter");
+    saveNativeStage(M, "interpreter.ll");
+  }
   json::Array FusionCoverage, FusionAbsorbed;
   if (NativeFusion) {
     // Captured immediately before fusion, so a function it consumes is
@@ -363,7 +452,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
   Cache.PerFunction.clear();
   for (Function &F : M) {
     if (F.isDeclaration()) continue;
-    F.addFnAttr("sre.native.source");
+    if (!F.hasFnAttribute("sre.runtime.support")) F.addFnAttr("sre.native.source");
     std::string Blocker = structuralBlocker(F);
     bool Protect = selected(F);
     // Do not transform naked/asm bodies at all. Other blockers get a reported
@@ -785,7 +874,7 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
     json::Object Result{{"schema", "sre-native-v6"},
                         {"profile", "native-" + NativeLevel.getValue() + "-ir"},
                         {"seed", std::to_string(static_cast<uint64_t>(ObfSeed))},
-                        {"vm", false}, {"injected_assembly", false},
+                        {"vm", NativeInterpreter.getValue()}, {"injected_assembly", false},
                         {"features", json::Object{{"diversity", NativeDiversity.getValue()},
                             {"data", NativeData.getValue()}, {"helpers", NativeHelpers.getValue()},
                             {"strings", NativeStrings.getValue()}, {"merge", NativeMerge.getValue()},
@@ -802,6 +891,13 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                             {"scale_structure", NativeScaleStructure.getValue()},
                             {"plan", NativePlan.getValue()},
                             {"bundles", NativeBundles.getValue()},
+                            {"runtime_state", NativeRuntimeState.getValue()},
+                            {"exact_consumers", NativeExactConsumers.getValue()},
+                            {"runtime_phases", NativeRuntimePhases.getValue()},
+                            {"runtime_buffers", NativeRuntimeBuffers.getValue()},
+                            {"runtime_getters", NativeRuntimeGetters.getValue()},
+                            {"runtime_single_thread", NativeRuntimeSingleThread.getValue()},
+                            {"runtime_test_context", NativeRuntimeTestSeed.getNumOccurrences() != 0},
                             {"object_bundles", NativeObjectBundles.getValue()},
                             {"immutable_bundles", NativeImmutableBundles.getValue()},
                             {"bundle_call_inputs", NativeBundleCallInputs.getValue()},
@@ -846,6 +942,12 @@ PreservedAnalyses NativeObfuscationPass::run(Module &M, ModuleAnalysisManager &A
                         {"late_constants", std::move(LateCoverage)},
                         {"functions", std::move(Coverage)}};
     Result["encoded_calls"] = std::move(CallCoverage);
+    if (NativeInterpreter) Result["selective_interpreter"] = std::move(InterpreterCoverage);
+    if (NativeExactConsumers) Result["exact_consumers"] = std::move(ExactConsumers);
+    if (NativeRuntimeState) {
+      Result["runtime_state"] = std::move(RuntimeCoverage);
+      Result["runtime_getter_preparation"] = std::move(RuntimeGetters);
+    }
     if (BundlePolicy) Result["bundle_policy"] = BundlePolicy->identity();
     if (NativeBundles) {
       if (obf::nativeBundleControl()) Result["bundle_control"] = obf::nativeBundleControlInventory(M, BundleCoverage);
